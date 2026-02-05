@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+yfinance
+plotly
+statsmodels
+scikit-learn
+pandas-datareader
+requests
+openpyxl
+fpdf2
+kaleido==0.2.1.post1
+setuptools
