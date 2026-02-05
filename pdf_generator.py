@@ -1,6 +1,7 @@
 from fpdf import FPDF
 import tempfile
 import os
+import re
 
 class PDF(FPDF):
     def header(self):
@@ -16,55 +17,59 @@ class PDF(FPDF):
     def chapter_title(self, title):
         self.set_font('Arial', 'B', 12)
         self.set_fill_color(200, 220, 255)
-        self.cell(0, 6, str(title), 0, 1, 'L', 1)
+        # タイトルからも特殊文字を除去
+        safe_title = self.clean_text(str(title))
+        self.cell(0, 6, safe_title, 0, 1, 'L', 1)
         self.ln(4)
 
     def chapter_body(self, body):
         self.set_font('Arial', '', 10)
-        # latin-1変換を完全に削除し、文字列として安全に処理
-        self.multi_cell(0, 5, str(body))
+        # 本文から特殊文字を除去して書き込む
+        safe_body = self.clean_text(str(body))
+        self.multi_cell(0, 5, safe_body)
         self.ln()
+
+    def clean_text(self, text):
+        """
+        絵文字や特殊記号を取り除き、標準的なフォントで表示可能な文字のみにする関数
+        """
+        # Latin-1（標準フォントの範囲）に変換できない文字を無視して削除
+        return text.encode('ascii', 'ignore').decode('ascii')
 
 def create_pdf_report(payload, figs):
     pdf = PDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # 1. Check if payload has data
     if not payload:
         pdf.chapter_title("No Data Available")
-        pdf.chapter_body("Please run the simulation to generate data.")
     else:
-        # 📊 Stats Section
+        # 1. Stats
         if 'stats' in payload:
             pdf.chapter_title("1. Risk & Return Metrics")
             pdf.chapter_body(payload['stats'])
 
-        # 📈 Charts Section (Safe Image Generation)
+        # 2. Charts
         if figs:
             pdf.chapter_title("2. Visual Analysis")
             for title, fig in figs.items():
                 try:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile:
-                        # Kaleidoで画像を保存
                         fig.write_image(tmpfile.name, format="png", engine="kaleido")
                         img_path = tmpfile.name
                     
                     pdf.set_font('Arial', 'I', 10)
-                    pdf.cell(0, 8, f"Chart: {title}", 0, 1)
+                    pdf.cell(0, 8, f"Chart: {pdf.clean_text(title)}", 0, 1)
                     pdf.image(img_path, w=170)
-                    os.unlink(img_path) # 一時ファイルを削除
+                    os.unlink(img_path)
                     pdf.ln(5)
-                except Exception as e:
-                    pdf.set_text_color(200, 0, 0)
-                    pdf.cell(0, 10, f"[Image Render Error: {title}]", 0, 1)
-                    pdf.set_text_color(0, 0, 0)
+                except:
+                    pdf.cell(0, 10, "[Chart Render Skipped]", 0, 1)
 
-        # 🧠 Analysis Section
+        # 3. Factor Analysis
         if 'factor_comment' in payload:
             pdf.add_page()
             pdf.chapter_title("3. Factor Analysis & AI Insight")
             pdf.chapter_body(payload['factor_comment'])
 
-    # 【重要】fpdf2では引数なしのoutput()が bytes を返します
     return pdf.output()
