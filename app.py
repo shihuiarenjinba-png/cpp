@@ -490,43 +490,42 @@ if st.session_state.analysis_done:
     st.header("📄 Generate Report")
     st.caption("Download the analysis results as a PDF.")
 
+    # 494行目あたり: ボタンのレイアウト作成
     col_gen, col_dl = st.columns([1, 1])
 
     with col_gen:
-        # In app.py, inside the button click event:
-if st.button("📥 Create PDF Report"):
-    with st.spinner("📄 Generating PDF..."):
-        try:
-            # 1. Copy the existing payload
-            final_payload = st.session_state.payload.copy()
-            
-            # 2. ADD THIS LINE: Pass the advisor note from the sidebar
-            final_payload['advisor_note'] = advisor_note 
-            
-            # (The detailed_review is already added to payload in the main logic of your app, 
-            # so that should be fine if you haven't changed the previous logic)
-
-            if final_payload and st.session_state.figs:
-                pdf_data = create_pdf_report(final_payload, st.session_state.figs)
-                # ... rest of the code
+        # ⚠️ ここから下は「4スペース」インデントを入れます
+        if st.button("📥 Create PDF Report"):
+            with st.spinner("📄 Generating PDF..."):
+                try:
+                    # payloadの作成
+                    final_payload = st.session_state.payload.copy()
+                    
+                    # サイドバーのコメントを反映 (変数名がadvisor_noteであることを確認してください)
+                    if 'advisor_note' in locals() or 'advisor_note' in globals():
+                        final_payload['advisor_note'] = advisor_note
+                    
+                    if final_payload and st.session_state.figs:
+                        # pdf_generator.py の関数を呼び出し
+                        pdf_data = create_pdf_report(final_payload, st.session_state.figs)
                         
-                        if pdf_data and len(pdf_data) > 0:
+                        if pdf_data:
                             st.session_state.pdf_bytes = pdf_data
-                            st.success(f"✅ Report Ready! Size: {len(pdf_data)} bytes")
+                            st.success(f"✅ Report Ready! ({len(pdf_data)} bytes)")
                         else:
-                            st.error("⚠️ PDF generation returned empty data.")
-                            st.session_state.pdf_bytes = None
+                            st.error("⚠️ Failed to generate PDF data.")
                     else:
-                        st.error("⚠️ Data missing. Please run simulation again.")
+                        st.error("⚠️ No simulation data found. Please run analysis first.")
                         
                 except Exception as e:
                     st.error(f"PDF Error: {e}")
 
     with col_dl:
+        # ⚠️ ここも同様に「4スペース」インデント
         if st.session_state.pdf_bytes is not None:
             st.download_button(
                 label="⬇️ Download PDF File",
-                data=bytes(st.session_state.pdf_bytes), # ここで念押しでbytes変換
+                data=st.session_state.pdf_bytes,
                 file_name="Portfolio_Analysis_Report.pdf",
                 mime="application/pdf",
                 type="primary"
