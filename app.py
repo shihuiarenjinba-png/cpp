@@ -518,7 +518,7 @@ if st.session_state.analysis_done:
         if st.session_state.pdf_bytes is not None:
             st.download_button(
                 label="⬇️ Download PDF File",
-                data=st.session_state.pdf_bytes,
+                data=bytes(st.session_state.pdf_bytes), # ここで念押しでbytes変換
                 file_name="Portfolio_Analysis_Report.pdf",
                 mime="application/pdf",
                 type="primary"
