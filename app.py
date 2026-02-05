@@ -493,14 +493,22 @@ if st.session_state.analysis_done:
     col_gen, col_dl = st.columns([1, 1])
 
     with col_gen:
-        if st.button("📥 Create PDF Report"):
-            with st.spinner("📄 Generating PDF..."):
-                try:
-                    final_payload = st.session_state.payload.copy()
-                    final_payload['advisor_note'] = advisor_note 
+        # In app.py, inside the button click event:
+if st.button("📥 Create PDF Report"):
+    with st.spinner("📄 Generating PDF..."):
+        try:
+            # 1. Copy the existing payload
+            final_payload = st.session_state.payload.copy()
+            
+            # 2. ADD THIS LINE: Pass the advisor note from the sidebar
+            final_payload['advisor_note'] = advisor_note 
+            
+            # (The detailed_review is already added to payload in the main logic of your app, 
+            # so that should be fine if you haven't changed the previous logic)
 
-                    if final_payload and st.session_state.figs:
-                        pdf_data = create_pdf_report(final_payload, st.session_state.figs)
+            if final_payload and st.session_state.figs:
+                pdf_data = create_pdf_report(final_payload, st.session_state.figs)
+                # ... rest of the code
                         
                         if pdf_data and len(pdf_data) > 0:
                             st.session_state.pdf_bytes = pdf_data
