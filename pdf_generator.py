@@ -72,4 +72,5 @@ def create_pdf_report(payload, figs):
             pdf.chapter_title("3. Factor Analysis & AI Insight")
             pdf.chapter_body(payload['factor_comment'])
 
-    return pdf.output()
+    # fpdf2のoutput()はbytearrayを返すため、Streamlit用にbytesに変換する
+    return bytes(pdf.output())
