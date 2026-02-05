@@ -9,5 +9,5 @@ pandas-datareader
 requests
 openpyxl
 fpdf2
-kaleido
+kaleido==0.2.1
 setuptools
