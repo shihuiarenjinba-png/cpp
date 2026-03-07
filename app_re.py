@@ -7,6 +7,13 @@ from scipy.stats import gaussian_kde
 import re
 import unicodedata
 
+# 📌 [Phase 2: 追加] リスク寄与度計算等のためにyfinanceを追加
+try:
+    import yfinance as yf
+except ImportError:
+    st.error("yfinanceがインストールされていません。ターミナルで `pip install yfinance` を実行してください。")
+    st.stop()
+
 # =========================================================
 # 🔄 [Phase 1: 修正] エンジン読み込み (New Engine Integration)
 # =========================================================
@@ -42,9 +49,7 @@ def clean_ticker(t_str):
 def clean_weight(w_str):
     """ウェイト値に混ざった記号(%, $, 全角など)を掃除して数値(float)にする"""
     try:
-        # 全角を半角に変換
         w_str = unicodedata.normalize('NFKC', str(w_str))
-        # 数字とピリオド以外の記号(%, $, 円, コンマ等)を削除
         w_str = re.sub(r'[%$円,]', '', w_str).strip()
         return float(w_str)
     except ValueError:
@@ -60,8 +65,7 @@ st.markdown("""
     /* 全体のフォントと背景調整 */
     .main { background-color: #0E1117; color: #FAFAFA; }
     
-    /* ▼▼ [Phase B-1] 文字の視認性向上（徹底調整） ▼▼ */
-    /* 入力ボックス、テキストエリア、セレクトボックス、ファイルアップローダー等の文字色を白に強制 */
+    /* 文字の視認性向上 */
     div[data-baseweb="textarea"] textarea,
     div[data-baseweb="input"] input,
     div[data-baseweb="select"] div,
@@ -72,21 +76,14 @@ st.markdown("""
         color: #FAFAFA !important;
     }
     
-    /* 入力要素の背景色を少し明るいダークグレーに */
     div[data-baseweb="textarea"] textarea,
     div[data-baseweb="input"] input,
     div[data-baseweb="select"] div {
         background-color: #262730 !important;
     }
 
-    /* セレクトボックスのドロップダウンメニュー */
-    ul[data-baseweb="menu"] {
-        background-color: #262730 !important;
-    }
-    ul[data-baseweb="menu"] li {
-        color: #FAFAFA !important;
-    }
-    /* ▲▲ 追加ここまで ▲▲ */
+    ul[data-baseweb="menu"] { background-color: #262730 !important; }
+    ul[data-baseweb="menu"] li { color: #FAFAFA !important; }
     
     /* KPIカードのデザイン */
     .metric-container {
@@ -154,9 +151,12 @@ if 'region_code' not in st.session_state:
     st.session_state.region_code = "US"
 if 'input_weights_dict' not in st.session_state:
     st.session_state.input_weights_dict = None
+# 📌 [Phase 2] データエディタ用のDataFrame状態管理
+if 'portfolio_df' not in st.session_state:
+    st.session_state.portfolio_df = pd.DataFrame(columns=["Ticker", "Weight"])
 
 # =========================================================
-# 📂 サイドバー: データ入力 (Input)
+# 📂 サイドバー: データ入力 & 編集 (Input)
 # =========================================================
 with st.sidebar:
     st.title("🛡️ Auditor Pro")
@@ -165,159 +165,181 @@ with st.sidebar:
     
     input_tab, settings_tab = st.tabs(["📂 ポートフォリオ", "⚙️ 設定"])
     
-    input_weights_dict = None
-    
     with input_tab:
         st.subheader("🌍 Market & Assets")
-        
         market_choice = st.radio("分析対象マーケット", ["🇺🇸 米国市場 (US)", "🇯🇵 日本市場 (Japan)"], horizontal=True)
         st.session_state.region_code = "US" if "US" in market_choice else "Japan"
         
-        # 🆕 CSVアップロード機能を追加
-        uploaded_file = st.file_uploader("📂 CSVアップロード (Ticker, Weight列を含む)", type=["csv"])
-        
-        if st.session_state.region_code == "US":
-            default_input = "SPY: 60\nTLT: 40"
-        else:
-            default_input = "1885.T: 10\n5449.T: 10\n8078.T: 10\n7241.T: 10\n3105.T: 10"
-
-        st.caption("またはテキストで入力:")
-        input_str = st.text_area("Ticker: Weight (%)", value=default_input, height=150)
-        
-        weights = {}
-        
-        # 1. CSVがアップロードされている場合は優先して読み込む
-        if uploaded_file is not None:
-            try:
-                df = pd.read_csv(uploaded_file)
-                skipped_rows = 0
-                if 'Ticker' in df.columns and 'Weight' in df.columns:
-                    for _, row in df.iterrows():
-                        # 📌 [Phase B-3] TickerとWeightのノイズを自動でクリーニング
-                        tkr = clean_ticker(row['Ticker'])
-                        w = clean_weight(row['Weight'])
-                        
-                        if tkr and w is not None:
-                            weights[tkr] = w
-                        else:
-                            skipped_rows += 1
-                            
-                    st.success(f"✅ CSVから {len(weights)} 銘柄を読み込みました")
-                    if skipped_rows > 0:
-                        st.warning(f"⚠️ {skipped_rows} 銘柄をスキップしました (空欄または不正なフォーマット)")
-                else:
-                    st.error("❌ CSVに 'Ticker' と 'Weight' の列がありません")
-            except Exception as e:
-                st.error(f"❌ CSVの読み込みエラー: {e}")
-                
-        # 2. CSVがない（またはエラー）場合はテキスト入力を使用する
-        if not weights and input_str:
-            skipped_rows = 0
-            for line in input_str.split('\n'):
-                if ':' in line: k, v = line.split(':', 1)
-                elif ',' in line: k, v = line.split(',', 1)
-                else: continue
-                
-                # 📌 [Phase B-3] 手入力データもクリーニング
-                tkr = clean_ticker(k)
-                w = clean_weight(v)
-                
-                if tkr and w is not None:
-                    weights[tkr] = w
-                else:
-                    skipped_rows += 1
-                    
-            if skipped_rows > 0:
-                st.warning(f"⚠️ {skipped_rows} 行の入力をスキップしました (不正なフォーマット)")
-                
-        # ウェイトの集計と検証
-        if weights:
-            input_weights_dict = weights
-            total_w = sum(weights.values())
-            if abs(total_w - 100) > 1:
-                st.warning(f"⚠️ 合計ウェイトが {total_w:.1f}% です (100%を推奨)")
+        # 📌 [Phase 2] データのインポートと編集を分離
+        with st.expander("📥 データのインポート (CSV / Text)", expanded=False):
+            uploaded_file = st.file_uploader("📂 CSVアップロード", type=["csv"])
+            
+            if st.session_state.region_code == "US":
+                default_input = "SPY: 60\nTLT: 40"
             else:
-                st.caption(f"✅ 合計ウェイト: {total_w:.1f}%")
+                default_input = "1885.T: 20\n5449.T: 20\n8078.T: 20\n7241.T: 20\n3105.T: 20"
+
+            input_str = st.text_area("テキスト入力 (Ticker: Weight)", value=default_input, height=100)
+            
+            if st.button("データを取り込む"):
+                new_weights = {}
+                if uploaded_file is not None:
+                    try:
+                        df_up = pd.read_csv(uploaded_file)
+                        if 'Ticker' in df_up.columns and 'Weight' in df_up.columns:
+                            for _, row in df_up.iterrows():
+                                tkr = clean_ticker(row['Ticker'])
+                                w = clean_weight(row['Weight'])
+                                if tkr and w is not None: new_weights[tkr] = w
+                        else:
+                            st.error("❌ CSVに 'Ticker' と 'Weight' の列がありません")
+                    except Exception as e:
+                        st.error(f"❌ 読み込みエラー: {e}")
+                else:
+                    for line in input_str.split('\n'):
+                        if ':' in line: k, v = line.split(':', 1)
+                        elif ',' in line: k, v = line.split(',', 1)
+                        else: continue
+                        tkr = clean_ticker(k)
+                        w = clean_weight(v)
+                        if tkr and w is not None: new_weights[tkr] = w
+                
+                if new_weights:
+                    # 読み込んだデータをセッションに保存してエディタに反映
+                    st.session_state.portfolio_df = pd.DataFrame(list(new_weights.items()), columns=["Ticker", "Weight"])
+                    st.success("✅ データをエディタに読み込みました")
+
+        st.markdown("### 📝 ポートフォリオ編集")
+        st.caption("直接セルをクリックしてティッカーや比率を修正できます")
+        
+        # デフォルトデータの初期化（空の場合）
+        if st.session_state.portfolio_df.empty:
+            def_data = [{"Ticker": "SPY", "Weight": 60.0}, {"Ticker": "TLT", "Weight": 40.0}] if "US" in market_choice else [{"Ticker": "1321.T", "Weight": 60.0}, {"Ticker": "2510.T", "Weight": 40.0}]
+            st.session_state.portfolio_df = pd.DataFrame(def_data)
+
+        # 📌 [Phase 2] データエディタの実装
+        edited_df = st.data_editor(
+            st.session_state.portfolio_df, 
+            num_rows="dynamic", 
+            use_container_width=True,
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker", required=True),
+                "Weight": st.column_config.NumberColumn("Weight (%)", min_value=0.0, format="%.2f", required=True)
+            }
+        )
+        
+        # 📌 [Phase 2] バリデーションと自動正規化
+        weights = {}
+        total_w = edited_df['Weight'].sum() if not edited_df.empty else 0
+        
+        if abs(total_w - 100.0) > 0.01 and not edited_df.empty:
+            st.warning(f"⚠️ 合計ウェイト: {total_w:.1f}% (100%を推奨)")
+            if st.button("⚖️ 100%に自動調整"):
+                edited_df['Weight'] = (edited_df['Weight'] / total_w) * 100.0
+                st.session_state.portfolio_df = edited_df
+                st.rerun()  # 画面をリフレッシュしてエディタを更新
+        elif not edited_df.empty:
+            st.caption(f"✅ 合計ウェイト: {total_w:.1f}%")
+            
+        # 最終的な辞書を作成（空のティッカーや0ウェイトを除外）
+        for _, row in edited_df.iterrows():
+            if pd.notna(row['Ticker']) and str(row['Ticker']).strip() != "" and row['Weight'] > 0:
+                weights[clean_ticker(row['Ticker'])] = float(row['Weight'])
+                
+        input_weights_dict = weights if weights else None
 
     with settings_tab:
         st.subheader("Analysis Config")
+        # 📌 [Phase 2] ルックバック期間の選択を追加
+        lookback_str = st.selectbox("データ参照期間 (ヒストリカル)", ["1年", "3年", "5年", "10年", "最大"], index=3)
+        lookback_map = {"1年": 1, "3年": 3, "5年": 5, "10年": 10, "最大": 100}
+        lookback_years = lookback_map[lookback_str]
+        
         scenario_mode = st.selectbox("ストレス強度 (Tail Risk)", ["Standard (Normal)", "Stress (Fat Tail)", "Extreme (Crisis)"], index=1)
         n_sims = st.slider("MC試行回数", 1000, 10000, 5000)
         months = st.selectbox("予測期間 (月)", [12, 36, 60, 120], index=2)
 
-    # 📌 [Phase B-2] run_btn (実行ボタン) を完全に廃止し、自動実行のトリガーへ移行
-
 # =========================================================
 # 🧠 メインロジック (Execution - 自動実行化)
 # =========================================================
-# 📌 [Phase B-2] ボタンが押されたかではなく、「有効なポートフォリオがあるか」で処理を開始する
 if input_weights_dict:
-    st.session_state.input_weights_dict = input_weights_dict
+    # 内容が変更された時のみ再計算する簡易キャッシュ機構
+    current_state_hash = hash(str(input_weights_dict) + st.session_state.region_code + str(lookback_years) + scenario_mode + str(n_sims) + str(months))
     
-    with st.spinner(f"🔍 {market_choice} の市場構造を分析中... (Applying Strict Factor Model)"):
-        try:
-            # 1. データの取得と合成
-            target = DataFetcher.create_synthetic_portfolio(input_weights_dict, region=st.session_state.region_code)
-            if target is None or target.empty:
-                st.error("データ取得失敗。ティッカーを確認してください。")
-                st.stop()
-            
-            st.session_state.target_series = target
-            returns = target.pct_change().dropna()
+    if st.session_state.get('last_run_hash') != current_state_hash:
+        st.session_state.input_weights_dict = input_weights_dict
+        
+        with st.spinner(f"🔍 {market_choice} の市場構造を分析中... (Applying Strict Factor Model)"):
+            try:
+                # 1. データの取得と合成
+                target = DataFetcher.create_synthetic_portfolio(input_weights_dict, region=st.session_state.region_code)
+                if target is None or target.empty:
+                    st.error("データ取得失敗。ティッカーを確認してください。")
+                    st.stop()
+                
+                # 📌 [Phase 2] 選択されたルックバック期間でデータをスライス
+                if lookback_years < 100 and hasattr(target, 'index'):
+                    try:
+                        cutoff_date = target.index[-1] - pd.DateOffset(years=lookback_years)
+                        target = target[target.index >= cutoff_date]
+                    except Exception:
+                        pass # インデックスが日付でない場合はスキップ
+                        
+                st.session_state.target_series = target
+                returns = target.pct_change().dropna()
 
-            # 2. 厳格化された評価ロジックを呼び出し
-            metrics = AdvancedStats.calculate_metrics(returns, weights_dict=input_weights_dict)
-            metrics['annual_return'] = returns.mean() * 12
-            
-            # 3. ファクター分析
-            factor_profile = FactorAnalyzer.analyze_style(target, region=st.session_state.region_code)
-            safe_profile = factor_profile if factor_profile else {'beta_market': 1.0, 'beta_size': 0.0, 'beta_value': 0.0, 'alpha': 0.0}
+                # 2. 厳格化された評価ロジックを呼び出し
+                metrics = AdvancedStats.calculate_metrics(returns, weights_dict=input_weights_dict)
+                metrics['annual_return'] = returns.mean() * 12
+                
+                # 3. ファクター分析
+                factor_profile = FactorAnalyzer.analyze_style(target, region=st.session_state.region_code)
+                safe_profile = factor_profile if factor_profile else {'beta_market': 1.0, 'beta_size': 0.0, 'beta_value': 0.0, 'alpha': 0.0}
 
-            audit_res = {
-                'metrics': metrics,
-                'betas': {
-                    'Mkt-RF': safe_profile.get('beta_market', 1.0),
-                    'SMB': safe_profile.get('beta_size', 0.0),
-                    'HML': safe_profile.get('beta_value', 0.0)
-                },
-                'current_regime': 'Normal',
-                'region': st.session_state.region_code,
-                'factor_success': factor_profile is not None  
-            }
-            st.session_state.audit_result = audit_res
+                audit_res = {
+                    'metrics': metrics,
+                    'betas': {
+                        'Mkt-RF': safe_profile.get('beta_market', 1.0),
+                        'SMB': safe_profile.get('beta_size', 0.0),
+                        'HML': safe_profile.get('beta_value', 0.0)
+                    },
+                    'current_regime': 'Normal',
+                    'region': st.session_state.region_code,
+                    'factor_success': factor_profile is not None  
+                }
+                st.session_state.audit_result = audit_res
 
-            # 4. モンテカルロシミュレーション
-            stress_level_key = scenario_mode.split(" ")[0] 
-            
-            simulated_returns = StochasticScenarioGenerator.generate_portfolio_paths(
-                returns=returns, 
-                n_sims=n_sims, 
-                horizon_months=months, 
-                stress_level=stress_level_key
-            )
-            
-            price_paths_arr = ProjectionCore.run_projection(
-                current_price=target.iloc[-1], 
-                simulated_returns=simulated_returns
-            )
+                # 4. モンテカルロシミュレーション
+                stress_level_key = scenario_mode.split(" ")[0] 
+                
+                simulated_returns = StochasticScenarioGenerator.generate_portfolio_paths(
+                    returns=returns, 
+                    n_sims=n_sims, 
+                    horizon_months=months, 
+                    stress_level=stress_level_key
+                )
+                
+                price_paths_arr = ProjectionCore.run_projection(
+                    current_price=target.iloc[-1], 
+                    simulated_returns=simulated_returns
+                )
 
-            sim_paths = pd.DataFrame(price_paths_arr)
+                sim_paths = pd.DataFrame(price_paths_arr)
 
-            # 5. リカバリー解析
-            recovery_metrics = AuditEngine.analyze_recovery_probability(price_paths_arr)
-            crashed = recovery_metrics.get('crashed_scenarios_count', 0)
-            recovery_metrics['survival_prob'] = 1.0 - (crashed / n_sims) if n_sims > 0 else 1.0
+                # 5. リカバリー解析
+                recovery_metrics = AuditEngine.analyze_recovery_probability(price_paths_arr)
+                crashed = recovery_metrics.get('crashed_scenarios_count', 0)
+                recovery_metrics['survival_prob'] = 1.0 - (crashed / n_sims) if n_sims > 0 else 1.0
 
-            st.session_state.simulation_result = {
-                "paths": sim_paths,
-                "recovery": recovery_metrics,
-                "final_values": price_paths_arr[-1, :]
-            }
-            
-        except Exception as e:
-            st.error(f"分析中にエラーが発生しました: {e}")
-            import traceback
-            st.code(traceback.format_exc())
+                st.session_state.simulation_result = {
+                    "paths": sim_paths,
+                    "recovery": recovery_metrics,
+                    "final_values": price_paths_arr[-1, :]
+                }
+                st.session_state.last_run_hash = current_state_hash
+                
+            except Exception as e:
+                st.error(f"分析中にエラーが発生しました: {e}")
 
 # =========================================================
 # 📊 結果ダッシュボード (Dashboard)
@@ -350,7 +372,7 @@ if st.session_state.audit_result is not None:
     factor_msg = ""
     
     if not res.get('factor_success'):
-        factor_msg = "⚠️ ファクターデータの取得サーバーが応答しなかったため、詳細なスタイル分析をスキップしました。（※未来予測は自身のボラティリティとt分布を使用して正常に完了しています）"
+        factor_msg = "⚠️ ファクターデータの取得サーバーが応答しなかったため、詳細なスタイル分析をスキップしました。（※未来予測は正常に完了しています）"
     elif hml_val > 0.1:
         factor_msg = "あなたのポートフォリオは**「割安株（バリュー）」**の傾向が強いです。インフレや金利上昇局面には強いですが、景気後退の初期には値動きが重くなる傾向があります。"
     elif hml_val < -0.1:
@@ -358,7 +380,6 @@ if st.session_state.audit_result is not None:
     else:
         factor_msg = "あなたのポートフォリオは、バリュー（割安）とグロース（成長）のバランスが取れた構成です。"
         
-    # 📌 [Phase B-4] アドバイザーテキストのレイアウトを洗練（タイトル追加、メリハリ向上）
     st.markdown(f"""
     <div class="advisor-card">
         <h4 style="margin-top: 0; margin-bottom: 10px; color: #4B7BFF;">🤖 AI Risk Advisor</h4>
@@ -389,7 +410,7 @@ if st.session_state.audit_result is not None:
         st.markdown(kpi_card("Expected Return", f"{ann_ret:.1f}%", "年率期待値", "delta-pos"), unsafe_allow_html=True)
     with col2:
         es_95 = metrics.get('cvar_95', 0) * 100
-        st.markdown(kpi_card("Expected Shortfall", f"{es_95:.1f}%", "暴落時の平均損失 (ペナルティ込)", "delta-neg"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Expected Shortfall", f"{es_95:.1f}%", "暴落時の平均損失 (厳格化済)", "delta-neg"), unsafe_allow_html=True)
     with col3:
         survival = sim_res['recovery'].get('survival_prob', 0) * 100
         st.markdown(kpi_card("Survival Prob", f"{survival:.1f}%", "生存率", "delta-pos" if survival>80 else "delta-neg"), unsafe_allow_html=True)
@@ -397,14 +418,11 @@ if st.session_state.audit_result is not None:
     with col4:
         rec_months = sim_res['recovery'].get('avg_recovery_months', 99)
         if rec_months <= 18:
-            color = "delta-pos"
-            suffix = "🟢 早期回復 (Safe)"
+            color = "delta-pos"; suffix = "🟢 早期回復 (Safe)"
         elif rec_months <= 36:
-            color = "delta-warn"
-            suffix = "🟡 注意 (Caution)"
+            color = "delta-warn"; suffix = "🟡 注意 (Caution)"
         else:
-            color = "delta-neg"
-            suffix = "🔴 警告 (Danger)"
+            color = "delta-neg"; suffix = "🔴 警告 (Danger)"
         st.markdown(kpi_card("Recovery Speed", f"{rec_months:.1f} M", suffix, color), unsafe_allow_html=True)
 
     st.markdown("---")
@@ -442,18 +460,17 @@ if st.session_state.audit_result is not None:
             height=500,
             font=dict(color="#FAFAFA")
         )
-        # 📌 [Phase B-4] Y軸をデータに合わせて自動調整し、グラフが平坦に見えるのを防ぐ
         fig_fan.update_yaxes(autorange=True, fixedrange=False)
-        st.plotly_chart(fig_fan, width="stretch")
+        st.plotly_chart(fig_fan, use_container_width=True)
 
     with t2:
-        c1, c2 = st.columns([1, 2])
+        c1, c2 = st.columns([1, 1.5])
         with c1:
             st.subheader("Risk Metrics")
             st.table(pd.DataFrame({
                 "Metric": ["Volatility (Ann.)", "Max Drawdown", "Skewness (歪度)", "Kurtosis (尖度)", "Concentration (HHI)"],
                 "Value": [
-                    f"{metrics.get('volatility', raw_sigma:=returns.std()*np.sqrt(12))*100:.1f}%",
+                    f"{metrics.get('volatility', 0)*100:.1f}%",
                     f"{metrics.get('max_dd', 0)*100:.1f}%",
                     f"{metrics.get('skewness', 0):.2f}",
                     f"{metrics.get('kurtosis', 0):.2f}",
@@ -461,9 +478,53 @@ if st.session_state.audit_result is not None:
                 ]
             }))
             st.caption("※ 集中度(HHI)が0.3以上だと分散不足のリスクが高まります。")
+            
+            # 📌 [Phase 2] リスク寄与度の円グラフ表示
+            st.markdown("---")
+            st.subheader("🥧 リスク寄与度 (Risk Contribution)")
+            st.caption("ポートフォリオ全体の変動リスクに対して、どの銘柄が最も影響を与えているかを示します。")
+            
+            weights_arr = np.array(list(st.session_state.input_weights_dict.values())) / 100.0
+            tickers = list(st.session_state.input_weights_dict.keys())
+            
+            with st.spinner("個別銘柄のリスク寄与度を計算中..."):
+                try:
+                    # 日本株の場合は末尾に.Tを補完してデータ取得
+                    yf_tickers = [f"{t}.T" if (st.session_state.region_code == "Japan" and not t.endswith(".T") and t.isdigit()) else t for t in tickers]
+                    period_str = f"{lookback_years}y" if lookback_years <= 10 else "max"
+                    
+                    data = yf.download(yf_tickers, period=period_str, progress=False)['Adj Close']
+                    if isinstance(data, pd.Series):
+                        data = data.to_frame(name=tickers[0])
+                    
+                    ind_returns = data.pct_change().dropna()
+                    
+                    # 共分散行列とリスク寄与度の計算（周辺リスク寄与度）
+                    cov_matrix = ind_returns.cov().values * 252
+                    port_vol = np.sqrt(np.dot(weights_arr.T, np.dot(cov_matrix, weights_arr)))
+                    marginal_contrib = np.dot(cov_matrix, weights_arr) / port_vol
+                    component_contrib = weights_arr * marginal_contrib
+                    contrib_pct = (component_contrib / port_vol) * 100
+                    
+                    fig_rc = px.pie(
+                        names=tickers,
+                        values=np.maximum(0, contrib_pct), # マイナスはゼロ扱い
+                        hole=0.4,
+                        color_discrete_sequence=px.colors.sequential.Plasma
+                    )
+                    fig_rc.update_layout(
+                        template="plotly_dark", 
+                        font=dict(color="#FAFAFA"),
+                        margin=dict(t=20, b=20, l=20, r=20),
+                        height=300
+                    )
+                    st.plotly_chart(fig_rc, use_container_width=True)
+                except Exception as e:
+                    st.warning("⚠️ リスク寄与度の計算に必要な個別データの取得に失敗しました。")
 
         with c2:
-            st.subheader("Recovery Time Distribution (Smoothed)")
+            st.subheader("Recovery Time Distribution (KDE Smoothed)")
+            st.caption("暴落後、元の資産額に回復するまでの期間の確率分布です。カーネル密度推定(KDE)により平滑化しています。")
             paths_arr = sim_res['paths'].values
             start_price = paths_arr[0, 0]
             
@@ -477,7 +538,7 @@ if st.session_state.audit_result is not None:
                     recovery_months_list.append(0)
                 else:
                     if path[-1] < start_price:
-                        selected_months = int(st.session_state.get('months', paths_arr.shape[0]-1))
+                        selected_months = int(paths_arr.shape[0]-1)
                         recovery_months_list.append(selected_months)
                     else:
                         first_under = np.argmax(underwater)
@@ -492,17 +553,18 @@ if st.session_state.audit_result is not None:
                 histnorm='probability density',
                 nbinsx=30,
                 name='Simulated Frequency',
-                marker_color='rgba(0, 204, 150, 0.5)'
+                marker_color='rgba(0, 204, 150, 0.4)'
             ))
             
+            # 📌 [Phase 2] カーネル密度推定曲線の強調
             if len(recovery_months_list) > 1 and np.var(recovery_months_list) > 0:
                 try:
-                    kde = gaussian_kde(recovery_months_list)
+                    kde = gaussian_kde(recovery_months_list, bw_method='scott')
                     x_range = np.linspace(0, max(recovery_months_list), 200)
                     fig_rec.add_trace(go.Scatter(
                         x=x_range, y=kde(x_range),
                         mode='lines', name='Density Curve',
-                        line=dict(color='#FAFAFA', width=2)
+                        line=dict(color='#00CC96', width=3)
                     ))
                 except Exception:
                     pass 
@@ -516,9 +578,10 @@ if st.session_state.audit_result is not None:
                 xaxis_title="Months to Recover Principal",
                 yaxis_title="Probability Density",
                 font=dict(color="#FAFAFA"),
-                legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99)
+                legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99),
+                height=450
             )
-            st.plotly_chart(fig_rec, width="stretch")
+            st.plotly_chart(fig_rec, use_container_width=True)
 
     with t3:
         st.subheader("🧠 総合ストレス・メーター (Comprehensive Stress Score)")
@@ -574,7 +637,7 @@ if st.session_state.audit_result is not None:
         
         c1, c2 = st.columns([1.5, 1])
         with c1:
-            st.plotly_chart(fig_gauge, width="stretch")
+            st.plotly_chart(fig_gauge, use_container_width=True)
             
         with c2:
             st.markdown("### 📊 スコアの内訳")
@@ -627,9 +690,8 @@ if st.session_state.audit_result is not None:
                 font=dict(color="#FAFAFA"),
                 legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
             )
-            # 📌 [Phase B-4] Y軸スケールの自動調整を適用
             fig_tm.update_yaxes(autorange=True, fixedrange=False)
-            st.plotly_chart(fig_tm, width="stretch")
+            st.plotly_chart(fig_tm, use_container_width=True)
         else:
             st.warning("⚠️ この期間のシミュレーションに必要なデータが不足しています。")
 
@@ -651,7 +713,7 @@ if st.session_state.audit_result is not None:
                     title="Factor Exposure Radar",
                     font=dict(color="#FAFAFA")
                 )
-                st.plotly_chart(fig_radar, width="stretch")
+                st.plotly_chart(fig_radar, use_container_width=True)
                 
             with c2:
                 st.subheader("診断レポート")
@@ -664,14 +726,14 @@ if st.session_state.audit_result is not None:
                 各数値がプラスであればその要素の恩恵を受けやすく、マイナスであれば逆の動きをする傾向があります。
                 """)
         else:
-            st.warning("⚠️ ファクター分析の外部データ（Fama-French）が取得できなかったため、この項目の表示をスキップしています。")
+            st.warning("⚠️ ファクター分析の外部データが取得できなかったため、この項目の表示をスキップしています。")
 
 else:
-    st.info("👈 左側のサイドバーからポートフォリオを入力するか、CSVファイルをアップロードしてください。")
+    st.info("👈 左側のサイドバーからポートフォリオを入力し、エディタでウェイトを調整してください。")
     st.markdown("""
     ### 🛡️ What is Portfolio Auditor Pro?
     新エンジン(V2)搭載のプロフェッショナル診断ツールです：
     1.  **Probability Projection:** t分布を用いた「テールリスク（極端な暴落）」を考慮した未来予測。
     2.  **Recovery Analysis:** 暴落した際に、どれくらいの期間で回復可能かを算出。
-    3.  **Factor X-Ray:** 専門用語を噛み砕き、あなたの資産の「癖」を可視化。
+    3.  **Factor X-Ray & Risk Contribution:** あなたの資産の「癖」と、リスクの「震源地」を可視化。
     """)
