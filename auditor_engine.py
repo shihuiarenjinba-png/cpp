@@ -106,6 +106,8 @@ class AdvancedStats:
                 if track_err > 0:
                     info_ratio = (active_ret.mean() * 12) / track_err
 
+        # 📌 修正: NaNを取り除いてからSkewnessとKurtosisを計算 (エラーや不正確な計算を防止)
+        clean_returns = returns.dropna()
         return {
             "sharpe": sharpe, 
             "sortino": sortino, 
@@ -116,8 +118,8 @@ class AdvancedStats:
             "kelly_criterion": kelly, 
             "max_dd": max_dd, 
             "info_ratio": info_ratio,
-            "skewness": skew(returns), 
-            "kurtosis": kurtosis(returns),
+            "skewness": skew(clean_returns) if len(clean_returns) > 0 else 0, 
+            "kurtosis": kurtosis(clean_returns) if len(clean_returns) > 0 else 0,
             "hhi_index": hhi, 
             "effective_n": enc,
             "risk_penalty_ratio": penalty
@@ -186,13 +188,18 @@ class DataFetcher:
             
         bm_returns = bm_prices.pct_change().iloc[:, 0].rename("Benchmark")
         
-        returns.index = returns.index.strftime('%Y-%m-%d')
-        bm_returns.index = bm_returns.index.strftime('%Y-%m-%d')
+        # 📌 修正: 文字列変換を廃止し、タイムゾーンを削除して日次ベースに揃える (確実な結合のため)
+        if returns.index.tz is not None:
+            returns.index = returns.index.tz_localize(None)
+        if bm_returns.index.tz is not None:
+            bm_returns.index = bm_returns.index.tz_localize(None)
+            
+        returns.index = returns.index.normalize()
+        bm_returns.index = bm_returns.index.normalize()
         
         aligned_data = pd.concat([returns, bm_returns], axis=1)
         
         for ticker in tickers:
-            # 📌 修正: その期間に全く存在しなかった銘柄（列がない）場合のフォールバック追加
             if ticker not in aligned_data.columns:
                 aligned_data[ticker] = aligned_data["Benchmark"]
                 continue
@@ -207,15 +214,13 @@ class DataFetcher:
             missing_mask = aligned_data[ticker].isna() & aligned_data["Benchmark"].notna()
             aligned_data.loc[missing_mask, ticker] = aligned_data.loc[missing_mask, "Benchmark"] * beta
             
-        aligned_data = aligned_data.dropna()
+        aligned_data = aligned_data.dropna(subset=["Benchmark"])
         
         weighted_returns = pd.Series(0, index=aligned_data.index)
         for ticker, weight in ticker_weights.items():
             if ticker in aligned_data.columns:
-                weighted_returns += aligned_data[ticker] * (weight / 100.0)
+                weighted_returns += aligned_data[ticker].fillna(0) * (weight / 100.0)
                 
-        weighted_returns.index = pd.to_datetime(weighted_returns.index)
-        
         synthetic_price = (1 + weighted_returns).cumprod() * 100
         return synthetic_price
 
@@ -267,6 +272,12 @@ class HistoryTimeMachine:
             if bm_data.empty: return None
             
             market_returns = bm_data.pct_change().dropna()
+            
+            # 📌 修正: タイムゾーン削除
+            if market_returns.index.tz is not None:
+                market_returns.index = market_returns.index.tz_localize(None)
+            market_returns.index = market_returns.index.normalize()
+            
             market_returns = market_returns.loc[start_date:end_date]
             if market_returns.empty: return None
 
@@ -281,14 +292,15 @@ class HistoryTimeMachine:
                         
                     port_returns = port_data.pct_change().dropna(how='all')
                     
-                    port_returns.index = port_returns.index.strftime('%Y-%m-%d')
-                    market_returns.index = market_returns.index.strftime('%Y-%m-%d')
+                    # 📌 修正: タイムゾーン削除
+                    if port_returns.index.tz is not None:
+                        port_returns.index = port_returns.index.tz_localize(None)
+                    port_returns.index = port_returns.index.normalize()
                     
                     aligned = pd.concat([port_returns, market_returns.rename("BM")], axis=1)
-                    aligned = aligned.loc[aligned.index >= start_date]
+                    aligned = aligned.loc[aligned.index >= pd.to_datetime(start_date)]
                     
                     for tkr in tickers:
-                        # 📌 修正: その時代に全く上場していなかった銘柄は、市場平均×ベータで動的に補完する
                         if tkr not in aligned.columns:
                             aligned[tkr] = aligned["BM"] * current_beta
                             continue
@@ -298,7 +310,7 @@ class HistoryTimeMachine:
                             cov = np.cov(aligned.loc[valid_mask, tkr], aligned.loc[valid_mask, "BM"])
                             beta = cov[0, 1] / cov[1, 1] if cov[1, 1] != 0 else 1.0
                         else:
-                            beta = current_beta # データが短すぎる場合も指定ベータで保護
+                            beta = current_beta 
                             
                         missing = aligned[tkr].isna() & aligned["BM"].notna()
                         aligned.loc[missing, tkr] = aligned.loc[missing, "BM"] * beta
@@ -309,21 +321,18 @@ class HistoryTimeMachine:
                     weighted_ret = pd.Series(0, index=aligned.index)
                     for tkr, w in weights_dict.items():
                         if tkr in aligned.columns:
-                            weighted_ret += aligned[tkr] * (w / 100.0)
+                            weighted_ret += aligned[tkr].fillna(0) * (w / 100.0)
                             
                     price_path = (1 + weighted_ret).cumprod() * current_price
                     market_path = (1 + aligned["BM"]).cumprod() * current_price
-                    dates = pd.to_datetime(aligned.index)
                     
-                    return {"dates": dates, "prices": price_path.values, "market_prices": market_path.values, "desc": scenario['desc']}
+                    return {"dates": aligned.index, "prices": price_path.values, "market_prices": market_path.values, "desc": scenario['desc']}
 
-            # 構成銘柄のデータが全く取れなかった場合の究極のフォールバック
             simulated_returns = market_returns * current_beta
             price_path = (1 + simulated_returns).cumprod() * current_price
             market_path = (1 + market_returns).cumprod() * current_price
-            dates = pd.to_datetime(market_returns.index)
             
-            return {"dates": dates, "prices": price_path.values, "market_prices": market_path.values, "desc": scenario['desc']}
+            return {"dates": market_returns.index, "prices": price_path.values, "market_prices": market_path.values, "desc": scenario['desc']}
             
         except Exception as e: 
             return None
@@ -335,7 +344,8 @@ class FactorAnalyzer:
     @staticmethod
     def analyze_style(target_series, region="US"):
         if target_series.empty: return None
-        target_monthly = target_series.resample('M').last().pct_change().dropna()
+        # 📌 修正: 'M' から 'ME' へ変更し警告を防止
+        target_monthly = target_series.resample('ME').last().pct_change().dropna()
         start_date = target_monthly.index[0]
         config = MarketConfig.get_config(region)
         ff_data = DataFetcher.fetch_fama_french_factors(start_date, dataset_name=config["ff_dataset"])
@@ -346,15 +356,25 @@ class FactorAnalyzer:
         combined = pd.concat([target_monthly.rename("Target"), ff_data], axis=1).dropna()
         if len(combined) < 12: return None
         
-        mkt_col = [c for c in combined.columns if "Mkt" in c or "MKT" in c][0]
-        smb_col = [c for c in combined.columns if "SMB" in c][0]
-        hml_col = [c for c in combined.columns if "HML" in c][0]
-        rf_col = [c for c in combined.columns if "RF" in c][0]
-
-        y = combined["Target"] - combined[rf_col]
-        X = combined[[mkt_col, smb_col, hml_col]]
-        X = sm.add_constant(X)
         try:
+            # 📌 修正: 該当カラムがFFデータになかった場合、クラッシュを避けるための安全機構
+            mkt_col_list = [c for c in combined.columns if "Mkt" in c or "MKT" in c]
+            smb_col_list = [c for c in combined.columns if "SMB" in c]
+            hml_col_list = [c for c in combined.columns if "HML" in c]
+            rf_col_list = [c for c in combined.columns if "RF" in c]
+            
+            if not (mkt_col_list and smb_col_list and hml_col_list and rf_col_list):
+                return None
+                
+            mkt_col = mkt_col_list[0]
+            smb_col = smb_col_list[0]
+            hml_col = hml_col_list[0]
+            rf_col = rf_col_list[0]
+
+            y = combined["Target"] - combined[rf_col]
+            X = combined[[mkt_col, smb_col, hml_col]]
+            X = sm.add_constant(X)
+            
             model = sm.OLS(y, X).fit()
             return {
                 "beta_market": model.params.get(mkt_col, 1.0),
@@ -406,33 +426,26 @@ class RegimeAnalyzer:
         return result_data
 
 # =========================================================
-# 🌊 確率的シナリオ生成エンジン (★NEW: シンプル＆ファットテール特化)
+# 🌊 確率的シナリオ生成エンジン
 # =========================================================
 class StochasticScenarioGenerator:
     @staticmethod
     def generate_portfolio_paths(returns, n_sims=7500, horizon_months=60, stress_level="Stress"):
-        """
-        ポートフォリオの過去リターンから直接、指定したストレス強度(t分布)で未来のパスを生成する
-        """
-        # 1. ストレスレベルに応じてt分布の自由度(df)を設定
         if stress_level == "Extreme":
-            df = 3   # リーマンショック級の暴落が頻出する極端なファットテール
+            df = 3   
         elif stress_level == "Stress":
-            df = 5   # 通常のファットテール（デフォルト）
+            df = 5   
         else:
-            df = 30  # Standard: ほぼ正規分布に近い
+            df = 30  
 
-        # 2. ポートフォリオ自身の周期性とボラティリティを計算
         period, power = RegimeAnalyzer.analyze_periodicity(returns)
         garch_res = RegimeAnalyzer.fit_garch_volatility(returns)
         
         current_vol = garch_res['current_vol'] / np.sqrt(12)
         long_run_vol = garch_res['long_term_vol'] / np.sqrt(12)
         
-        # 3. 常にt分布を用いて乱数を生成（ファットテールの完全再現）
         future_shocks = t.rvs(df=df, size=(horizon_months, n_sims))
         
-        # t分布の分散を1に正規化するための調整
         variance_adjustment = np.sqrt(df / (df - 2)) if df > 2 else 1.0
         future_shocks = future_shocks / variance_adjustment
             
@@ -440,7 +453,6 @@ class StochasticScenarioGenerator:
         drift = returns.mean()
         sim_vol = current_vol
         
-        # 4. パスの構築ループ
         for i in range(horizon_months):
             cycle_multiplier = 1.0
             if period > 0:
@@ -448,34 +460,25 @@ class StochasticScenarioGenerator:
                 amp = min(power * 0.5, 0.5) 
                 cycle_multiplier = 1.0 + amp * np.sin(phase)
 
-            # ドリフト + (変動ボラティリティ * 周期性 * t分布ショック)
             ret = drift + sim_vol * cycle_multiplier * future_shocks[i]
             paths[i] = ret
             
-            # ボラティリティの自己回帰更新 (GARCH的)
             alpha = 0.1
             sim_vol = np.sqrt((1 - alpha) * (long_run_vol**2) + alpha * (ret**2))
             
         return paths
 
 # =========================================================
-# 🚀 プロジェクション・コア (★NEW: 複利計算のみに特化)
+# 🚀 プロジェクション・コア
 # =========================================================
 class ProjectionCore:
     @staticmethod
     def run_projection(current_price, simulated_returns):
-        """
-        生成されたリターンパスを受け取り、現在価格からの価格推移パスへ変換する
-        """
         growth_factors = 1.0 + simulated_returns
-        
         n_sims = simulated_returns.shape[1]
         ones = np.ones((1, n_sims))
         
-        # 0ヶ月目（初期値1.0）を追加して積み上げ
         cumulative_growth = np.vstack([ones, growth_factors])
-        
-        # 累積積を計算して現在価格を掛ける
         price_paths = np.cumprod(cumulative_growth, axis=0) * current_price
 
         return price_paths
