@@ -94,6 +94,8 @@ if 'simulation_result' not in st.session_state:
     st.session_state.simulation_result = None
 if 'target_series' not in st.session_state:
     st.session_state.target_series = None
+if 'region_code' not in st.session_state:
+    st.session_state.region_code = "US"
 
 # =========================================================
 # 📂 サイドバー: データ入力 (Input)
@@ -108,21 +110,15 @@ with st.sidebar:
     input_weights_dict = None
     
     with input_tab:
-        st.subheader("Asset Allocation")
-        port_file = st.file_uploader("構成CSV (Ticker, Weight)", type=['csv'], key="port_up")
+        st.subheader("🌍 Market & Assets")
         
-        default_input = "SPY: 60\nTLT: 40"
+        market_choice = st.radio("分析対象マーケット", ["🇺🇸 米国市場 (US)", "🇯🇵 日本市場 (Japan)"], horizontal=True)
+        st.session_state.region_code = "US" if "US" in market_choice else "Japan"
         
-        if port_file:
-            try:
-                df_port = pd.read_csv(port_file)
-                if df_port.shape[1] >= 2:
-                    tickers = df_port.iloc[:, 0].astype(str).tolist()
-                    weights = df_port.iloc[:, 1].astype(str).tolist()
-                    default_input = "\n".join(f"{t}: {w}" for t, w in zip(tickers, weights))
-                    st.success(f"✅ {len(tickers)} 銘柄ロード完了")
-            except Exception as e:
-                st.error(f"読込エラー: {e}")
+        if st.session_state.region_code == "US":
+            default_input = "SPY: 60\nTLT: 40"
+        else:
+            default_input = "1321.T: 60\n2510.T: 40"
 
         input_str = st.text_area("Ticker: Weight (%)", value=default_input, height=150)
         
@@ -160,9 +156,10 @@ if run_btn:
     if not input_weights_dict:
         st.error("ポートフォリオを入力してください")
     else:
-        with st.spinner("🔍 市場構造を分析中... (Applying 3-Factor Model & t-Distribution)"):
+        with st.spinner(f"🔍 {market_choice} の市場構造を分析中... (Applying Factor Model & Tail Risk)"):
             try:
-                target = DataFetcher.create_synthetic_portfolio(input_weights_dict)
+                # 🆕 [Step 4-2] 地域を渡して未上場銘柄のプロキシ補完を有効化
+                target = DataFetcher.create_synthetic_portfolio(input_weights_dict, region=st.session_state.region_code)
                 if target is None or target.empty:
                     st.error("データ取得失敗。ティッカーを確認してください。")
                     st.stop()
@@ -174,7 +171,7 @@ if run_btn:
                 metrics['annual_return'] = returns.mean() * 12
                 metrics['volatility'] = returns.std() * np.sqrt(12)
                 
-                factor_profile = FactorAnalyzer.analyze_style(target)
+                factor_profile = FactorAnalyzer.analyze_style(target, region=st.session_state.region_code)
                 if not factor_profile:
                     factor_profile = {'beta_market': 1.0, 'beta_size': 0.0, 'beta_value': 0.0, 'alpha': 0.0}
 
@@ -185,13 +182,14 @@ if run_btn:
                         'SMB': factor_profile.get('beta_size', 0.0),
                         'HML': factor_profile.get('beta_value', 0.0)
                     },
-                    'current_regime': 'Normal'
+                    'current_regime': 'Normal',
+                    'region': st.session_state.region_code
                 }
                 st.session_state.audit_result = audit_res
 
                 start_date = target.index[0]
                 waves = StochasticScenarioGenerator.generate_3factor_waves(
-                    start_date=start_date, n_sims=n_sims, horizon_months=months
+                    start_date=start_date, region=st.session_state.region_code, n_sims=n_sims, horizon_months=months
                 )
 
                 if waves:
@@ -233,9 +231,11 @@ if st.session_state.audit_result is not None:
     st.header("📊 Executive Summary")
     
     regime = res.get('current_regime', 'Normal')
-    advisor_text = "現在の市場環境は**平時**と判定されています。"
+    region_display = "🇺🇸 米国市場" if res.get('region', 'US') == "US" else "🇯🇵 日本市場"
+    
+    advisor_text = f"**{region_display}** の現在の市場環境は**平時**と判定されています。"
     if regime == 'Crisis':
-        advisor_text = "⚠️ 市場は**不安定な局面（Crisis Regime）**にあります。ボラティリティの上昇に警戒が必要です。"
+        advisor_text = f"⚠️ **{region_display}** の市場は**不安定な局面（Crisis Regime）**にあります。ボラティリティの上昇に警戒が必要です。"
     
     betas = res.get('betas', {})
     hml_val = betas.get('HML', 0)
@@ -320,7 +320,6 @@ if st.session_state.audit_result is not None:
         current_val = st.session_state.target_series.iloc[-1]
         fig_fan.add_hline(y=current_val, line_dash="dash", line_color="gray", annotation_text="Start")
 
-        # 🎨 Plotly文字色修正
         fig_fan.update_layout(
             title="Portfolio Value Projection (Monte Carlo)", 
             xaxis_title="Months Ahead", 
@@ -372,7 +371,6 @@ if st.session_state.audit_result is not None:
             fig_rec.add_vline(x=12, line_dash="dash", line_color="yellow", annotation_text="1 Year")
             fig_rec.add_vline(x=36, line_dash="dash", line_color="red", annotation_text="3 Years")
             
-            # 🎨 Plotly文字色修正
             fig_rec.update_layout(
                 template="plotly_dark", 
                 bargap=0.1, 
@@ -382,34 +380,25 @@ if st.session_state.audit_result is not None:
             st.plotly_chart(fig_rec, use_container_width=True)
 
     with t3:
-        # =========================================================
-        # 🚀 [Phase 2: 新機能] 総合ストレス・メーター (Gauge Chart)
-        # =========================================================
         st.subheader("🧠 総合ストレス・メーター (Comprehensive Stress Score)")
         
-        # 1. 過去の実績ベースのストレス (Ulcer Index)
         ulcer = metrics.get('ulcer_index', 0) * 100
-        historical_stress = min(ulcer, 100) # MAX100に制限
+        historical_stress = min(ulcer, 100) 
         
-        # 2. 未来のファットテールリスク (シミュレーション下位5%の平均下落率)
         final_values = sim_res['final_values']
         start_price = st.session_state.target_series.iloc[-1]
         var_95 = np.percentile(final_values, 5)
         
-        # CVaR (下位5%の平均値) の算出
         if len(final_values[final_values <= var_95]) > 0:
             cvar_95_val = final_values[final_values <= var_95].mean()
         else:
             cvar_95_val = var_95
             
-        # 下落率 (%)
         cvar_drop_pct = max(0, (start_price - cvar_95_val) / start_price * 100)
         
-        # 3. 総合スコアの算出 (未来の暴落リスクをやや重めに見る)
         total_stress = (historical_stress * 0.4) + (cvar_drop_pct * 0.6)
         total_stress = min(total_stress, 100)
         
-        # 4. ゲージチャートの作成 
         fig_gauge = go.Figure(go.Indicator(
             mode = "gauge+number",
             value = total_stress,
@@ -460,22 +449,41 @@ if st.session_state.audit_result is not None:
         st.subheader("🕰️ Stress Testing with History")
         scenario_key = st.selectbox("Select Historical Crisis", list(HistoryTimeMachine.SCENARIOS.keys()))
         
+        # 🆕 [Step 4-2] エンジンに地域情報を渡し、ベンチマークの実データも取得する
+        current_region = res.get('region', 'US')
         replay_res = HistoryTimeMachine.run_replay(
             current_price=st.session_state.target_series.iloc[-1],
             current_beta=res['betas'].get('Mkt-RF', 1.0),
-            scenario_key=scenario_key
+            scenario_key=scenario_key,
+            region=current_region
         )
         
         if replay_res:
             st.caption(f"Scenario: {replay_res['desc']}")
             fig_tm = go.Figure()
-            fig_tm.add_trace(go.Scatter(x=replay_res['days'], y=replay_res['prices'], mode='lines', name='Your Portfolio', line=dict(color='#00CC96', width=3)))
             
-            # 🎨 Plotly文字色修正
+            # 🆕 [Step 4-2] ベンチマーク（市場平均）のリアルな動きをグレーの点線で追加
+            bm_name = "S&P 500 (US)" if current_region == "US" else "Nikkei 225 (Japan)"
+            fig_tm.add_trace(go.Scatter(
+                x=replay_res['days'], y=replay_res['market_prices'], 
+                mode='lines', name=bm_name, 
+                line=dict(color='gray', width=2, dash='dash')
+            ))
+            
+            # ポートフォリオの動きを緑の実線で追加
+            fig_tm.add_trace(go.Scatter(
+                x=replay_res['days'], y=replay_res['prices'], 
+                mode='lines', name='Your Portfolio', 
+                line=dict(color='#00CC96', width=3)
+            ))
+            
             fig_tm.update_layout(
                 template="plotly_dark", 
                 title=f"Replay: {scenario_key}",
-                font=dict(color="#FAFAFA")
+                xaxis_title="Days since Crisis Start",
+                yaxis_title="Portfolio Value",
+                font=dict(color="#FAFAFA"),
+                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
             )
             st.plotly_chart(fig_tm, use_container_width=True)
 
@@ -491,7 +499,6 @@ if st.session_state.audit_result is not None:
                     r=values, theta=categories, fill='toself', name='Factor Exposure'
                 ))
                 
-                # 🎨 Plotly文字色修正
                 fig_radar.update_layout(
                     polar=dict(radialaxis=dict(visible=True, color="#FAFAFA")),
                     template="plotly_dark",
