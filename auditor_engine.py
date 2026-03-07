@@ -6,6 +6,10 @@ from scipy.stats import t, skew, kurtosis
 import scipy.signal as signal
 import pandas_datareader.data as web
 from datetime import datetime, timedelta
+import warnings
+
+# 📌 ログを埋め尽くすPandasの仕様変更警告(date_parser等)をミュートして動作を軽くする
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # GARCHモデル用 (ライブラリがない場合はEWMAで代用するロジックが含まれています)
 try:
@@ -188,7 +192,11 @@ class DataFetcher:
         aligned_data = pd.concat([returns, bm_returns], axis=1)
         
         for ticker in tickers:
-            if ticker not in aligned_data.columns: continue
+            # 📌 修正: その期間に全く存在しなかった銘柄（列がない）場合のフォールバック追加
+            if ticker not in aligned_data.columns:
+                aligned_data[ticker] = aligned_data["Benchmark"]
+                continue
+                
             valid_mask = aligned_data[ticker].notna() & aligned_data["Benchmark"].notna()
             if valid_mask.sum() > 30:
                 cov = np.cov(aligned_data.loc[valid_mask, ticker], aligned_data.loc[valid_mask, "Benchmark"])
@@ -280,14 +288,17 @@ class HistoryTimeMachine:
                     aligned = aligned.loc[aligned.index >= start_date]
                     
                     for tkr in tickers:
-                        if tkr not in aligned.columns: continue
-                        
+                        # 📌 修正: その時代に全く上場していなかった銘柄は、市場平均×ベータで動的に補完する
+                        if tkr not in aligned.columns:
+                            aligned[tkr] = aligned["BM"] * current_beta
+                            continue
+                            
                         valid_mask = aligned[tkr].notna() & aligned["BM"].notna()
                         if valid_mask.sum() > 30:
                             cov = np.cov(aligned.loc[valid_mask, tkr], aligned.loc[valid_mask, "BM"])
                             beta = cov[0, 1] / cov[1, 1] if cov[1, 1] != 0 else 1.0
                         else:
-                            beta = 1.0
+                            beta = current_beta # データが短すぎる場合も指定ベータで保護
                             
                         missing = aligned[tkr].isna() & aligned["BM"].notna()
                         aligned.loc[missing, tkr] = aligned.loc[missing, "BM"] * beta
@@ -302,16 +313,17 @@ class HistoryTimeMachine:
                             
                     price_path = (1 + weighted_ret).cumprod() * current_price
                     market_path = (1 + aligned["BM"]).cumprod() * current_price
-                    days = np.arange(len(price_path))
+                    dates = pd.to_datetime(aligned.index)
                     
-                    return {"days": days, "prices": price_path.values, "market_prices": market_path.values, "desc": scenario['desc']}
+                    return {"dates": dates, "prices": price_path.values, "market_prices": market_path.values, "desc": scenario['desc']}
 
+            # 構成銘柄のデータが全く取れなかった場合の究極のフォールバック
             simulated_returns = market_returns * current_beta
-            days = np.arange(len(simulated_returns))
             price_path = (1 + simulated_returns).cumprod() * current_price
             market_path = (1 + market_returns).cumprod() * current_price
+            dates = pd.to_datetime(market_returns.index)
             
-            return {"days": days, "prices": price_path.values, "market_prices": market_path.values, "desc": scenario['desc']}
+            return {"dates": dates, "prices": price_path.values, "market_prices": market_path.values, "desc": scenario['desc']}
             
         except Exception as e: 
             return None
