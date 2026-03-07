@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
+from scipy.stats import gaussian_kde
 
 # =========================================================
 # 🔄 [Phase 1: 修正] エンジン読み込み (New Engine Integration)
@@ -42,7 +43,7 @@ st.markdown("""
     /* KPIカードのデザイン */
     .metric-container {
         background-color: #1E1E1E;
-        border: 1px solid #333;
+        border: 1px solid #333333;
         border-radius: 10px;
         padding: 20px;
         text-align: center;
@@ -64,6 +65,15 @@ st.markdown("""
         padding: 15px;
         border-radius: 5px;
         margin-bottom: 20px;
+    }
+    
+    .alert-card {
+        background-color: #3E1616;
+        border-left: 5px solid #EF553B;
+        padding: 15px;
+        border-radius: 5px;
+        margin-bottom: 20px;
+        color: #FAFAFA;
     }
     
     /* ボタンカスタマイズ */
@@ -96,6 +106,8 @@ if 'target_series' not in st.session_state:
     st.session_state.target_series = None
 if 'region_code' not in st.session_state:
     st.session_state.region_code = "US"
+if 'input_weights_dict' not in st.session_state:
+    st.session_state.input_weights_dict = None
 
 # =========================================================
 # 📂 サイドバー: データ入力 (Input)
@@ -156,9 +168,11 @@ if run_btn:
     if not input_weights_dict:
         st.error("ポートフォリオを入力してください")
     else:
-        with st.spinner(f"🔍 {market_choice} の市場構造を分析中... (Applying Factor Model & Tail Risk)"):
+        # バックテスト等に使うためにセッションへ保存
+        st.session_state.input_weights_dict = input_weights_dict
+        
+        with st.spinner(f"🔍 {market_choice} の市場構造を分析中... (Applying Strict Factor Model)"):
             try:
-                # 🆕 [Step 4-2] 地域を渡して未上場銘柄のプロキシ補完を有効化
                 target = DataFetcher.create_synthetic_portfolio(input_weights_dict, region=st.session_state.region_code)
                 if target is None or target.empty:
                     st.error("データ取得失敗。ティッカーを確認してください。")
@@ -167,9 +181,10 @@ if run_btn:
                 st.session_state.target_series = target
                 returns = target.pct_change().dropna()
 
-                metrics = AdvancedStats.calculate_metrics(returns)
+                # 🆕 厳格化された評価ロジックを呼び出し、weights_dictを渡す
+                metrics = AdvancedStats.calculate_metrics(returns, weights_dict=input_weights_dict)
                 metrics['annual_return'] = returns.mean() * 12
-                metrics['volatility'] = returns.std() * np.sqrt(12)
+                # ボラティリティは metrics 内で既にペナルティ込みで計算されている
                 
                 factor_profile = FactorAnalyzer.analyze_style(target, region=st.session_state.region_code)
                 if not factor_profile:
@@ -230,6 +245,17 @@ if st.session_state.audit_result is not None:
     
     st.header("📊 Executive Summary")
     
+    # 🆕 集中投資リスク（ペナルティ）の警告表示
+    penalty_ratio = metrics.get('risk_penalty_ratio', 1.0)
+    if penalty_ratio > 1.05:
+        st.markdown(f"""
+        <div class="alert-card">
+            <b>⚠️ 集中投資アラート (Concentration Risk)</b><br>
+            銘柄数が少ない、または一部の資産に比率が偏っているため、分散効果が十分に機能していません。<br>
+            現実のドローダウンを過小評価しないよう、推定リスク（ボラティリティ等）を <b>{penalty_ratio:.2f} 倍に厳格化</b> して評価しています。
+        </div>
+        """, unsafe_allow_html=True)
+    
     regime = res.get('current_regime', 'Normal')
     region_display = "🇺🇸 米国市場" if res.get('region', 'US') == "US" else "🇯🇵 日本市場"
     
@@ -275,7 +301,7 @@ if st.session_state.audit_result is not None:
         st.markdown(kpi_card("Expected Return", f"{ann_ret:.1f}%", "年率期待値", "delta-pos"), unsafe_allow_html=True)
     with col2:
         es_95 = metrics.get('cvar_95', 0) * 100
-        st.markdown(kpi_card("Expected Shortfall", f"{es_95:.1f}%", "暴落時の平均損失", "delta-neg"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Expected Shortfall", f"{es_95:.1f}%", "暴落時の平均損失 (ペナルティ込)", "delta-neg"), unsafe_allow_html=True)
     with col3:
         survival = sim_res['recovery'].get('survival_prob', 0) * 100
         st.markdown(kpi_card("Survival Prob", f"{survival:.1f}%", f"{months}ヶ月生存率", "delta-pos" if survival>80 else "delta-neg"), unsafe_allow_html=True)
@@ -304,7 +330,7 @@ if st.session_state.audit_result is not None:
     ])
 
     with t1:
-        st.subheader(f"📈 {months}-Month Projection (Fan Chart)")
+        st.subheader(f"📈 {months}-Month Projection (Fat-Tail Engine)")
         paths = sim_res['paths']
         x_axis = np.arange(len(paths))
         
@@ -335,18 +361,19 @@ if st.session_state.audit_result is not None:
         with c1:
             st.subheader("Risk Metrics")
             st.table(pd.DataFrame({
-                "Metric": ["Volatility (Ann.)", "Max Drawdown", "Skewness (歪度)", "Kurtosis (尖度)"],
+                "Metric": ["Volatility (Ann.)", "Max Drawdown", "Skewness (歪度)", "Kurtosis (尖度)", "Concentration (HHI)"],
                 "Value": [
                     f"{metrics.get('volatility', 0)*100:.1f}%",
                     f"{metrics.get('max_dd', 0)*100:.1f}%",
                     f"{metrics.get('skewness', 0):.2f}",
-                    f"{metrics.get('kurtosis', 0):.2f}"
+                    f"{metrics.get('kurtosis', 0):.2f}",
+                    f"{metrics.get('hhi_index', 0):.2f}"
                 ]
             }))
-            st.caption("※ 尖度(Kurtosis)が高いほど、極端な暴落(Fat Tail)が起きやすいことを示唆します。")
+            st.caption("※ 集中度(HHI)が0.3以上だと分散不足のリスクが高まります。")
 
         with c2:
-            st.subheader("Recovery Time Distribution")
+            st.subheader("Recovery Time Distribution (Smoothed)")
             paths_arr = sim_res['paths'].values
             start_price = paths_arr[0, 0]
             
@@ -366,16 +393,42 @@ if st.session_state.audit_result is not None:
                         recovered_after = np.argmax(path[first_under:] >= start_price)
                         recovery_months_list.append(recovered_after + 1)
             
+            # 🆕 歯抜けヒストグラムを解消し、KDE(カーネル密度推定)を用いた美しい分布図を作成
+            fig_rec = go.Figure()
             df_rec = pd.DataFrame(recovery_months_list, columns=['Months'])
-            fig_rec = px.histogram(df_rec, x='Months', nbins=30, title="Probability of Recovery Time (Months)", color_discrete_sequence=['#00CC96'], labels={'Months': 'Months to Recover'})
+            
+            # 棒グラフ部分
+            fig_rec.add_trace(go.Histogram(
+                x=df_rec['Months'],
+                histnorm='probability density',
+                nbinsx=30,
+                name='Simulated Frequency',
+                marker_color='rgba(0, 204, 150, 0.5)'
+            ))
+            
+            # KDE (密度曲線) 部分
+            if len(recovery_months_list) > 1 and np.var(recovery_months_list) > 0:
+                try:
+                    kde = gaussian_kde(recovery_months_list)
+                    x_range = np.linspace(0, max(recovery_months_list), 200)
+                    fig_rec.add_trace(go.Scatter(
+                        x=x_range, y=kde(x_range),
+                        mode='lines', name='Density Curve',
+                        line=dict(color='#FAFAFA', width=2)
+                    ))
+                except Exception:
+                    pass # 分散が0に近い場合などはスキップ
+            
             fig_rec.add_vline(x=12, line_dash="dash", line_color="yellow", annotation_text="1 Year")
             fig_rec.add_vline(x=36, line_dash="dash", line_color="red", annotation_text="3 Years")
             
             fig_rec.update_layout(
                 template="plotly_dark", 
-                bargap=0.1, 
+                bargap=0.05, 
                 xaxis_title="Months to Recover Principal",
-                font=dict(color="#FAFAFA")
+                yaxis_title="Probability Density",
+                font=dict(color="#FAFAFA"),
+                legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99)
             )
             st.plotly_chart(fig_rec, use_container_width=True)
 
@@ -446,23 +499,24 @@ if st.session_state.audit_result is not None:
             """)
 
     with t4:
-        st.subheader("🕰️ Stress Testing with History")
+        st.subheader("🕰️ Stress Testing (Real Historical Data)")
         scenario_key = st.selectbox("Select Historical Crisis", list(HistoryTimeMachine.SCENARIOS.keys()))
         
-        # 🆕 [Step 4-2] エンジンに地域情報を渡し、ベンチマークの実データも取得する
         current_region = res.get('region', 'US')
+        
+        # 🆕 裏側のエンジンに weights_dict を渡し、「真の実データバックテスト」を呼び出す
         replay_res = HistoryTimeMachine.run_replay(
             current_price=st.session_state.target_series.iloc[-1],
             current_beta=res['betas'].get('Mkt-RF', 1.0),
             scenario_key=scenario_key,
-            region=current_region
+            region=current_region,
+            weights_dict=st.session_state.input_weights_dict
         )
         
         if replay_res:
             st.caption(f"Scenario: {replay_res['desc']}")
             fig_tm = go.Figure()
             
-            # 🆕 [Step 4-2] ベンチマーク（市場平均）のリアルな動きをグレーの点線で追加
             bm_name = "S&P 500 (US)" if current_region == "US" else "Nikkei 225 (Japan)"
             fig_tm.add_trace(go.Scatter(
                 x=replay_res['days'], y=replay_res['market_prices'], 
@@ -470,10 +524,9 @@ if st.session_state.audit_result is not None:
                 line=dict(color='gray', width=2, dash='dash')
             ))
             
-            # ポートフォリオの動きを緑の実線で追加
             fig_tm.add_trace(go.Scatter(
                 x=replay_res['days'], y=replay_res['prices'], 
-                mode='lines', name='Your Portfolio', 
+                mode='lines', name='Your Portfolio (Real Data)', 
                 line=dict(color='#00CC96', width=3)
             ))
             
