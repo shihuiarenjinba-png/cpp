@@ -40,6 +40,24 @@ st.markdown("""
     /* 全体のフォントと背景調整 */
     .main { background-color: #0E1117; color: #FAFAFA; }
     
+    /* ▼▼ 追加: 文字の視認性向上（黒文字で見えなくなるのを防ぐ） ▼▼ */
+    div[data-baseweb="textarea"] textarea,
+    div[data-baseweb="select"] div,
+    div[data-baseweb="input"] input,
+    .stFileUploader div {
+        color: #FAFAFA !important;
+        background-color: #262730 !important;
+    }
+    
+    /* セレクトボックスのメニューリスト */
+    ul[data-baseweb="menu"] {
+        background-color: #262730 !important;
+    }
+    ul[data-baseweb="menu"] li {
+        color: #FAFAFA !important;
+    }
+    /* ▲▲ 追加ここまで ▲▲ */
+    
     /* KPIカードのデザイン */
     .metric-container {
         background-color: #1E1E1E;
@@ -127,31 +145,55 @@ with st.sidebar:
         market_choice = st.radio("分析対象マーケット", ["🇺🇸 米国市場 (US)", "🇯🇵 日本市場 (Japan)"], horizontal=True)
         st.session_state.region_code = "US" if "US" in market_choice else "Japan"
         
+        # 🆕 CSVアップロード機能を追加
+        uploaded_file = st.file_uploader("📂 CSVアップロード (Ticker, Weight列を含む)", type=["csv"])
+        
         if st.session_state.region_code == "US":
             default_input = "SPY: 60\nTLT: 40"
         else:
-            # ユーザーがアップした portfolio.csv に近いサンプルをデフォルト化
             default_input = "1885.T: 10\n5449.T: 10\n8078.T: 10\n7241.T: 10\n3105.T: 10"
 
-        input_str = st.text_area("Ticker: Weight (%)", value=default_input, height=200)
+        st.caption("またはテキストで入力:")
+        input_str = st.text_area("Ticker: Weight (%)", value=default_input, height=150)
         
-        if input_str:
+        weights = {}
+        
+        # 1. CSVがアップロードされている場合は優先して読み込む
+        if uploaded_file is not None:
             try:
-                weights = {}
+                df = pd.read_csv(uploaded_file)
+                if 'Ticker' in df.columns and 'Weight' in df.columns:
+                    for _, row in df.iterrows():
+                        tkr = str(row['Ticker']).strip()
+                        w = float(row['Weight'])
+                        if tkr:
+                            weights[tkr] = w
+                    st.success(f"✅ CSVから {len(weights)} 銘柄を読み込みました")
+                else:
+                    st.error("❌ CSVに 'Ticker' と 'Weight' の列がありません")
+            except Exception as e:
+                st.error(f"❌ CSVの読み込みエラー: {e}")
+                
+        # 2. CSVがない（またはエラー）場合はテキスト入力を使用する
+        if not weights and input_str:
+            try:
                 for line in input_str.split('\n'):
                     if ':' in line: k, v = line.split(':')
                     elif ',' in line: k, v = line.split(',')
                     else: continue
-                    weights[k.strip()] = float(v.strip())
-                input_weights_dict = weights
-                
-                total_w = sum(weights.values())
-                if abs(total_w - 100) > 1:
-                    st.warning(f"⚠️ 合計が {total_w:.1f}% です (100%推奨)")
-                else:
-                    st.caption(f"✅ 合計: {total_w:.1f}%")
+                    if k.strip():
+                        weights[k.strip()] = float(v.strip())
             except:
                 pass
+                
+        # ウェイトの集計と検証
+        if weights:
+            input_weights_dict = weights
+            total_w = sum(weights.values())
+            if abs(total_w - 100) > 1:
+                st.warning(f"⚠️ 合計ウェイトが {total_w:.1f}% です (100%を推奨)")
+            else:
+                st.caption(f"✅ 合計ウェイト: {total_w:.1f}%")
 
     with settings_tab:
         st.subheader("Analysis Config")
@@ -203,8 +245,7 @@ if run_btn:
                 }
                 st.session_state.audit_result = audit_res
 
-                # 4. モンテカルロシミュレーション (★新しいシンプル＆強力なエンジン連携)
-                # "Stress (Fat Tail)" -> "Stress" のように最初の単語を抽出
+                # 4. モンテカルロシミュレーション
                 stress_level_key = scenario_mode.split(" ")[0] 
                 
                 simulated_returns = StochasticScenarioGenerator.generate_portfolio_paths(
@@ -358,7 +399,8 @@ if st.session_state.audit_result is not None:
             height=500,
             font=dict(color="#FAFAFA")
         )
-        st.plotly_chart(fig_fan, use_container_width=True)
+        # 警告防止のため width="stretch" に変更
+        st.plotly_chart(fig_fan, width="stretch")
 
     with t2:
         c1, c2 = st.columns([1, 2])
@@ -391,7 +433,6 @@ if st.session_state.audit_result is not None:
                     recovery_months_list.append(0)
                 else:
                     if path[-1] < start_price:
-                        # Convert selected 'months' from dropdown to int for comparison
                         selected_months = int(st.session_state.get('months', paths_arr.shape[0]-1))
                         recovery_months_list.append(selected_months)
                     else:
@@ -433,7 +474,8 @@ if st.session_state.audit_result is not None:
                 font=dict(color="#FAFAFA"),
                 legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99)
             )
-            st.plotly_chart(fig_rec, use_container_width=True)
+            # 警告防止のため width="stretch" に変更
+            st.plotly_chart(fig_rec, width="stretch")
 
     with t3:
         st.subheader("🧠 総合ストレス・メーター (Comprehensive Stress Score)")
@@ -489,7 +531,8 @@ if st.session_state.audit_result is not None:
         
         c1, c2 = st.columns([1.5, 1])
         with c1:
-            st.plotly_chart(fig_gauge, use_container_width=True)
+            # 警告防止のため width="stretch" に変更
+            st.plotly_chart(fig_gauge, width="stretch")
             
         with c2:
             st.markdown("### 📊 スコアの内訳")
@@ -544,7 +587,8 @@ if st.session_state.audit_result is not None:
                 font=dict(color="#FAFAFA"),
                 legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
             )
-            st.plotly_chart(fig_tm, use_container_width=True)
+            # 警告防止のため width="stretch" に変更
+            st.plotly_chart(fig_tm, width="stretch")
         else:
             st.warning("⚠️ この期間のシミュレーションに必要なデータが不足しています。")
 
@@ -566,7 +610,8 @@ if st.session_state.audit_result is not None:
                     title="Factor Exposure Radar",
                     font=dict(color="#FAFAFA")
                 )
-                st.plotly_chart(fig_radar, use_container_width=True)
+                # 警告防止のため width="stretch" に変更
+                st.plotly_chart(fig_radar, width="stretch")
                 
             with c2:
                 st.subheader("診断レポート")
