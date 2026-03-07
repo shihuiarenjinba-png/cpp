@@ -15,35 +15,29 @@ except ImportError:
     HAS_ARCH = False
 
 # =========================================================
-# 🌍 市場設定管理クラス (STEP 4 Implementation)
+# 🌍 市場設定管理クラス (STEP 3-1: Market Selector)
 # =========================================================
 class MarketConfig:
     REGIONS = {
         "US": {
             "name": "United States",
             "ff_dataset": "F-F_Research_Data_Factors",
-            "benchmark_ticker": "^GSPC",
-            "risk_free_ticker": "^TNX",
-            "vix_ticker": "^VIX"
+            "benchmark_ticker": "^GSPC",   # S&P 500
+            "risk_free_ticker": "^TNX",    # 米国10年国債利回り
+            "vix_ticker": "^VIX"           # 米国VIX（恐怖指数）
         },
         "Japan": {
             "name": "Japan",
             "ff_dataset": "Japan_3_Factors",
-            "benchmark_ticker": "^N225",
-            "risk_free_ticker": "^TNX",
-            "vix_ticker": "^VIX"
-        },
-        "Developed": {
-            "name": "Developed Markets",
-            "ff_dataset": "Developed_3_Factors",
-            "benchmark_ticker": "URTH",
-            "risk_free_ticker": "^TNX",
-            "vix_ticker": "^VIX"
+            "benchmark_ticker": "^N225",   # 日経225
+            "risk_free_ticker": "JPY=X",   # ドル円相場 (日本のマクロ指標として強力)
+            "vix_ticker": "^JNIV"          # 日経VI (日本版の恐怖指数)
         }
     }
 
     @staticmethod
     def get_config(region="US"):
+        # 指定されたリージョンがない場合はデフォルトでUSを返す
         return MarketConfig.REGIONS.get(region, MarketConfig.REGIONS["US"])
 
 # =========================================================
@@ -105,7 +99,6 @@ class DataFetcher:
     @staticmethod
     def fetch_market_data(tickers, start_date="2000-01-01"):
         try:
-            # yfinanceの仕様変更に対応 (listで渡す)
             if isinstance(tickers, str):
                 tickers = [tickers]
                 
@@ -116,7 +109,7 @@ class DataFetcher:
                 elif 'Adj Close' in data.columns: data = data['Adj Close']
             
             if data.empty: return pd.DataFrame()
-            return data.ffill().dropna()
+            return data.ffill().dropna(how='all') # 全てNaNの行のみ削除
         except Exception:
             return pd.DataFrame()
 
@@ -134,16 +127,67 @@ class DataFetcher:
         return valid_data, invalid_tickers
 
     @staticmethod
-    def create_synthetic_portfolio(ticker_weights):
+    def create_synthetic_portfolio(ticker_weights, region="US"):
+        """
+        [Step 4-1] 未上場銘柄のプロキシ補完機能を追加
+        """
         tickers = list(ticker_weights.keys())
         if not tickers: return None
+        
+        # 1. 各銘柄のデータを取得
         raw_prices = DataFetcher.fetch_market_data(tickers)
         if raw_prices.empty: return None
-        returns = raw_prices.pct_change().dropna()
-        weighted_returns = pd.Series(0, index=returns.index)
+        if isinstance(raw_prices, pd.Series):
+            raw_prices = raw_prices.to_frame(name=tickers[0])
+            
+        returns = raw_prices.pct_change()
+        
+        # 2. ベンチマーク(市場平均)のデータを取得
+        config = MarketConfig.get_config(region)
+        bm_ticker = config["benchmark_ticker"]
+        bm_prices = DataFetcher.fetch_market_data([bm_ticker])
+        
+        if bm_prices.empty:
+            # 万が一ベンチマークが取得できない場合のフォールバック（従来処理）
+            returns = returns.dropna()
+            weighted_returns = pd.Series(0, index=returns.index)
+            for ticker, weight in ticker_weights.items():
+                if ticker in returns.columns:
+                    weighted_returns += returns[ticker] * (weight / 100.0)
+            return (1 + weighted_returns).cumprod() * 100
+
+        if isinstance(bm_prices, pd.Series):
+            bm_prices = bm_prices.to_frame(name=bm_ticker)
+            
+        bm_returns = bm_prices.pct_change().iloc[:, 0].rename("Benchmark")
+        
+        # 3. データ結合とプロキシ補完 (Betaによる仮想リターンのバックフィル)
+        aligned_data = pd.concat([returns, bm_returns], axis=1)
+        
+        for ticker in tickers:
+            if ticker not in aligned_data.columns: continue
+            
+            # 重複してデータが存在する期間でBetaを計算
+            valid_mask = aligned_data[ticker].notna() & aligned_data["Benchmark"].notna()
+            if valid_mask.sum() > 30: # 少なくとも30日分のデータでBetaを算出
+                cov = np.cov(aligned_data.loc[valid_mask, ticker], aligned_data.loc[valid_mask, "Benchmark"])
+                beta = cov[0, 1] / cov[1, 1] if cov[1, 1] != 0 else 1.0
+            else:
+                beta = 1.0 # データ不足の場合はBeta=1とする
+                
+            # 銘柄のデータが欠損している過去の期間を、(ベンチマークリターン * Beta) で補完
+            missing_mask = aligned_data[ticker].isna() & aligned_data["Benchmark"].notna()
+            aligned_data.loc[missing_mask, ticker] = aligned_data.loc[missing_mask, "Benchmark"] * beta
+            
+        # 補完しきれない大昔のNaNは削除
+        aligned_data = aligned_data.dropna()
+        
+        # 4. ポートフォリオ合成
+        weighted_returns = pd.Series(0, index=aligned_data.index)
         for ticker, weight in ticker_weights.items():
-            if ticker in returns.columns:
-                weighted_returns += returns[ticker] * (weight / 100.0)
+            if ticker in aligned_data.columns:
+                weighted_returns += aligned_data[ticker] * (weight / 100.0)
+                
         synthetic_price = (1 + weighted_returns).cumprod() * 100
         return synthetic_price
 
@@ -168,14 +212,13 @@ class DataFetcher:
             risk_free = config["risk_free_ticker"]
             
             target_tickers = [benchmark, risk_free]
-            
             data = DataFetcher.fetch_market_data(target_tickers, start_date=start_date)
             return data
         except Exception:
             return pd.DataFrame()
 
 # =========================================================
-# 🕰️ タイムマシン機能
+# 🕰️ タイムマシン機能 (STEP 4-1: 地域別リアルデータ対応)
 # =========================================================
 class HistoryTimeMachine:
     SCENARIOS = {
@@ -184,21 +227,34 @@ class HistoryTimeMachine:
         "Corona Shock (2020)": {"start": "2020-02-19", "end": "2022-02-19", "desc": "瞬間的な暴落と急激なバブル"},
         "Great Inflation (2022)": {"start": "2022-01-03", "end": "2024-01-03", "desc": "金利急騰による株債券同時安"}
     }
+    
     @staticmethod
-    def run_replay(current_price, current_beta, scenario_key):
+    def run_replay(current_price, current_beta, scenario_key, region="US"):
         scenario = HistoryTimeMachine.SCENARIOS.get(scenario_key)
         if not scenario: return None
+        
+        config = MarketConfig.get_config(region)
+        bm_ticker = config["benchmark_ticker"]
+        
         try:
-            sp500 = yf.download("^GSPC", start=scenario['start'], end=scenario['end'], progress=False, auto_adjust=True)
-            if isinstance(sp500, pd.DataFrame) and 'Close' in sp500.columns: sp500 = sp500['Close']
-            if sp500.empty: return None
-            market_returns = sp500.pct_change().dropna()
+            # 選択された地域（日本なら^N225、米国なら^GSPC）の当時の実データを直接取得
+            bm_data = yf.download(bm_ticker, start=scenario['start'], end=scenario['end'], progress=False, auto_adjust=True)
+            if isinstance(bm_data, pd.DataFrame) and 'Close' in bm_data.columns: 
+                bm_data = bm_data['Close']
+                
+            if bm_data.empty: return None
+            
+            market_returns = bm_data.pct_change().dropna()
+            # 過去の市場の動き × ポートフォリオの連動性(Beta)
             simulated_returns = market_returns * current_beta
+            
             days = np.arange(len(simulated_returns))
             price_path = (1 + simulated_returns).cumprod() * current_price
             market_path = (1 + market_returns).cumprod() * current_price
+            
             return {"days": days, "prices": price_path, "market_prices": market_path, "desc": scenario['desc']}
-        except Exception: return None
+        except Exception: 
+            return None
 
 # =========================================================
 # 🧪 ファクター分析
