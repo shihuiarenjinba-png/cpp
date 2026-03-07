@@ -130,9 +130,10 @@ with st.sidebar:
         if st.session_state.region_code == "US":
             default_input = "SPY: 60\nTLT: 40"
         else:
-            default_input = "1321.T: 60\n2510.T: 40"
+            # ユーザーがアップした portfolio.csv に近いサンプルをデフォルト化
+            default_input = "1885.T: 10\n5449.T: 10\n8078.T: 10\n7241.T: 10\n3105.T: 10"
 
-        input_str = st.text_area("Ticker: Weight (%)", value=default_input, height=150)
+        input_str = st.text_area("Ticker: Weight (%)", value=default_input, height=200)
         
         if input_str:
             try:
@@ -168,11 +169,11 @@ if run_btn:
     if not input_weights_dict:
         st.error("ポートフォリオを入力してください")
     else:
-        # バックテスト等に使うためにセッションへ保存
         st.session_state.input_weights_dict = input_weights_dict
         
         with st.spinner(f"🔍 {market_choice} の市場構造を分析中... (Applying Strict Factor Model)"):
             try:
+                # 1. データの取得と合成
                 target = DataFetcher.create_synthetic_portfolio(input_weights_dict, region=st.session_state.region_code)
                 if target is None or target.empty:
                     st.error("データ取得失敗。ティッカーを確認してください。")
@@ -181,43 +182,46 @@ if run_btn:
                 st.session_state.target_series = target
                 returns = target.pct_change().dropna()
 
-                # 🆕 厳格化された評価ロジックを呼び出し、weights_dictを渡す
+                # 2. 厳格化された評価ロジックを呼び出し
                 metrics = AdvancedStats.calculate_metrics(returns, weights_dict=input_weights_dict)
                 metrics['annual_return'] = returns.mean() * 12
-                # ボラティリティは metrics 内で既にペナルティ込みで計算されている
                 
+                # 3. ファクター分析 (UI表示用のみ。失敗してもNoneで続行)
                 factor_profile = FactorAnalyzer.analyze_style(target, region=st.session_state.region_code)
-                if not factor_profile:
-                    factor_profile = {'beta_market': 1.0, 'beta_size': 0.0, 'beta_value': 0.0, 'alpha': 0.0}
+                safe_profile = factor_profile if factor_profile else {'beta_market': 1.0, 'beta_size': 0.0, 'beta_value': 0.0, 'alpha': 0.0}
 
                 audit_res = {
                     'metrics': metrics,
                     'betas': {
-                        'Mkt-RF': factor_profile.get('beta_market', 1.0),
-                        'SMB': factor_profile.get('beta_size', 0.0),
-                        'HML': factor_profile.get('beta_value', 0.0)
+                        'Mkt-RF': safe_profile.get('beta_market', 1.0),
+                        'SMB': safe_profile.get('beta_size', 0.0),
+                        'HML': safe_profile.get('beta_value', 0.0)
                     },
                     'current_regime': 'Normal',
-                    'region': st.session_state.region_code
+                    'region': st.session_state.region_code,
+                    'factor_success': factor_profile is not None  # UIでの警告表示用フラグ
                 }
                 st.session_state.audit_result = audit_res
 
-                start_date = target.index[0]
-                waves = StochasticScenarioGenerator.generate_3factor_waves(
-                    start_date=start_date, region=st.session_state.region_code, n_sims=n_sims, horizon_months=months
+                # 4. モンテカルロシミュレーション (★新しいシンプル＆強力なエンジン連携)
+                # "Stress (Fat Tail)" -> "Stress" のように最初の単語を抽出
+                stress_level_key = scenario_mode.split(" ")[0] 
+                
+                simulated_returns = StochasticScenarioGenerator.generate_portfolio_paths(
+                    returns=returns, 
+                    n_sims=n_sims, 
+                    horizon_months=months, 
+                    stress_level=stress_level_key
                 )
-
-                if waves:
-                    price_paths_arr = ProjectionCore.run_market_driven_projection(
-                        current_price=target.iloc[-1], factor_waves=waves,
-                        factor_profile=factor_profile, n_sims=n_sims, horizon_months=months
-                    )
-                else:
-                    st.warning("ファクターデータが不足しています。簡易予測に切り替えます。")
-                    price_paths_arr = np.tile(target.iloc[-1], (months, n_sims))
+                
+                price_paths_arr = ProjectionCore.run_projection(
+                    current_price=target.iloc[-1], 
+                    simulated_returns=simulated_returns
+                )
 
                 sim_paths = pd.DataFrame(price_paths_arr)
 
+                # 5. リカバリー解析
                 recovery_metrics = AuditEngine.analyze_recovery_probability(price_paths_arr)
                 crashed = recovery_metrics.get('crashed_scenarios_count', 0)
                 recovery_metrics['survival_prob'] = 1.0 - (crashed / n_sims) if n_sims > 0 else 1.0
@@ -245,7 +249,7 @@ if st.session_state.audit_result is not None:
     
     st.header("📊 Executive Summary")
     
-    # 🆕 集中投資リスク（ペナルティ）の警告表示
+    # 集中投資リスク（ペナルティ）の警告表示
     penalty_ratio = metrics.get('risk_penalty_ratio', 1.0)
     if penalty_ratio > 1.05:
         st.markdown(f"""
@@ -259,15 +263,15 @@ if st.session_state.audit_result is not None:
     regime = res.get('current_regime', 'Normal')
     region_display = "🇺🇸 米国市場" if res.get('region', 'US') == "US" else "🇯🇵 日本市場"
     
-    advisor_text = f"**{region_display}** の現在の市場環境は**平時**と判定されています。"
-    if regime == 'Crisis':
-        advisor_text = f"⚠️ **{region_display}** の市場は**不安定な局面（Crisis Regime）**にあります。ボラティリティの上昇に警戒が必要です。"
+    advisor_text = f"**{region_display}** の過去データを基にした診断を実行しました。"
     
     betas = res.get('betas', {})
     hml_val = betas.get('HML', 0)
     factor_msg = ""
     
-    if hml_val > 0.1:
+    if not res.get('factor_success'):
+        factor_msg = "⚠️ ファクターデータの取得サーバーが応答しなかったため、詳細なスタイル分析をスキップしました。（※未来予測シミュレーションは自身のボラティリティとt分布を使用して正常に完了しています）"
+    elif hml_val > 0.1:
         factor_msg = "あなたのポートフォリオは**「割安株（バリュー）」**の傾向が強いです。インフレや金利上昇局面には強いですが、景気後退の初期には値動きが重くなる傾向があります。"
     elif hml_val < -0.1:
         factor_msg = "あなたのポートフォリオは**「成長株（グロース）」**の傾向が強いです。市場上昇時の爆発力はありますが、金利上昇には弱いため、債券等でのヘッジが推奨されます。"
@@ -280,7 +284,7 @@ if st.session_state.audit_result is not None:
         {advisor_text} <br>
         {factor_msg}<br>
         <hr style="border-top: 1px solid #4B7BFF; margin: 10px 0;">
-        設定された期間({months}ヶ月)での推定元本回復期間は <b>{sim_res['recovery'].get('avg_recovery_months', 0):.1f}ヶ月</b> です。
+        設定された期間での推定元本回復期間は <b>{sim_res['recovery'].get('avg_recovery_months', 0):.1f}ヶ月</b> です。
     </div>
     """, unsafe_allow_html=True)
 
@@ -304,7 +308,7 @@ if st.session_state.audit_result is not None:
         st.markdown(kpi_card("Expected Shortfall", f"{es_95:.1f}%", "暴落時の平均損失 (ペナルティ込)", "delta-neg"), unsafe_allow_html=True)
     with col3:
         survival = sim_res['recovery'].get('survival_prob', 0) * 100
-        st.markdown(kpi_card("Survival Prob", f"{survival:.1f}%", f"{months}ヶ月生存率", "delta-pos" if survival>80 else "delta-neg"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Survival Prob", f"{survival:.1f}%", "生存率", "delta-pos" if survival>80 else "delta-neg"), unsafe_allow_html=True)
     
     with col4:
         rec_months = sim_res['recovery'].get('avg_recovery_months', 99)
@@ -330,7 +334,7 @@ if st.session_state.audit_result is not None:
     ])
 
     with t1:
-        st.subheader(f"📈 {months}-Month Projection (Fat-Tail Engine)")
+        st.subheader("📈 Projection (Fat-Tail Engine)")
         paths = sim_res['paths']
         x_axis = np.arange(len(paths))
         
@@ -363,7 +367,7 @@ if st.session_state.audit_result is not None:
             st.table(pd.DataFrame({
                 "Metric": ["Volatility (Ann.)", "Max Drawdown", "Skewness (歪度)", "Kurtosis (尖度)", "Concentration (HHI)"],
                 "Value": [
-                    f"{metrics.get('volatility', 0)*100:.1f}%",
+                    f"{metrics.get('volatility', raw_sigma:=returns.std()*np.sqrt(12))*100:.1f}%",
                     f"{metrics.get('max_dd', 0)*100:.1f}%",
                     f"{metrics.get('skewness', 0):.2f}",
                     f"{metrics.get('kurtosis', 0):.2f}",
@@ -387,17 +391,17 @@ if st.session_state.audit_result is not None:
                     recovery_months_list.append(0)
                 else:
                     if path[-1] < start_price:
-                        recovery_months_list.append(months)
+                        # Convert selected 'months' from dropdown to int for comparison
+                        selected_months = int(st.session_state.get('months', paths_arr.shape[0]-1))
+                        recovery_months_list.append(selected_months)
                     else:
                         first_under = np.argmax(underwater)
                         recovered_after = np.argmax(path[first_under:] >= start_price)
                         recovery_months_list.append(recovered_after + 1)
             
-            # 🆕 歯抜けヒストグラムを解消し、KDE(カーネル密度推定)を用いた美しい分布図を作成
             fig_rec = go.Figure()
             df_rec = pd.DataFrame(recovery_months_list, columns=['Months'])
             
-            # 棒グラフ部分
             fig_rec.add_trace(go.Histogram(
                 x=df_rec['Months'],
                 histnorm='probability density',
@@ -406,7 +410,6 @@ if st.session_state.audit_result is not None:
                 marker_color='rgba(0, 204, 150, 0.5)'
             ))
             
-            # KDE (密度曲線) 部分
             if len(recovery_months_list) > 1 and np.var(recovery_months_list) > 0:
                 try:
                     kde = gaussian_kde(recovery_months_list)
@@ -417,7 +420,7 @@ if st.session_state.audit_result is not None:
                         line=dict(color='#FAFAFA', width=2)
                     ))
                 except Exception:
-                    pass # 分散が0に近い場合などはスキップ
+                    pass 
             
             fig_rec.add_vline(x=12, line_dash="dash", line_color="yellow", annotation_text="1 Year")
             fig_rec.add_vline(x=36, line_dash="dash", line_color="red", annotation_text="3 Years")
@@ -504,7 +507,7 @@ if st.session_state.audit_result is not None:
         
         current_region = res.get('region', 'US')
         
-        # 🆕 裏側のエンジンに weights_dict を渡し、「真の実データバックテスト」を呼び出す
+        # エンジン側に weights_dict を渡し、「真の実データバックテスト」を呼び出す
         replay_res = HistoryTimeMachine.run_replay(
             current_price=st.session_state.target_series.iloc[-1],
             current_beta=res['betas'].get('Mkt-RF', 1.0),
@@ -517,15 +520,18 @@ if st.session_state.audit_result is not None:
             st.caption(f"Scenario: {replay_res['desc']}")
             fig_tm = go.Figure()
             
+            # X軸を辞書キーに依存せず安全に取得
+            x_data = replay_res.get('dates', replay_res.get('days', np.arange(len(replay_res['prices']))))
+            
             bm_name = "S&P 500 (US)" if current_region == "US" else "Nikkei 225 (Japan)"
             fig_tm.add_trace(go.Scatter(
-                x=replay_res['days'], y=replay_res['market_prices'], 
+                x=x_data, y=replay_res['market_prices'], 
                 mode='lines', name=bm_name, 
                 line=dict(color='gray', width=2, dash='dash')
             ))
             
             fig_tm.add_trace(go.Scatter(
-                x=replay_res['days'], y=replay_res['prices'], 
+                x=x_data, y=replay_res['prices'], 
                 mode='lines', name='Your Portfolio (Real Data)', 
                 line=dict(color='#00CC96', width=3)
             ))
@@ -533,16 +539,18 @@ if st.session_state.audit_result is not None:
             fig_tm.update_layout(
                 template="plotly_dark", 
                 title=f"Replay: {scenario_key}",
-                xaxis_title="Days since Crisis Start",
+                xaxis_title="Time",
                 yaxis_title="Portfolio Value",
                 font=dict(color="#FAFAFA"),
                 legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
             )
             st.plotly_chart(fig_tm, use_container_width=True)
+        else:
+            st.warning("⚠️ この期間のシミュレーションに必要なデータが不足しています。")
 
     with t5:
         f_res = res.get('betas', {})
-        if f_res:
+        if res.get('factor_success'):
             c1, c2 = st.columns([1, 1])
             with c1:
                 categories = [FACTOR_TRANSLATION.get(k, k) for k in f_res.keys()]
@@ -571,7 +579,7 @@ if st.session_state.audit_result is not None:
                 各数値がプラスであればその要素の恩恵を受けやすく、マイナスであれば逆の動きをする傾向があります。
                 """)
         else:
-            st.warning("ファクター分析データが不足しています。")
+            st.warning("⚠️ ファクター分析の外部データ（Fama-French）が取得できなかったため、この項目の表示をスキップしています。")
 
 else:
     st.info("👈 左側のサイドバーからポートフォリオを入力し、「診断を実行」ボタンを押してください。")
