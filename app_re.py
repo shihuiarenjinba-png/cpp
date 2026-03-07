@@ -3,38 +3,507 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-import warnings
-
-# 将来の警告を無視する設定
-warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # =========================================================
-# 🔗 モジュール読み込みチェック
+# 🔄 [Phase 1: 修正] エンジン読み込み (New Engine Integration)
+# 旧: AuditorCore, ScenarioSimulator -> 新: AuditEngine, ProjectionCore
 # =========================================================
 try:
-    from simulation_engine import MarketDataEngine, PortfolioAnalyzer, PortfolioDiagnosticEngine
-    from pdf_generator import create_pdf_report
+    from auditor_engine import DataFetcher, AuditEngine, ProjectionCore, HistoryTimeMachine
 except ImportError as e:
-    st.error(f"❌ 重要ファイルが見つかりません: {e}")
-    st.info("app.py と同じフォルダに 'simulation_engine.py' と 'pdf_generator.py' があるか確認してください。")
+    # 開発用ダミーモード（エンジンがない場合でもUI確認できるようにする措置）
+    # 本番では st.error を出して stop してください
+    st.error(f"エンジンの読み込みに失敗しました: {e}")
     st.stop()
 
 # =========================================================
-# ⚙️ 定数・設定
+# 📝 [Phase 1: 追加] 用語のマッピング辞書 (Soft Language)
 # =========================================================
+FACTOR_TRANSLATION = {
+    "Mkt-RF": "市場全体 (Market)",
+    "SMB": "小型株効果 (Size)",
+    "HML": "割安株効果 (Value)",
+    "RMW": "収益性 (Profitability)",
+    "CMA": "投資態度 (Investment)",
+    "Mom": "モメンタム (Trend)"
+}
 
-# 🎨 カラーパレット
-COLORS = {
-    'main': '#00FFFF',      # Neon Cyan
-    'benchmark': '#FF69B4', # Hot Pink
-    'principal': '#FFFFFF', # White
-    'median': '#32CD32',    # Lime Green
-    'mean': '#FFD700',      # Gold
-    'p10': '#FF6347',       # Pessimistic
-    'p90': '#00BFFF',       # Optimistic
-    'hist_bar': '#42A5F5',  # Mid Blue
-    'cost_net': '#FF6347',  # Tomato Red
-    'bg_fill': 'rgba(0, 255, 255, 0.1)'
+# =========================================================
+# 🎨 ページ設定 & CSSデザイン (変更なし)
+# =========================================================
+st.set_page_config(page_title="Portfolio Auditor Pro", layout="wide", page_icon="🛡️")
+
+st.markdown("""
+<style>
+    /* 全体のフォントと背景調整 */
+    .main { background-color: #0E1117; color: #FAFAFA; }
+    
+    /* KPIカードのデザイン */
+    .metric-container {
+        background-color: #1E1E1E;
+        border: 1px solid #333;
+        border-radius: 10px;
+        padding: 20px;
+        text-align: center;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    }
+    .metric-label { font-size: 0.9em; color: #A0A0A0; margin-bottom: 5px; }
+    .metric-value { font-size: 1.8em; font-weight: bold; color: #FFFFFF; }
+    .metric-delta { font-size: 0.8em; }
+    .delta-pos { color: #00CC96; }
+    .delta-neg { color: #EF553B; }
+    
+    /* アドバイザーカード */
+    .advisor-card {
+        background-color: #16213E;
+        border-left: 5px solid #4B7BFF;
+        padding: 15px;
+        border-radius: 5px;
+        margin-bottom: 20px;
+    }
+    
+    /* ボタンカスタマイズ */
+    .stButton>button { width: 100%; background-color: #FF4B4B; color: white; font-weight: bold; border-radius: 8px; }
+    
+    /* タブのスタイル */
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        background-color: #262730;
+        border-radius: 5px 5px 0 0;
+        padding: 0 20px;
+        color: #FAFAFA;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #FF4B4B;
+        color: white;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# =========================================================
+# 🏗️ セッション状態の管理
+# =========================================================
+if 'audit_result' not in st.session_state:
+    st.session_state.audit_result = None
+if 'simulation_result' not in st.session_state:
+    st.session_state.simulation_result = None
+if 'target_series' not in st.session_state:
+    st.session_state.target_series = None
+if 'combined_df' not in st.session_state:
+    st.session_state.combined_df = None
+
+# =========================================================
+# 📂 サイドバー: データ入力 (Input)
+# =========================================================
+with st.sidebar:
+    st.title("🛡️ Auditor Pro")
+    st.caption("Professional Risk Analysis System")
+    st.markdown("---")
+    
+    # 入力モード切り替え
+    input_tab, settings_tab = st.tabs(["📂 ポートフォリオ", "⚙️ 設定"])
+    
+    input_weights_dict = None
+    macro_file = None
+    
+    with input_tab:
+        st.subheader("Asset Allocation")
+        
+        # ファイルアップロード
+        port_file = st.file_uploader("構成CSV (Ticker, Weight)", type=['csv'], key="port_up")
+        
+        # デフォルト値の設定
+        default_input = "SPY: 60\nTLT: 40"
+        
+        if port_file:
+            try:
+                df_port = pd.read_csv(port_file)
+                if df_port.shape[1] >= 2:
+                    tickers = df_port.iloc[:, 0].astype(str).tolist()
+                    weights = df_port.iloc[:, 1].astype(str).tolist()
+                    default_input = "\n".join(f"{t}: {w}" for t, w in zip(tickers, weights))
+                    st.success(f"✅ {len(tickers)} 銘柄ロード完了")
+            except Exception as e:
+                st.error(f"読込エラー: {e}")
+
+        # テキストエリア (入力・編集用)
+        input_str = st.text_area("Ticker: Weight (%)", value=default_input, height=150)
+        
+        # 入力解析
+        if input_str:
+            try:
+                weights = {}
+                for line in input_str.split('\n'):
+                    if ':' in line: k, v = line.split(':')
+                    elif ',' in line: k, v = line.split(',')
+                    else: continue
+                    weights[k.strip()] = float(v.strip())
+                input_weights_dict = weights
+                
+                # 合計チェック
+                total_w = sum(weights.values())
+                if abs(total_w - 100) > 1:
+                    st.warning(f"⚠️ 合計が {total_w:.1f}% です (100%推奨)")
+                else:
+                    st.caption(f"✅ 合計: {total_w:.1f}%")
+            except:
+                pass
+
+        st.markdown("---")
+        st.subheader("Macro Indicators (Optional)")
+        macro_file = st.file_uploader("経済指標CSV", type=['csv'], key="macro_up")
+
+    with settings_tab:
+        st.subheader("Analysis Config")
+        
+        # [Phase 2: 修正] 設定項目のデフォルト値を長期・プロ向けに変更
+        scenario_mode = st.selectbox("ストレス強度 (Tail Risk)", ["Standard (Normal)", "Stress (Fat Tail)", "Extreme (Crisis)"], index=1)
+        
+        n_sims = st.slider("MC試行回数", 1000, 10000, 5000) # デフォルトを増やしました
+        
+        # [Phase 2: 修正] デフォルト期間を60ヶ月に変更
+        months = st.selectbox("予測期間 (月)", [12, 36, 60, 120], index=2) # default: 60 months
+
+    st.markdown("---")
+    run_btn = st.button("🚀 診断を実行 (Run Audit)")
+
+# =========================================================
+# 🧠 メインロジック (Execution) - [Phase 3: 全面刷新]
+# =========================================================
+if run_btn:
+    if not input_weights_dict:
+        st.error("ポートフォリオを入力してください")
+    else:
+        with st.spinner("🔍 市場構造を分析中... (Applying 3-Factor Model & t-Distribution)"):
+            try:
+                # 1. データ取得とPF組成 (既存ロジック維持)
+                target = DataFetcher.create_synthetic_portfolio(input_weights_dict)
+                if target is None or target.empty:
+                    st.error("データ取得失敗。ティッカーを確認してください。")
+                    st.stop()
+                
+                st.session_state.target_series = target
+
+                # 2. マクロデータ結合 (既存ロジック維持)
+                std_macro = DataFetcher.fetch_benchmark_and_macro(start_date=target.index[0])
+                user_macro = None
+                if macro_file:
+                    macro_file.seek(0)
+                    user_macro = DataFetcher.load_macro_csv(macro_file)
+                
+                if user_macro is not None and not user_macro.empty:
+                    macro_combined = pd.merge(std_macro, user_macro, left_index=True, right_index=True, how='outer').ffill().dropna()
+                else:
+                    macro_combined = std_macro
+
+                # ---------------------------------------------------------
+                # [Phase 3: 変更点] 新しいエンジンの呼び出し
+                # ---------------------------------------------------------
+                
+                # 3. 監査実行 (AuditEngine)
+                engine = AuditEngine()
+                audit_res = engine.analyze(target, macro_combined)
+                st.session_state.audit_result = audit_res
+
+                # 4. 未来予測 (ProjectionCore)
+                if audit_res:
+                    projector = ProjectionCore(engine_result=audit_res)
+                    
+                    # t分布などを用いた高度なシミュレーション
+                    sim_paths = projector.simulate(
+                        months=months, 
+                        n_scenarios=n_sims, 
+                        use_t_dist=(scenario_mode != "Standard (Normal)")
+                    )
+                    
+                    # 回復力分析
+                    recovery_metrics = projector.analyze_recovery(
+                        paths=sim_paths, 
+                        target_return=0.0  # 元本回復
+                    )
+                    
+                    st.session_state.simulation_result = {
+                        "paths": sim_paths,
+                        "recovery": recovery_metrics,
+                        "final_values": sim_paths.iloc[-1, :].values
+                    }
+                
+                st.success("✅ 分析完了")
+
+            except Exception as e:
+                st.error(f"分析中にエラーが発生しました: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+
+# =========================================================
+# 📊 結果ダッシュボード (Dashboard) - [Phase 4: 表示調整]
+# =========================================================
+if st.session_state.audit_result is not None:
+    res = st.session_state.audit_result
+    sim_res = st.session_state.simulation_result
+    metrics = res.get('metrics', {}) # 基本指標
+    
+    # --- A. エグゼクティブ・サマリー ---
+    st.header("📊 Executive Summary")
+    
+    # 1. アドバイザーメッセージ
+    regime = res.get('current_regime', 'Normal')
+    
+    advisor_text = "現在の市場環境は**平時**と判定されています。"
+    if regime == 'Crisis':
+        advisor_text = "⚠️ 市場は**不安定な局面（Crisis Regime）**にあります。ボラティリティの上昇に警戒が必要です。"
+    
+    # ---------------------------------------------------------
+    # [修正箇所] ファクター翻訳ロジックの強化
+    # ---------------------------------------------------------
+    betas = res.get('betas', {})
+    hml_val = betas.get('HML', 0)
+    factor_msg = ""
+    
+    if hml_val > 0.1:
+        # Value（割安）が強い場合
+        factor_msg = "あなたのポートフォリオは**「割安株（バリュー）」**の傾向が強いです。インフレや金利上昇局面には強いですが、景気後退の初期には値動きが重くなる傾向があります。"
+    elif hml_val < -0.1:
+        # Growth（成長）が強い場合
+        factor_msg = "あなたのポートフォリオは**「成長株（グロース）」**の傾向が強いです。市場上昇時の爆発力はありますが、金利上昇には弱いため、債券等でのヘッジが推奨されます。"
+    else:
+        # どちらでもない場合（バランス型）
+        factor_msg = "あなたのポートフォリオは、バリュー（割安）とグロース（成長）のバランスが取れた構成です。"
+        
+    st.markdown(f"""
+    <div class="advisor-card">
+        <b>🤖 AI Risk Advisor:</b><br>
+        {advisor_text} <br>
+        {factor_msg}<br>
+        <hr style="border-top: 1px solid #4B7BFF; margin: 10px 0;">
+        設定された期間({months}ヶ月)での推定元本回復期間は <b>{sim_res['recovery'].get('avg_recovery_months', 0):.1f}ヶ月</b> です。
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 2. KPI Cards
+    col1, col2, col3, col4 = st.columns(4)
+    
+    def kpi_card(label, value, delta=None, color=""):
+        delta_html = f"<span class='metric-delta {color}'>{delta}</span>" if delta else ""
+        return f"""
+        <div class="metric-container">
+            <div class="metric-label">{label}</div>
+            <div class="metric-value">{value}</div>
+            {delta_html}
+        </div>
+        """
+
+    with col1:
+        ann_ret = metrics.get('annual_return', 0) * 100
+        st.markdown(kpi_card("Expected Return", f"{ann_ret:.1f}%", "年率期待値", "delta-pos"), unsafe_allow_html=True)
+    with col2:
+        es_95 = metrics.get('cvar_95', 0) * 100
+        st.markdown(kpi_card("Expected Shortfall", f"{es_95:.1f}%", "暴落時の平均損失", "delta-neg"), unsafe_allow_html=True)
+    with col3:
+        survival = sim_res['recovery'].get('survival_prob', 0) * 100
+        st.markdown(kpi_card("Survival Prob", f"{survival:.1f}%", f"{months}ヶ月生存率", "delta-pos" if survival>80 else "delta-neg"), unsafe_allow_html=True)
+    with col4:
+        rec_months = sim_res['recovery'].get('avg_recovery_months', 99)
+        # 信号機ロジック: 18ヶ月以内=安全、36ヶ月以内=注意、それ以上=危険
+        color = "delta-pos"
+        if rec_months > 36: color = "delta-neg"
+        elif rec_months > 18: color = "text-warning" # 黄色的な扱い（CSS未定義なら白になる）
+        
+        st.markdown(kpi_card("Recovery Speed", f"{rec_months:.1f} M", "平均回復期間", color), unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # --- B. 詳細分析タブ ---
+    t1, t2, t3, t4, t5 = st.tabs([
+        "🔮 未来予測 (Projection)", 
+        "🛡️ リスク詳細 (Downside)", 
+        "🧠 メンタル指標 (Stress)",
+        "🕰️ タイムマシン (History)",
+        "🧪 ファクター (Style)"
+    ])
+
+    # Tab 1: 未来予測
+    with t1:
+        st.subheader(f"📈 {months}-Month Projection (Fan Chart)")
+        
+        paths = sim_res['paths']
+        x_axis = np.arange(len(paths))
+        
+        p10 = paths.apply(lambda x: np.percentile(x, 10), axis=1)
+        p50 = paths.apply(lambda x: np.percentile(x, 50), axis=1)
+        p90 = paths.apply(lambda x: np.percentile(x, 90), axis=1)
+        
+        fig_fan = go.Figure()
+        fig_fan.add_trace(go.Scatter(
+            x=x_axis, y=p90, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'
+        ))
+        fig_fan.add_trace(go.Scatter(
+            x=x_axis, y=p10, mode='lines', line=dict(width=0), fill='tonexty', 
+            fillcolor='rgba(75, 123, 255, 0.2)', name='80% Confidence'
+        ))
+        fig_fan.add_trace(go.Scatter(
+            x=x_axis, y=p50, mode='lines', line=dict(color='#4B7BFF', width=2), name='Median Forecast'
+        ))
+        
+        current_val = st.session_state.target_series.iloc[-1]
+        fig_fan.add_hline(y=current_val, line_dash="dash", line_color="gray", annotation_text="Start")
+
+        fig_fan.update_layout(
+            title="Portfolio Value Projection (Monte Carlo with t-Distribution)",
+            xaxis_title="Months Ahead",
+            yaxis_title="Portfolio Value",
+            template="plotly_dark",
+            height=500
+        )
+        st.plotly_chart(fig_fan, use_container_width=True)
+
+    # Tab 2: リスク詳細 (Modified for Recovery Histogram)
+    with t2:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.subheader("Risk Metrics")
+            st.table(pd.DataFrame({
+                "Metric": ["Volatility (Ann.)", "Max Drawdown", "Skewness (歪度)", "Kurtosis (尖度)"],
+                "Value": [
+                    f"{metrics.get('volatility', 0)*100:.1f}%",
+                    f"{metrics.get('max_dd', 0)*100:.1f}%",
+                    f"{metrics.get('skewness', 0):.2f}",
+                    f"{metrics.get('kurtosis', 0):.2f}"
+                ]
+            }))
+            st.caption("※ 尖度(Kurtosis)が高いほど、極端な暴落(Fat Tail)が起きやすいことを示唆します。")
+
+        with c2:
+            st.subheader("Recovery Time Distribution")
+            
+            # --- ここから分布生成ロジック ---
+            # シミュレーションパスから、元本回復にかかった月数を計算
+            # (エンジンがこのリストを返さない場合を想定し、ここで軽量計算を行う)
+            paths_arr = sim_res['paths'].values  # numpy array (months, sims)
+            start_price = paths_arr[0, 0]
+            
+            recovery_months = []
+            # パフォーマンスのため、最大1000シナリオ程度をサンプリングして描画
+            sample_indices = np.random.choice(paths_arr.shape[1], min(1000, paths_arr.shape[1]), replace=False)
+            
+            for i in sample_indices:
+                path = paths_arr[:, i]
+                # 元本割れしている期間を探す
+                underwater = path < start_price
+                if not np.any(underwater):
+                    recovery_months.append(0) # そもそも割れてない
+                else:
+                    # 元本割れした後、初めて元本に戻ったインデックスを探す
+                    # 簡易的に、最終的に戻っていない場合は max_months とする
+                    if path[-1] < start_price:
+                        recovery_months.append(months) # 期間内に回復せず
+                    else:
+                        # 最初に割れた地点以降で、回復した地点を探す
+                        first_under = np.argmax(underwater)
+                        recovered_after = np.argmax(path[first_under:] >= start_price)
+                        recovery_months.append(recovered_after + 1) # +1 for approximate month count
+            
+            # ヒストグラムの作成
+            df_rec = pd.DataFrame(recovery_months, columns=['Months'])
+            
+            # 
+            fig_rec = px.histogram(
+                df_rec, x='Months', nbins=30,
+                title="Probability of Recovery Time (Months)",
+                color_discrete_sequence=['#00CC96'], # Greenish for recovery
+                labels={'Months': 'Months to Recover'}
+            )
+            
+            # 1年、3年のライン
+            fig_rec.add_vline(x=12, line_dash="dash", line_color="yellow", annotation_text="1 Year")
+            fig_rec.add_vline(x=36, line_dash="dash", line_color="red", annotation_text="3 Years")
+            
+            fig_rec.update_layout(
+                template="plotly_dark",
+                bargap=0.1,
+                xaxis_title="Months to Recover Principal"
+            )
+            st.plotly_chart(fig_rec, use_container_width=True)
+            
+            st.info("""
+            **見方:** 左側に山があるほど「すぐ戻る」健全なポートフォリオです。
+            右端（期間内未回復）に柱がある場合、長期塩漬けリスクがあります。
+            """)
+
+    # Tab 3: メンタル指標
+    with t3:
+        st.subheader("🧠 Investor Psychology Metrics")
+        c1, c2, c3 = st.columns(3)
+        
+        ulcer = metrics.get('ulcer_index', 0) * 100
+        c1.metric("Ulcer Index (胃潰瘍指数)", f"{ulcer:.1f}", help="下落の深さと期間の長さを組み合わせたストレス指数。")
+        
+        pain_idx = metrics.get('pain_index', 0) * 100 if 'pain_index' in metrics else 0
+        c2.metric("Pain Index", f"{pain_idx:.1f}", help="投資家が感じる痛みの平均値。")
+        
+        st.progress(min(ulcer/20, 1.0), text="Stress Level (Visual)")
+
+    # Tab 4: タイムマシン
+    with t4:
+        st.subheader("🕰️ Stress Testing with History")
+        scenario_key = st.selectbox("Select Historical Crisis", list(HistoryTimeMachine.SCENARIOS.keys()))
+        
+        replay_res = HistoryTimeMachine.run_replay(
+            current_value=st.session_state.target_series.iloc[-1],
+            beta=metrics.get('beta_market', 1.0),
+            scenario_name=scenario_key
+        )
+        
+        if replay_res:
+            st.caption(f"Scenario: {replay_res['desc']}")
+            fig_tm = go.Figure()
+            fig_tm.add_trace(go.Scatter(x=replay_res['days'], y=replay_res['prices'], mode='lines', name='Your Portfolio', line=dict(color='#00CC96', width=3)))
+            fig_tm.update_layout(template="plotly_dark", title=f"Replay: {scenario_key}")
+            st.plotly_chart(fig_tm, use_container_width=True)
+
+    # Tab 5: ファクター分析
+    with t5:
+        f_res = res.get('betas', {})
+        if f_res:
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                categories = [FACTOR_TRANSLATION.get(k, k) for k in f_res.keys()]
+                values = list(f_res.values())
+                
+                fig_radar = go.Figure(data=go.Scatterpolar(
+                    r=values, theta=categories, fill='toself', name='Factor Exposure'
+                ))
+                fig_radar.update_layout(
+                    polar=dict(radialaxis=dict(visible=True)),
+                    template="plotly_dark",
+                    title="Factor Exposure Radar"
+                )
+                st.plotly_chart(fig_radar, use_container_width=True)
+                
+            with c2:
+                st.subheader("診断レポート")
+                st.markdown(f"""
+                - **{FACTOR_TRANSLATION.get('Mkt-RF', 'Market')}**: {f_res.get('Mkt-RF', 1.0):.2f} (市場連動性)
+                - **{FACTOR_TRANSLATION.get('SMB', 'Size')}**: {f_res.get('SMB', 0.0):.2f} (小型株要素)
+                - **{FACTOR_TRANSLATION.get('HML', 'Value')}**: {f_res.get('HML', 0.0):.2f} (割安株要素)
+                
+                **解説:**
+                各数値がプラスであればその要素の恩恵を受けやすく、マイナスであれば逆の動きをする傾向があります。
+                """)
+        else:
+            st.warning("ファクター分析データが不足しています。")
+
+else:
+    # 初期画面
+    st.info("👈 左側のサイドバーからポートフォリオを入力し、「診断を実行」ボタンを押してください。")
+    st.markdown("""
+    ### 🛡️ What is Portfolio Auditor Pro?
+    新エンジン(V2)搭載のプロフェッショナル診断ツールです：
+    1.  **Probability Projection:** t分布を用いた「テールリスク（極端な暴落）」を考慮した未来予測。
+    2.  **Recovery Analysis:** 暴落した際に、どれくらいの期間で回復可能かを算出。
+    3.  **Factor X-Ray:** 専門用語を噛み砕き、あなたの資産の「癖」を可視化。
+    """)    'bg_fill': 'rgba(0, 255, 255, 0.1)'
 }
 
 st.set_page_config(page_title="Factor Simulator V17.2", layout="wide", page_icon="🧬")
