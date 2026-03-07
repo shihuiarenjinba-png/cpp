@@ -15,7 +15,7 @@ except ImportError:
     HAS_ARCH = False
 
 # =========================================================
-# 🌍 市場設定管理クラス (STEP 3-1: Market Selector)
+# 🌍 市場設定管理クラス
 # =========================================================
 class MarketConfig:
     REGIONS = {
@@ -37,19 +37,29 @@ class MarketConfig:
 
     @staticmethod
     def get_config(region="US"):
-        # 指定されたリージョンがない場合はデフォルトでUSを返す
         return MarketConfig.REGIONS.get(region, MarketConfig.REGIONS["US"])
 
 # =========================================================
-# 📊 高度な統計指標計算クラス
+# 📊 高度な統計指標計算クラス (STEP 1: 集中投資ペナルティ実装)
 # =========================================================
 class AdvancedStats:
     @staticmethod
-    def calculate_metrics(returns, benchmark_returns=None):
+    def calculate_metrics(returns, benchmark_returns=None, weights_dict=None):
         if returns.empty: return {}
         
+        # 1. 集中投資ペナルティ(HHI)の計算
+        hhi = 0.0
+        penalty = 1.0
+        if weights_dict is not None:
+            weights = np.array(list(weights_dict.values())) / 100.0
+            hhi = np.sum(weights**2)
+            # HHIが1に近い(集中投資)ほどペナルティ増加（最大1.5倍のリスク評価）
+            penalty = 1.0 + (hhi * 0.5) 
+            
         mu = returns.mean() * 12
-        sigma = returns.std() * np.sqrt(12)
+        # 分散不足の場合、ボラティリティを厳格に（高く）見積もる
+        sigma = returns.std() * np.sqrt(12) * penalty 
+        
         cumulative = (1 + returns).cumprod()
         peak = cumulative.cummax()
         drawdown = (cumulative - peak) / peak
@@ -58,7 +68,7 @@ class AdvancedStats:
         sharpe = (mu - 0.02) / sigma if sigma > 0 else 0
         
         downside_returns = returns[returns < 0]
-        downside_dev = downside_returns.std() * np.sqrt(12)
+        downside_dev = downside_returns.std() * np.sqrt(12) * penalty
         sortino = (mu - 0.02) / downside_dev if downside_dev > 0 else 0
         
         calmar = mu / abs(max_dd) if max_dd != 0 else 0
@@ -68,8 +78,8 @@ class AdvancedStats:
         losses = abs(returns[returns < threshold].sum())
         omega = gains / losses if losses > 0 else np.inf
         
-        var_95 = np.percentile(returns, 5)
-        cvar_95 = returns[returns <= var_95].mean()
+        var_95 = np.percentile(returns, 5) * penalty # 下落リスクも厳しく
+        cvar_95 = returns[returns <= var_95].mean() * penalty
         
         ulcer_sq = (drawdown ** 2).mean()
         ulcer_index = np.sqrt(ulcer_sq)
@@ -89,7 +99,8 @@ class AdvancedStats:
             "sharpe": sharpe, "sortino": sortino, "calmar": calmar,
             "omega": omega, "cvar_95": cvar_95, "ulcer_index": ulcer_index,
             "kelly_criterion": kelly, "max_dd": max_dd, "info_ratio": info_ratio,
-            "skewness": skew(returns), "kurtosis": kurtosis(returns)
+            "skewness": skew(returns), "kurtosis": kurtosis(returns),
+            "hhi_index": hhi, "risk_penalty_ratio": penalty
         }
 
 # =========================================================
@@ -109,7 +120,7 @@ class DataFetcher:
                 elif 'Adj Close' in data.columns: data = data['Adj Close']
             
             if data.empty: return pd.DataFrame()
-            return data.ffill().dropna(how='all') # 全てNaNの行のみ削除
+            return data.ffill().dropna(how='all')
         except Exception:
             return pd.DataFrame()
 
@@ -128,13 +139,9 @@ class DataFetcher:
 
     @staticmethod
     def create_synthetic_portfolio(ticker_weights, region="US"):
-        """
-        [Step 4-1] 未上場銘柄のプロキシ補完機能を追加
-        """
         tickers = list(ticker_weights.keys())
         if not tickers: return None
         
-        # 1. 各銘柄のデータを取得
         raw_prices = DataFetcher.fetch_market_data(tickers)
         if raw_prices.empty: return None
         if isinstance(raw_prices, pd.Series):
@@ -142,13 +149,11 @@ class DataFetcher:
             
         returns = raw_prices.pct_change()
         
-        # 2. ベンチマーク(市場平均)のデータを取得
         config = MarketConfig.get_config(region)
         bm_ticker = config["benchmark_ticker"]
         bm_prices = DataFetcher.fetch_market_data([bm_ticker])
         
         if bm_prices.empty:
-            # 万が一ベンチマークが取得できない場合のフォールバック（従来処理）
             returns = returns.dropna()
             weighted_returns = pd.Series(0, index=returns.index)
             for ticker, weight in ticker_weights.items():
@@ -160,29 +165,21 @@ class DataFetcher:
             bm_prices = bm_prices.to_frame(name=bm_ticker)
             
         bm_returns = bm_prices.pct_change().iloc[:, 0].rename("Benchmark")
-        
-        # 3. データ結合とプロキシ補完 (Betaによる仮想リターンのバックフィル)
         aligned_data = pd.concat([returns, bm_returns], axis=1)
         
         for ticker in tickers:
             if ticker not in aligned_data.columns: continue
-            
-            # 重複してデータが存在する期間でBetaを計算
             valid_mask = aligned_data[ticker].notna() & aligned_data["Benchmark"].notna()
-            if valid_mask.sum() > 30: # 少なくとも30日分のデータでBetaを算出
+            if valid_mask.sum() > 30:
                 cov = np.cov(aligned_data.loc[valid_mask, ticker], aligned_data.loc[valid_mask, "Benchmark"])
                 beta = cov[0, 1] / cov[1, 1] if cov[1, 1] != 0 else 1.0
             else:
-                beta = 1.0 # データ不足の場合はBeta=1とする
+                beta = 1.0
                 
-            # 銘柄のデータが欠損している過去の期間を、(ベンチマークリターン * Beta) で補完
             missing_mask = aligned_data[ticker].isna() & aligned_data["Benchmark"].notna()
             aligned_data.loc[missing_mask, ticker] = aligned_data.loc[missing_mask, "Benchmark"] * beta
             
-        # 補完しきれない大昔のNaNは削除
         aligned_data = aligned_data.dropna()
-        
-        # 4. ポートフォリオ合成
         weighted_returns = pd.Series(0, index=aligned_data.index)
         for ticker, weight in ticker_weights.items():
             if ticker in aligned_data.columns:
@@ -204,55 +201,75 @@ class DataFetcher:
         except Exception:
             return pd.DataFrame()
 
-    @staticmethod
-    def fetch_benchmark_and_macro(start_date, region="US"):
-        try:
-            config = MarketConfig.get_config(region)
-            benchmark = config["benchmark_ticker"]
-            risk_free = config["risk_free_ticker"]
-            
-            target_tickers = [benchmark, risk_free]
-            data = DataFetcher.fetch_market_data(target_tickers, start_date=start_date)
-            return data
-        except Exception:
-            return pd.DataFrame()
-
 # =========================================================
-# 🕰️ タイムマシン機能 (STEP 4-1: 地域別リアルデータ対応)
+# 🕰️ タイムマシン機能 (STEP 3: 真の実データバックテスト)
 # =========================================================
 class HistoryTimeMachine:
     SCENARIOS = {
-        "IT Bubble Burst (2000)": {"start": "2000-03-24", "end": "2005-03-24", "desc": "ハイテクバブル崩壊と長期停滞"},
-        "Lehman Shock (2008)": {"start": "2008-09-15", "end": "2013-09-15", "desc": "金融システム崩壊から量的緩和へ"},
-        "Corona Shock (2020)": {"start": "2020-02-19", "end": "2022-02-19", "desc": "瞬間的な暴落と急激なバブル"},
-        "Great Inflation (2022)": {"start": "2022-01-03", "end": "2024-01-03", "desc": "金利急騰による株債券同時安"}
+        "IT Bubble Burst (2000)": {"start": "2000-03-01", "end": "2005-03-24", "desc": "ハイテクバブル崩壊と長期停滞"},
+        "Lehman Shock (2008)": {"start": "2008-08-01", "end": "2013-09-15", "desc": "金融システム崩壊から量的緩和へ"},
+        "Corona Shock (2020)": {"start": "2020-01-01", "end": "2022-02-19", "desc": "瞬間的な暴落と急激なバブル"},
+        "Great Inflation (2022)": {"start": "2021-12-01", "end": "2024-01-03", "desc": "金利急騰による株債券同時安"}
     }
     
     @staticmethod
-    def run_replay(current_price, current_beta, scenario_key, region="US"):
+    def run_replay(current_price, current_beta, scenario_key, region="US", weights_dict=None):
         scenario = HistoryTimeMachine.SCENARIOS.get(scenario_key)
         if not scenario: return None
         
         config = MarketConfig.get_config(region)
         bm_ticker = config["benchmark_ticker"]
+        start_date = scenario['start']
+        end_date = scenario['end']
         
         try:
-            # 選択された地域（日本なら^N225、米国なら^GSPC）の当時の実データを直接取得
-            bm_data = yf.download(bm_ticker, start=scenario['start'], end=scenario['end'], progress=False, auto_adjust=True)
+            # ベンチマーク（市場平均）の当時の実データを取得
+            bm_data = yf.download(bm_ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
             if isinstance(bm_data, pd.DataFrame) and 'Close' in bm_data.columns: 
                 bm_data = bm_data['Close']
-                
             if bm_data.empty: return None
             
             market_returns = bm_data.pct_change().dropna()
-            # 過去の市場の動き × ポートフォリオの連動性(Beta)
+            market_path = (1 + market_returns).cumprod() * current_price
+
+            # 🆕 【真のバックテスト】構成銘柄の当時の実際の価格データを取得して合成する
+            if weights_dict is not None:
+                tickers = list(weights_dict.keys())
+                port_data = DataFetcher.fetch_market_data(tickers, start_date=start_date)
+                
+                # 期間フィルタリング
+                port_data = port_data.loc[:end_date]
+                if not port_data.empty:
+                    if isinstance(port_data, pd.Series):
+                        port_data = port_data.to_frame(name=tickers[0])
+                        
+                    port_returns = port_data.pct_change()
+                    
+                    # プロキシ補完（当時上場していなかった銘柄は、ベンチマークの動きで埋める）
+                    aligned = pd.concat([port_returns, market_returns.rename("BM")], axis=1)
+                    for tkr in tickers:
+                        if tkr not in aligned.columns: continue
+                        missing = aligned[tkr].isna() & aligned["BM"].notna()
+                        aligned.loc[missing, tkr] = aligned.loc[missing, "BM"] # Beta=1補完
+                        
+                    aligned = aligned.dropna(subset=["BM"])
+                    
+                    weighted_ret = pd.Series(0, index=aligned.index)
+                    for tkr, w in weights_dict.items():
+                        if tkr in aligned.columns:
+                            weighted_ret += aligned[tkr] * (w / 100.0)
+                            
+                    price_path = (1 + weighted_ret).cumprod() * current_price
+                    days = np.arange(len(price_path))
+                    
+                    return {"days": days, "prices": price_path.values, "market_prices": market_path.values, "desc": scenario['desc']}
+
+            # weights_dictが渡されなかった場合のフォールバック（旧ベータ計算）
             simulated_returns = market_returns * current_beta
-            
             days = np.arange(len(simulated_returns))
             price_path = (1 + simulated_returns).cumprod() * current_price
-            market_path = (1 + market_returns).cumprod() * current_price
+            return {"days": days, "prices": price_path.values, "market_prices": market_path.values, "desc": scenario['desc']}
             
-            return {"days": days, "prices": price_path, "market_prices": market_path, "desc": scenario['desc']}
         except Exception: 
             return None
 
@@ -334,7 +351,7 @@ class RegimeAnalyzer:
         return result_data
 
 # =========================================================
-# 🌊 確率的シナリオ生成エンジン
+# 🌊 確率的シナリオ生成エンジン (STEP 2: 連続性の確保)
 # =========================================================
 class StochasticScenarioGenerator:
     @staticmethod
@@ -345,12 +362,16 @@ class StochasticScenarioGenerator:
         current_vol = garch_res['current_vol'] / np.sqrt(12)
         long_run_vol = garch_res['long_term_vol'] / np.sqrt(12)
         
-        DEGREES_OF_FREEDOM = 5 
         residuals = garch_res['residuals']
 
         if len(residuals) > 36:
-            future_shocks = np.random.choice(residuals, size=(horizon_months, n_sims))
+            # 🆕 Smoothed Bootstrap: 生の抽出に正規ノイズを足すことで、ヒストグラムの歯抜けを防ぐ
+            sampled_shocks = np.random.choice(residuals, size=(horizon_months, n_sims))
+            noise = np.random.normal(0, np.std(residuals) * 0.2, size=(horizon_months, n_sims))
+            future_shocks = sampled_shocks + noise
         else:
+            # 🆕 Fat-tailを極端に強調(df=3)し、最悪のシナリオを増やす
+            DEGREES_OF_FREEDOM = 3 
             future_shocks = t.rvs(df=DEGREES_OF_FREEDOM, size=(horizon_months, n_sims))
             variance_adjustment = np.sqrt(DEGREES_OF_FREEDOM / (DEGREES_OF_FREEDOM - 2))
             future_shocks = future_shocks / variance_adjustment
@@ -425,31 +446,6 @@ class ProjectionCore:
 
         return price_paths
 
-    @staticmethod
-    def calculate_prob_metrics(price_paths, target_price=None):
-        final_prices = price_paths[-1, :]
-        mean_final = np.mean(final_prices)
-        median_final = np.median(final_prices)
-        
-        start_price = price_paths[0, 0]
-        prob_up = np.mean(final_prices > start_price)
-        
-        prob_target = 0.0
-        if target_price:
-            prob_target = np.mean(final_prices >= target_price)
-            
-        var_95 = np.percentile(final_prices, 5)
-        cvar_95 = final_prices[final_prices <= var_95].mean() if len(final_prices[final_prices <= var_95]) > 0 else var_95
-
-        return {
-            "mean_price": mean_final,
-            "median_price": median_final,
-            "prob_gain": prob_up,
-            "prob_target": prob_target,
-            "VaR_95": var_95,
-            "CVaR_95": cvar_95
-        }
-
 # =========================================================
 # 📋 最終監査レポート & 解析エンジン
 # =========================================================
@@ -494,50 +490,4 @@ class AuditEngine:
             "recovery_probability": round(prob_recovery * 100, 1),
             "avg_recovery_months": round(avg_recovery, 1),
             "median_recovery_months": np.median(recovery_months) if recovery_months else 0
-        }
-
-    @staticmethod
-    def stress_test_regimes(price_paths, factor_waves):
-        final_returns = (price_paths[-1] / price_paths[0]) - 1
-        results = {}
-        
-        if 'Market' in factor_waves:
-            mkt_vol = np.std(factor_waves['Market'], axis=0)
-            threshold = np.percentile(mkt_vol, 90)
-            high_vol_indices = np.where(mkt_vol >= threshold)[0]
-            
-            if len(high_vol_indices) > 0:
-                avg_ret_stress = np.mean(final_returns[high_vol_indices])
-                prob_loss_stress = np.mean(final_returns[high_vol_indices] < 0)
-                
-                results["High_VIX_Regime"] = {
-                    "avg_return": avg_ret_stress,
-                    "win_rate": 1.0 - prob_loss_stress,
-                    "desc": "市場変動が激しい上位10%のシナリオ"
-                }
-
-        if 'HML' in factor_waves and 'Market' in factor_waves:
-            hml_sum = np.sum(factor_waves['HML'], axis=0)
-            mkt_sum = np.sum(factor_waves['Market'], axis=0)
-            
-            value_dominant_indices = np.where(hml_sum > mkt_sum)[0]
-            
-            if len(value_dominant_indices) > 0:
-                avg_ret_val = np.mean(final_returns[value_dominant_indices])
-                results["Inflation_Value_Regime"] = {
-                    "avg_return": avg_ret_val,
-                    "count": len(value_dominant_indices),
-                    "desc": "バリュー株が市場平均を上回るシナリオ"
-                }
-
-        return results
-
-    @staticmethod
-    def generate_histogram_data(price_paths):
-        final_prices = price_paths[-1, :]
-        hist, bin_edges = np.histogram(final_prices, bins=50, density=True)
-        return {
-            "bins": bin_edges.tolist(),
-            "frequency": hist.tolist(),
-            "raw_final_prices": final_prices.tolist()
         }
