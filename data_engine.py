@@ -59,9 +59,29 @@ class DataFetcher:
             data = yf.download(tickers, start=start_date, progress=False, auto_adjust=True, threads=False)
             
             if data.empty: return pd.DataFrame()
+            
+            # 🚨【修正箇所】yfinanceの仕様変更による多重階層(MultiIndex)やタプル化を強制的に平坦化
             if isinstance(data.columns, pd.MultiIndex):
-                if 'Close' in data.columns.levels[0]: data = data['Close']
-                elif 'Adj Close' in data.columns.levels[0]: data = data['Adj Close']
+                if 'Close' in data.columns.levels[0]: 
+                    data = data['Close']
+                elif 'Adj Close' in data.columns.levels[0]: 
+                    data = data['Adj Close']
+            
+            # 1銘柄取得時などにSeriesになってしまった場合はDataFrameに戻す
+            if isinstance(data, pd.Series):
+                name = tickers[0] if tickers else 'Close'
+                data = data.to_frame(name=name)
+                
+            # 古い仕様や特殊な設定で平坦なままPrice項目が列になっている場合の対応
+            if 'Close' in data.columns:
+                data = data[['Close']].copy()
+                data.columns = [tickers[0]]
+            elif 'Adj Close' in data.columns:
+                data = data[['Adj Close']].copy()
+                data.columns = [tickers[0]]
+                
+            # 列名を確実に「文字列」に統一（タプル混入によるKeyErrorを完全排除）
+            data.columns = [str(c) for c in data.columns]
             
             # タイムゾーンを削除してインデックスを「日付」のみに標準化（結合時のズレを防止）
             if data.index.tz is not None: data.index = data.index.tz_localize(None)
