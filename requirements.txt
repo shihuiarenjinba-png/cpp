@@ -14,3 +14,4 @@ setuptools
 scipy
 arch
 matplotlib
+seaborn
