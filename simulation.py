@@ -37,8 +37,9 @@ class RegimeAnalyzer:
         rolling_vol = returns.rolling(window=20).std().dropna()
         if len(rolling_vol) < 100: return None
         
-        # ウェルチ法による周波数解析
-        freqs, psd = signal.welch(rolling_vol)
+        # 🚨【修正箇所】Pandas Seriesを純粋な1次元NumPy配列に変換してから渡す
+        # これによりSciPy内部でのKeyError(tuple)を完全に回避
+        freqs, psd = signal.welch(rolling_vol.to_numpy().flatten())
         dominant_freq = freqs[np.argmax(psd)]
         
         # 周波数から周期（日数）へ変換
