@@ -58,6 +58,21 @@ class AuditEngine:
         plt.close(fig)
 
     @staticmethod
+    def plot_underwater_drawdown(portfolio_prices):
+        """【新規追加】アンダーウォーター・プロット（過去のドローダウンの時系列推移）"""
+        peak = portfolio_prices.cummax()
+        drawdown = (portfolio_prices - peak) / peak * 100
+        
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.fill_between(drawdown.index, drawdown, 0, color="firebrick", alpha=0.4)
+        ax.plot(drawdown.index, drawdown, color="darkred", linewidth=1)
+        ax.set_title("Underwater Plot (Historical Drawdowns)", fontsize=14, fontweight="bold")
+        ax.set_ylabel("Drawdown (%)")
+        ax.set_ylim(drawdown.min() * 1.1 if drawdown.min() < 0 else -10, 0)
+        st.pyplot(fig)
+        plt.close(fig)
+
+    @staticmethod
     def plot_time_machine_chart(crisis_results):
         """過去の危機における最大ドローダウンを棒グラフで警告表示"""
         names = list(crisis_results.keys())
@@ -115,6 +130,25 @@ class AuditEngine:
         
         ax.set_title("Final Value Distribution", fontsize=14, fontweight="bold")
         ax.set_xlabel("Final Portfolio Value (1.0 = Initial)")
+        ax.legend()
+        st.pyplot(fig)
+        plt.close(fig)
+        
+    @staticmethod
+    def plot_monte_carlo_drawdown_hist(paths):
+        """【新規追加】1万回のシナリオにおける最大ドローダウンの分布"""
+        peaks = np.maximum.accumulate(paths, axis=0)
+        drawdowns = (paths - peaks) / peaks
+        max_dds = drawdowns.min(axis=0) * 100 # %表記
+        
+        fig, ax = plt.subplots(figsize=(10, 3))
+        sns.histplot(max_dds, bins=50, kde=True, color="darkorange", ax=ax, stat="probability")
+        
+        median_dd = np.median(max_dds)
+        ax.axvline(median_dd, color="red", linestyle="--", linewidth=2, label=f"Median Max DD: {median_dd:.1f}%")
+        
+        ax.set_title("Simulated Max Drawdown Distribution (1-Year)", fontsize=14, fontweight="bold")
+        ax.set_xlabel("Maximum Drawdown (%)")
         ax.legend()
         st.pyplot(fig)
         plt.close(fig)
@@ -217,9 +251,12 @@ def main():
                 col3.metric("Sharpe Ratio", f"{metrics.get('sharpe', 0):.2f}")
                 col4.metric("Max Drawdown", f"{metrics.get('max_dd', 0) * 100:.2f}%")
                 
-                st.subheader("Historical Cumulative Growth (Base=100)")
+                st.subheader("Historical Cumulative Growth & Drawdown")
                 aligned_growth = pd.concat([synthetic_portfolio.rename("Portfolio"), (1+bm_returns).cumprod()*100], axis=1).dropna()
                 st.line_chart(aligned_growth)
+                
+                # 【追加】アンダーウォーター・プロット
+                AuditEngine.plot_underwater_drawdown(synthetic_portfolio)
 
             # --- タブ2: リスクと連動性 ---
             with tab2:
@@ -246,12 +283,23 @@ def main():
                 if projection:
                     AuditEngine.plot_monte_carlo_fanchart(projection["paths"])
                     
-                    p_col1, p_col2, p_col3 = st.columns(3)
-                    p_col1.metric("Median Scenario (中央値)", f"{projection['median'] * 100:.1f}%")
-                    p_col2.metric("Worst 5% Scenario (下位5%)", f"{projection['worst_5th'] * 100:.1f}%")
-                    p_col3.metric("Probability of Loss (元本割れ確率)", f"{projection['prob_loss']:.1f}%")
+                    # CVaR (Expected Shortfall) の計算
+                    final_values = projection["paths"][-1, :]
+                    worst_5th = projection['worst_5th']
+                    cvar = final_values[final_values <= worst_5th].mean()
                     
-                    AuditEngine.plot_monte_carlo_histogram(projection["paths"][-1, :])
+                    p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+                    p_col1.metric("Median (中央値)", f"{projection['median'] * 100:.1f}%")
+                    p_col2.metric("Worst 5% (下位5%)", f"{worst_5th * 100:.1f}%")
+                    p_col3.metric("CVaR (下位5%の平均)", f"{cvar * 100:.1f}%", help="テールリスク（最悪のシナリオでの平均的な着地点）")
+                    p_col4.metric("Prob of Loss (元本割れ)", f"{projection['prob_loss']:.1f}%")
+                    
+                    # グラフを横並びに配置
+                    g_col1, g_col2 = st.columns(2)
+                    with g_col1:
+                        AuditEngine.plot_monte_carlo_histogram(final_values)
+                    with g_col2:
+                        AuditEngine.plot_monte_carlo_drawdown_hist(projection["paths"])
                     
                     recovery_rate = AuditEngine.analyze_recovery(projection["paths"])
                     st.info(f"📉 **回復力監査:** ドローダウン発生後、1年以内に元本を回復する確率: **{recovery_rate:.1f}%**")
@@ -265,7 +313,10 @@ def main():
                     f_col1.metric("Market Beta (市場連動性)", f"{style['beta_market']:.2f}")
                     f_col2.metric("Size (小型株効果)", f"{style['beta_size']:.2f}")
                     f_col3.metric("Value (割安株効果)", f"{style['beta_value']:.2f}")
-                    f_col4.metric("Alpha (超過収益)", f"{style['alpha'] * 100:.3f}%")
+                    # 超過収益（Alpha）に関する注釈付き表示
+                    f_col4.metric("Alpha (超過収益/未調整)", f"{style['alpha'] * 100:.3f}%", help="バックエンド計算による未調整アルファ。無リスク金利(Rf)を控除していない場合、値が大きく出ることがあります。")
+                    
+                    st.caption("※ **Alphaに関する注記**: このAlphaは純粋な超過収益率（$R_p - R_f$）に基づいた厳密なゼロ近似ではない可能性があります。モデルの当てはまりの目安としてご利用ください。")
                 else:
                     st.warning("ファクター分析に必要な期間のデータが不足しています。")
                 
