@@ -198,22 +198,32 @@ class FactorAnalyzer:
         if len(combined) < 10: return None
         
         try:
+            # Kenneth Frenchライブラリの列名を柔軟に取得
             mkt = [c for c in combined.columns if 'Mkt' in c or 'MKT' in c][0]
             smb = [c for c in combined.columns if 'SMB' in c][0]
             hml = [c for c in combined.columns if 'HML' in c][0]
             rf  = [c for c in combined.columns if 'RF' in c][0]
 
-            # 超過リターン = ポートフォリオリターン - 無リスク利子率
+            # 💡【重要修正】超過リターン = ポートフォリオリターン - 無リスク利子率
+            # 目的変数を厳密な「超過収益率」に設定
             y = combined["Target"] - combined[rf]
+            
+            # 説明変数 (Mkt-RF, SMB, HML)
             X = combined[[mkt, smb, hml]]
             X = sm.add_constant(X)
             
             model = sm.OLS(y, X).fit()
+            
+            # 💡【重要修正】Alphaの年率化
+            # OLSの切片(const)は「月次のAlpha」。これを12倍して年率(Annualized)に変換する
+            monthly_alpha = model.params.get("const", 0.0)
+            annualized_alpha = monthly_alpha * 12
+            
             return {
                 "beta_market": model.params.get(mkt, 1.0),
                 "beta_size": model.params.get(smb, 0.0),
                 "beta_value": model.params.get(hml, 0.0),
-                "alpha": model.params.get("const", 0.0),
+                "alpha": annualized_alpha,  # 修正された年率Alphaを返す
                 "r_squared": model.rsquared,
                 "region": region
             }
