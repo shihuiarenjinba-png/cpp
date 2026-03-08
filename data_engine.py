@@ -60,28 +60,31 @@ class DataFetcher:
             
             if data.empty: return pd.DataFrame()
             
-            # 🚨【修正箇所】yfinanceの仕様変更による多重階層(MultiIndex)やタプル化を強制的に平坦化
+            # 💡【修正1】データ構造の確実なクレンジング（不要な階層の削ぎ落とし）
+            # MultiIndex（複数階層）で返ってきた場合、純粋なティッカー名だけを残す
             if isinstance(data.columns, pd.MultiIndex):
-                if 'Close' in data.columns.levels[0]: 
+                if 'Close' in data.columns.get_level_values(0):
                     data = data['Close']
-                elif 'Adj Close' in data.columns.levels[0]: 
+                elif 'Adj Close' in data.columns.get_level_values(0):
                     data = data['Adj Close']
+            else:
+                # 古い形式の場合の対応
+                if 'Close' in data.columns:
+                    data = data[['Close']]
+                elif 'Adj Close' in data.columns:
+                    data = data[['Adj Close']]
             
-            # 1銘柄取得時などにSeriesになってしまった場合はDataFrameに戻す
+            # 💡【修正2】1銘柄・複数銘柄の取得パターンの統一
+            # 1銘柄取得時などにデータがSeries（1列のリスト）に潰れた場合、表（DataFrame）に直す
             if isinstance(data, pd.Series):
-                name = tickers[0] if tickers else 'Close'
-                data = data.to_frame(name=name)
+                data = data.to_frame()
                 
-            # 古い仕様や特殊な設定で平坦なままPrice項目が列になっている場合の対応
-            if 'Close' in data.columns:
-                data = data[['Close']].copy()
-                data.columns = [tickers[0]]
-            elif 'Adj Close' in data.columns:
-                data = data[['Adj Close']].copy()
+            # 列名が 'Close' 等の一般名詞になってしまっている場合は、ティッカー名に強制上書き
+            if len(data.columns) == 1 and len(tickers) == 1:
                 data.columns = [tickers[0]]
                 
-            # 列名を確実に「文字列」に統一（タプル混入によるKeyErrorを完全排除）
-            data.columns = [str(c) for c in data.columns]
+            # 列名を確実に文字列化（ここでタプルの混入を最終ブロック）
+            data.columns = [str(c).strip() for c in data.columns]
             
             # タイムゾーンを削除してインデックスを「日付」のみに標準化（結合時のズレを防止）
             if data.index.tz is not None: data.index = data.index.tz_localize(None)
@@ -133,6 +136,7 @@ class DataFetcher:
         bm_ticker = config["benchmark_ticker"]
         bm_prices = DataFetcher.fetch_market_data([bm_ticker])
         
+        # 💡【修正3】合成計算前の安全化（列名の確実な文字列化と次元統一）
         if isinstance(raw_prices, pd.Series):
             raw_prices = raw_prices.to_frame(name=tickers[0])
         if isinstance(bm_prices, pd.Series):
@@ -148,28 +152,31 @@ class DataFetcher:
         aligned_data = aligned_data.dropna(subset=["Benchmark"])
         
         for ticker in tickers:
+            ticker_str = str(ticker).strip()
+            
             # その時代に全く上場していなかった場合（完全欠損）のフォールバック
-            if ticker not in aligned_data.columns or aligned_data[ticker].isna().all():
-                aligned_data[ticker] = aligned_data["Benchmark"] 
+            if ticker_str not in aligned_data.columns or aligned_data[ticker_str].isna().all():
+                aligned_data[ticker_str] = aligned_data["Benchmark"] 
                 continue
             
             # 有効な重複期間からベータ値の算出
-            valid_mask = aligned_data[ticker].notna() & aligned_data["Benchmark"].notna()
+            valid_mask = aligned_data[ticker_str].notna() & aligned_data["Benchmark"].notna()
             if valid_mask.sum() > 30:
-                cov = np.cov(aligned_data.loc[valid_mask, ticker], aligned_data.loc[valid_mask, "Benchmark"])
+                cov = np.cov(aligned_data.loc[valid_mask, ticker_str], aligned_data.loc[valid_mask, "Benchmark"])
                 beta = cov[0, 1] / cov[1, 1] if cov[1, 1] != 0 else 1.0
             else:
                 beta = 1.0
             
             # 上場前の空白期間を「ベンチマークリターン * ベータ」でバックフィル生成
-            missing_mask = aligned_data[ticker].isna()
-            aligned_data.loc[missing_mask, ticker] = aligned_data.loc[missing_mask, "Benchmark"] * beta
+            missing_mask = aligned_data[ticker_str].isna()
+            aligned_data.loc[missing_mask, ticker_str] = aligned_data.loc[missing_mask, "Benchmark"] * beta
         
         # ウェイトに基づく加重平均リターンの算出
         weighted_returns = pd.Series(0, index=aligned_data.index)
         for ticker, weight in ticker_weights.items():
+            ticker_str = str(ticker).strip()
             # 最後の細かい休場のズレは 0 (変動なし) として処理
-            weighted_returns += aligned_data[ticker].fillna(0) * (weight / 100.0)
+            weighted_returns += aligned_data[ticker_str].fillna(0) * (weight / 100.0)
                 
         # 100をベースとした累積リターン(価格推移)を返す
         return (1 + weighted_returns).cumprod() * 100
