@@ -1,6 +1,6 @@
 """
 analytics.py
-ポートフォリオのリスク、リターン、およびファクターエクスポージャーを計算するコア分析エンジン。
+ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
 """
 
 import pandas as pd
@@ -28,7 +28,7 @@ class AdvancedStats:
     @staticmethod
     def calculate_metrics(returns, benchmark_returns=None, weights_dict=None, region="US"):
         """
-        日次リターン系列から各種リスク指標、ダウンサイドリスク、分離リスクを計算する。
+        日次リターン系列から各種リスク指標、ダウンサイドリスク、分離リスク、およびリスク寄与度を計算する。
         """
         if returns.empty: return {}
         
@@ -44,17 +44,17 @@ class AdvancedStats:
             weights = np.array(list(weights_dict.values())) / 100.0
             hhi = np.sum(weights**2)
             enc = 1.0 / hhi if hhi > 0 else 1.0
-            # 集中度が高いほどペナルティ係数が1.0から増加する
             penalty = 1.0 + (hhi ** 0.8) * 0.5 
             
-        # 2. リスク（ボラティリティ）の計算
-        # ⚠️ 【重要修正】日次リターンの年率換算に sqrt(252) を使用してリスクの過小評価を防止
+        # 2. リスク（ボラティリティ）とリスク寄与度の計算
         ann_factor = np.sqrt(TRADING_DAYS_PER_YEAR)
         raw_sigma = returns.std() * ann_factor
         lw_sigma = raw_sigma
         
-        # 📌 収縮推定（Ledoit-Wolf）による堅牢なボラティリティ算出
-        if HAS_SKLEARN and weights_dict:
+        # 【新規追加】銘柄ごとのリスク寄与度（Percentage Risk Contribution）
+        risk_contribution = {}
+        
+        if weights_dict:
             try:
                 tickers = list(weights_dict.keys())
                 raw_comp = DataFetcher.fetch_market_data(tickers)
@@ -69,18 +69,30 @@ class AdvancedStats:
                         new_weights = np.array([weights_dict[t] for t in valid_tickers])
                         new_weights = new_weights / np.sum(new_weights)
                         
-                        # 外れ値やノイズに強い共分散行列を生成
-                        lw = LedoitWolf().fit(comp_returns)
-                        cov_matrix = lw.covariance_
+                        # 共分散行列の計算 (Ledoit-Wolf または 通常の共分散)
+                        if HAS_SKLEARN:
+                            lw = LedoitWolf().fit(comp_returns)
+                            cov_matrix = lw.covariance_
+                        else:
+                            cov_matrix = comp_returns.cov().values
+                            
+                        # ポートフォリオの分散
                         port_var = np.dot(new_weights.T, np.dot(cov_matrix, new_weights))
                         lw_sigma = np.sqrt(port_var) * ann_factor
+                        
+                        # 💡【重要追加】周辺リスク寄与度 (Marginal Contribution to Risk) の計算
+                        # 各銘柄がポートフォリオ全体のリスク（分散）に何％寄与しているかを算出
+                        mcr = np.dot(cov_matrix, new_weights) / np.sqrt(port_var)
+                        component_risk = new_weights * mcr
+                        percentage_risk = component_risk / np.sqrt(port_var)
+                        
+                        risk_contribution = dict(zip(valid_tickers, percentage_risk))
             except Exception as e:
-                print(f"LedoitWolf Error: {e}")
+                print(f"Risk Contribution/LedoitWolf Error: {e}")
         
-        # 最終的なシグマは収縮推定値に集中投資ペナルティを加味したもの
         sigma = lw_sigma * penalty 
         
-        # リターン計算 (ボラティリティ・ドラッグを考慮した幾何平均ベースの推定)
+        # リターン計算 (ボラティリティ・ドラッグを考慮)
         arithmetic_mu = returns.mean() * TRADING_DAYS_PER_YEAR
         mu = arithmetic_mu - 0.5 * (sigma ** 2) 
         
@@ -95,7 +107,6 @@ class AdvancedStats:
         risk_free_rate = DEFAULT_RISK_FREE_RATE 
         sharpe = (mu - risk_free_rate) / sigma if sigma > 0 else 0
         
-        # ダウンサイドリスク (下落時のみの標準偏差)
         downside_returns = returns[returns < 0]
         downside_dev = downside_returns.std() * ann_factor * penalty
         sortino = (mu - risk_free_rate) / downside_dev if downside_dev > 0 else 0
@@ -107,15 +118,12 @@ class AdvancedStats:
         losses = abs(returns[returns < threshold].sum())
         omega = gains / losses if losses > 0 else np.inf
         
-        # CVaR (Expected Shortfall): 最悪5%の日の平均損失
         var_95 = np.percentile(returns, 5) * penalty 
         cvar_95 = returns[returns <= var_95].mean() * penalty
         
         kelly = mu / (sigma ** 2) if sigma > 0 else 0
-        
         info_ratio = np.nan
         
-        # 📌 固有リスク（Idiosyncratic Risk）とシステマティックリスクの分離
         systematic_risk = 0.0
         idiosyncratic_risk = 0.0
         portfolio_beta = 1.0
@@ -147,7 +155,6 @@ class AdvancedStats:
                         systematic_risk = np.sqrt(sys_var) * ann_factor
                         idiosyncratic_risk = np.sqrt(idio_var) * ann_factor
                         
-                        # Info Ratio
                         active_ret = aligned.iloc[:, 0] - aligned["BM"]
                         track_err = active_ret.std() * ann_factor
                         if track_err > 0:
@@ -167,7 +174,8 @@ class AdvancedStats:
             "raw_volatility": raw_sigma,
             "systematic_risk": systematic_risk,
             "idiosyncratic_risk": idiosyncratic_risk,
-            "portfolio_beta": portfolio_beta
+            "portfolio_beta": portfolio_beta,
+            "risk_contribution": risk_contribution # 💡追加: 各銘柄のリスク寄与度(%)
         }
 
 # =========================================================
@@ -177,10 +185,9 @@ class FactorAnalyzer:
     @staticmethod
     def analyze_style(target_series, region="US"):
         """
-        Fama-French 3ファクターモデルを用いて、ポートフォリオのリターンの源泉を重回帰分析する。
+        Fama-French 3ファクターモデルを用いて、超過収益率による厳密な重回帰分析を行う。
         """
         if target_series.empty: return None
-        # 月次リターンへ変換 ('ME' は Month End の意)
         target_monthly = target_series.resample('ME').last().pct_change().dropna()
         if len(target_monthly) < 6: return None
         
@@ -190,7 +197,6 @@ class FactorAnalyzer:
         
         if ff_data.empty: return None
         
-        # 期間（月）でインデックスを結合
         target_monthly.index = target_monthly.index.to_period('M')
         ff_data.index = ff_data.index.to_period('M')
         combined = pd.concat([target_monthly.rename("Target"), ff_data], axis=1).dropna()
@@ -198,35 +204,103 @@ class FactorAnalyzer:
         if len(combined) < 10: return None
         
         try:
-            # Kenneth Frenchライブラリの列名を柔軟に取得
             mkt = [c for c in combined.columns if 'Mkt' in c or 'MKT' in c][0]
             smb = [c for c in combined.columns if 'SMB' in c][0]
             hml = [c for c in combined.columns if 'HML' in c][0]
             rf  = [c for c in combined.columns if 'RF' in c][0]
 
-            # 💡【重要修正】超過リターン = ポートフォリオリターン - 無リスク利子率
-            # 目的変数を厳密な「超過収益率」に設定
+            # 💡【超過収益率の算出】ポートフォリオリターンから無リスク金利を控除
             y = combined["Target"] - combined[rf]
             
-            # 説明変数 (Mkt-RF, SMB, HML)
             X = combined[[mkt, smb, hml]]
             X = sm.add_constant(X)
             
             model = sm.OLS(y, X).fit()
             
-            # 💡【重要修正】Alphaの年率化
-            # OLSの切片(const)は「月次のAlpha」。これを12倍して年率(Annualized)に変換する
             monthly_alpha = model.params.get("const", 0.0)
             annualized_alpha = monthly_alpha * 12
+            
+            # 💡【重要追加】p値を取得し、回帰係数の信頼性をAIに渡せるようにする
+            pvalues = model.pvalues
             
             return {
                 "beta_market": model.params.get(mkt, 1.0),
                 "beta_size": model.params.get(smb, 0.0),
                 "beta_value": model.params.get(hml, 0.0),
-                "alpha": annualized_alpha,  # 修正された年率Alphaを返す
+                "alpha": annualized_alpha,
                 "r_squared": model.rsquared,
+                "p_value_market": pvalues.get(mkt, 1.0),
+                "p_value_size": pvalues.get(smb, 1.0),
+                "p_value_value": pvalues.get(hml, 1.0),
                 "region": region
             }
         except Exception as e:
             print(f"Factor Analyzer Error: {e}")
             return None
+
+    @staticmethod
+    def get_factor_correlation(region="US", periods=60):
+        """
+        ファクター同士（市場、サイズ、バリュー）の相関行列を計算する。
+        """
+        try:
+            config = MarketConfig.get_config(region)
+            ff_data = DataFetcher.fetch_fama_french_factors(dataset_name=config["ff_dataset"])
+            if ff_data.empty: return None
+            
+            ff_recent = ff_data.tail(periods)
+            
+            mkt = [c for c in ff_recent.columns if 'Mkt' in c or 'MKT' in c][0]
+            smb = [c for c in ff_recent.columns if 'SMB' in c][0]
+            hml = [c for c in ff_recent.columns if 'HML' in c][0]
+            
+            factors_only = ff_recent[[mkt, smb, hml]]
+            return factors_only.corr().to_dict()
+        except Exception as e:
+            print(f"Factor Correlation Error: {e}")
+            return None
+
+
+# =========================================================
+# 🤖 AIアドバイザープロンプト生成 (Step 3: AIの診断能力)
+# =========================================================
+class AIPromptBuilder:
+    @staticmethod
+    def generate_quant_prompt(stats_data, factor_data, target_name="現在のポートフォリオ"):
+        """
+        計算結果（数字）を元に、生成AIへ渡す「クオンツマネージャーの小言」作成用プロンプトを自動生成する。
+        """
+        # リスク寄与度の一番高い銘柄（真の支配者）を特定
+        risk_contributions = stats_data.get("risk_contribution", {})
+        top_risk_asset = "特定不能"
+        top_risk_value = 0.0
+        
+        if risk_contributions:
+            top_risk_asset = max(risk_contributions, key=risk_contributions.get)
+            top_risk_value = risk_contributions[top_risk_asset] * 100
+
+        # R2とアルファの取得（ファクター分析が成功している場合）
+        r_squared = factor_data.get("r_squared", 0) * 100 if factor_data else 0.0
+        alpha = factor_data.get("alpha", 0) * 100 if factor_data else 0.0
+
+        # AIの脳内に叩き込む「秘密の指示書」
+        prompt = f"""
+あなたはウォール街で長年活躍する、非常に優秀だが少し辛口なクオンツ・ポートフォリオマネージャーです。
+以下の計算結果データに基づいて、個人投資家向けに「プロの小言（診断レポート）」を作成してください。
+
+【ポートフォリオの客観的データ】
+- 分析対象: {target_name}
+- リスクの支配者（最大リスク寄与銘柄）: {top_risk_asset} ({top_risk_value:.1f}%)
+- 市場との連動性 (R2): {r_squared:.1f}% (※この数値が高いほど、ただのインデックスファンドと同じ動きをしています)
+- 年率アルファ (超過収益): {alpha:.2f}%
+- ボラティリティ: {stats_data.get("volatility", 0) * 100:.1f}%
+- 最大ドローダウン: {stats_data.get("max_dd", 0) * 100:.1f}%
+
+【指示】
+1. 専門的なクオンツの視点から、厳しいが的確で愛のあるアドバイスをしてください。
+2. もし「リスクの支配者」が50%を超えている場合、「分散投資になっているつもりか？実質的に{top_risk_asset}と心中しているだけだぞ」と厳しく指摘してください。
+3. もしR2が90%を超えていて、かつアルファがマイナスまたはゼロ付近の場合は、「高い手数料（または手間）を払ってインデックス以下の成果を出す、典型的な『隠れインデックスファンド』だ」と警告してください。
+4. 最後に、改善のための具体的なネクストアクションを1つ提示してください。
+5. 出力はMarkdown形式で、見出しを使って読みやすくしてください。ですます調で構いませんが、プロとしての威厳を保ってください。
+"""
+        return prompt
