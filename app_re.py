@@ -3,6 +3,7 @@ app.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
 ※ Plotly対応 ＆ サイドバー即時編集（st.data_editor）統合版
 ※ Step 3: AIプロンプト連携 ＆ ファクター解析詳細化 追加版
+※ 修正版: CSV対応、ファクター相関、過去危機のチャート化、Tab4 UI整理
 """
 
 import streamlit as st
@@ -10,6 +11,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots  # 追加: 危機チャートのサブプロット用
 
 # これまでに作成したモジュールのインポート
 from config import MarketConfig, FACTOR_TRANSLATION
@@ -22,18 +24,24 @@ from simulation import RegimeAnalyzer, HistoryTimeMachine, ProjectionCore
 # =========================================================
 class AuditEngine:
     
+    # 修正点2: 個別銘柄の相関からファクター相関へ刷新
     @staticmethod
-    def plot_correlation_matrix(returns_df):
-        """銘柄間の相関関係をヒートマップで可視化（Plotly）"""
-        corr = returns_df.corr()
+    def plot_factor_correlation(region="US"):
+        """ファクター同士の相関関係をヒートマップで可視化（Plotly）"""
+        factor_corr = FactorAnalyzer.get_factor_correlation(region=region)
+        if not factor_corr:
+            st.warning("ファクター相関データが取得できません。")
+            return
+            
+        corr_df = pd.DataFrame(factor_corr)
         fig = px.imshow(
-            corr, 
+            corr_df, 
             text_auto=".2f", 
             color_continuous_scale="RdBu_r", 
             zmin=-1, zmax=1,
-            title="Asset Correlation Matrix (Interactive)"
+            title="Factor Correlation (クラウディング・重複リスクの確認)"
         )
-        fig.update_layout(height=500, margin=dict(l=20, r=20, t=50, b=20))
+        fig.update_layout(height=400, margin=dict(l=20, r=20, t=50, b=20))
         st.plotly_chart(fig, use_container_width=True)
 
     @staticmethod
@@ -70,21 +78,32 @@ class AuditEngine:
         fig.update_layout(height=300, margin=dict(l=20, r=20, t=50, b=20))
         st.plotly_chart(fig, use_container_width=True)
 
+    # 修正点3: 棒グラフから、回復軌跡を追体験する時系列チャートに変更
     @staticmethod
-    def plot_time_machine_chart(crisis_results):
-        """過去の危機における最大ドローダウンを棒グラフで表示（Plotly）"""
+    def plot_crisis_replays(crisis_results):
+        """過去の危機における累積リターンの推移をチャート化（Plotly）"""
         names = list(crisis_results.keys())
-        dd_values = [crisis_results[n]['max_drawdown_pct'] for n in names]
+        n_crises = len(names)
         
-        fig = px.bar(
-            x=dd_values, y=names, orientation='h',
-            text=[f"{v:.1f}%" for v in dd_values],
-            labels={'x': 'Max Drawdown (%)', 'y': 'Crisis Event'},
-            title="Historical Stress Tests (Max Drawdown)",
-            color=dd_values, color_continuous_scale="Reds_r"
-        )
-        fig.update_traces(textposition='outside')
-        fig.update_layout(height=350, margin=dict(l=20, r=20, t=50, b=20), showlegend=False)
+        if n_crises == 0:
+            return
+            
+        fig = make_subplots(rows=n_crises, cols=1, subplot_titles=names, vertical_spacing=0.1)
+        
+        for i, name in enumerate(names):
+            data = crisis_results[name]
+            # cum_returns が存在すると仮定（HistoryTimeMachineの仕様に基づく）
+            if 'cum_returns' in data:
+                series = data['cum_returns']
+                fig.add_trace(
+                    go.Scatter(x=series.index, y=series.values, name=name, fill='tozeroy', line=dict(color='firebrick')),
+                    row=i+1, col=1
+                )
+                # 基準線 (開始時が1.0か100.0かで判別)
+                base_val = 100.0 if series.iloc[0] > 10 else 1.0
+                fig.add_hline(y=base_val, line_dash="dash", line_color="gray", row=i+1, col=1)
+        
+        fig.update_layout(height=300 * n_crises, showlegend=False, title_text="Historical Stress Tests (Recovery Paths)", margin=dict(l=20, r=20, t=50, b=20))
         st.plotly_chart(fig, use_container_width=True)
 
     @staticmethod
@@ -169,7 +188,9 @@ def main():
     
     region = st.sidebar.selectbox("Market Region", ["US", "Japan"])
     
-    st.sidebar.markdown("**📊 銘柄とウェイトを入力（直接編集可能）**")
+    # 修正点1: CSVアップロード機能の追加
+    st.sidebar.markdown("**📤 1. ポートフォリオ一括読込 (オプション)**")
+    uploaded_file = st.sidebar.file_uploader("CSVファイル (Ticker, Weight 列)", type=["csv"])
     
     # セッションステートを使って初期データを保持
     if 'portfolio_data' not in st.session_state:
@@ -177,6 +198,19 @@ def main():
             "Ticker": ["AAPL", "MSFT", "GOOGL"],
             "Weight": [40.0, 40.0, 20.0]
         })
+
+    # アップロードされたCSVをセッションステートに反映
+    if uploaded_file is not None:
+        try:
+            df_csv = pd.read_csv(uploaded_file)
+            if "Ticker" in df_csv.columns and "Weight" in df_csv.columns:
+                st.session_state.portfolio_data = df_csv[["Ticker", "Weight"]]
+            else:
+                st.sidebar.error("CSVエラー: 'Ticker' と 'Weight' の列を含めてください。")
+        except Exception as e:
+            st.sidebar.error(f"CSV読み込みエラー: {e}")
+
+    st.sidebar.markdown("**✏️ 2. 銘柄とウェイト調整（直接編集可能）**")
     
     # st.data_editorでエクセルライクな入力UIを提供
     edited_df = st.sidebar.data_editor(
@@ -245,7 +279,7 @@ def main():
             with tab1:
                 st.header("1. Core Risk Metrics & AI Diagnosis")
                 
-                # 💡【新規追加】AIによる「プロの小言」セクション
+                # AIによる「プロの小言」セクション
                 st.subheader("🤖 クオンツマネージャーの辛口診断")
                 
                 # analytics.pyで追加したクラスを使ってプロンプト（命令書）を生成
@@ -287,18 +321,22 @@ def main():
             with tab2:
                 st.header("2. Risk Diversification & Stress Tests")
                 c_col1, c_col2 = st.columns(2)
+                
+                # 修正点2: Tab 4からファクター相関を移動し、ここへ配置
                 with c_col1:
-                    st.subheader("Asset Correlation Matrix")
-                    if not raw_returns.empty:
-                        AuditEngine.plot_correlation_matrix(raw_returns)
+                    st.subheader("Factor Correlation Matrix")
+                    AuditEngine.plot_factor_correlation(region=region)
+                    
                 with c_col2:
                     st.subheader("Market Correlation (Rolling 60-Day)")
                     AuditEngine.plot_rolling_correlation(returns, bm_returns)
                 
                 st.divider()
-                st.subheader("History Time Machine (Crash Replay)")
+                # 修正点3: 棒グラフではなく、時系列チャートを呼び出す
+                st.subheader("History Time Machine (Crash Recovery Paths)")
+                st.markdown("過去の主要な金融危機の際、当ポートフォリオがどのように下落し、**どの程度の期間で回復したか**を追体験します。")
                 if crisis_results:
-                    AuditEngine.plot_time_machine_chart(crisis_results)
+                    AuditEngine.plot_crisis_replays(crisis_results)
                 else:
                     st.warning("危機期間のシミュレーションに必要なデータが合成できませんでした。")
 
@@ -328,41 +366,31 @@ def main():
                     st.info(f"📉 **回復力監査:** ドローダウン発生後、1年以内に元本を回復する確率: **{recovery_rate:.1f}%**")
 
             # --- タブ4: ファクター解析 ---
+            # 修正点4: 情報のレイアウトとUXをプロフェッショナルに整理
             with tab4:
                 st.header("4. Market Regime & Factor Exposure")
-                st.subheader("Fama-French 3-Factor Model")
+                st.markdown("ポートフォリオの背後にある「リスクの源泉（ファクター）」を統計的に分解し、その信頼性を評価します。")
+                
                 if style:
+                    st.subheader("📊 Factor Sensitivity (ファクター感度)")
                     f_col1, f_col2, f_col3, f_col4 = st.columns(4)
-                    f_col1.metric("Market Beta (市場連動性)", f"{style.get('beta_market', 1.0):.2f}")
-                    f_col2.metric("Size (小型株効果)", f"{style.get('beta_size', 0.0):.2f}")
-                    f_col3.metric("Value (割安株効果)", f"{style.get('beta_value', 0.0):.2f}")
-                    f_col4.metric("Alpha", f"{style.get('alpha', 0.0) * 100:.3f}%")
+                    f_col1.metric("Market Beta (市場連動性)", f"{style.get('beta_market', 1.0):.2f}", help="1.0より高いと市場より激しく動きます")
+                    f_col2.metric("Size (小型株効果)", f"{style.get('beta_size', 0.0):.2f}", help="プラスなら小型株、マイナスなら大型株寄り")
+                    f_col3.metric("Value (割安株効果)", f"{style.get('beta_value', 0.0):.2f}", help="プラスなら割安、マイナスなら成長株寄り")
+                    f_col4.metric("Alpha (超過収益)", f"{style.get('alpha', 0.0) * 100:.3f}%", help="モデルで説明できない固有の超過収益")
                     
-                    # 💡【新規追加】統計的信頼性（決定係数とP値）の表示
-                    st.markdown("##### 📈 統計的信頼性 (Statistical Reliability)")
+                    st.divider()
+                    
+                    st.subheader("📈 Model Reliability (統計的信頼性)")
                     s_col1, s_col2, s_col3 = st.columns(3)
                     s_col1.metric("R-Squared (決定係数)", f"{style.get('r_squared', 0.0) * 100:.1f}%", help="この数値が高いほど、市場全体の動きだけでポートフォリオの動きが説明できる（インデックスに近い）ことを示します。")
-                    s_col2.metric("Market P-Value", f"{style.get('p_value_market', 1.0):.3f}")
+                    s_col2.metric("Market P-Value", f"{style.get('p_value_market', 1.0):.3f}", help="0.05未満であれば統計的に有意です。")
                     s_col3.metric("Size/Value P-Value", f"{style.get('p_value_size', 1.0):.3f} / {style.get('p_value_value', 1.0):.3f}")
                 else:
                     st.warning("ファクター分析に必要な期間のデータが不足しています。")
                 
                 st.divider()
-                
-                # 💡【新規追加】ファクター同士の相関クラウディング確認
-                st.subheader("Factor Correlation (ファクターのクラウディング確認)")
-                factor_corr = FactorAnalyzer.get_factor_correlation(region=region)
-                if factor_corr:
-                    corr_df = pd.DataFrame(factor_corr)
-                    fig_corr = px.imshow(
-                        corr_df, text_auto=".2f", color_continuous_scale="RdBu_r", 
-                        zmin=-1, zmax=1, title="Fama-French Factors Correlation"
-                    )
-                    fig_corr.update_layout(height=400, margin=dict(l=20, r=20, t=50, b=20))
-                    st.plotly_chart(fig_corr, use_container_width=True)
-                
-                st.divider()
-                st.subheader("Volatility Cycle Detection")
+                st.subheader("⏳ Volatility Cycle Detection")
                 if cycle_days:
                     st.info(f"ウェルチ法による現在のボラティリティ周期: **約 {cycle_days} 日**")
 
