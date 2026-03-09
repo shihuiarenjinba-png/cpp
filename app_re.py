@@ -2,6 +2,7 @@
 app.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
 ※ Plotly対応 ＆ サイドバー即時編集（st.data_editor）統合版
+※ Step 3: AIプロンプト連携 ＆ ファクター解析詳細化 追加版
 """
 
 import streamlit as st
@@ -13,7 +14,7 @@ import plotly.graph_objects as go
 # これまでに作成したモジュールのインポート
 from config import MarketConfig, FACTOR_TRANSLATION
 from data_engine import DataFetcher
-from analytics import AdvancedStats, FactorAnalyzer
+from analytics import AdvancedStats, FactorAnalyzer, AIPromptBuilder
 from simulation import RegimeAnalyzer, HistoryTimeMachine, ProjectionCore
 
 # =========================================================
@@ -158,11 +159,17 @@ def main():
     st.markdown("インタラクティブなリスク評価とAI診断システム")
     st.divider()
 
-    # --- サイドバー (動的スプレッドシート機能) ---
-    st.sidebar.header("📊 Portfolio Editor")
+    # --- サイドバー (動的スプレッドシート機能 & API設定) ---
+    st.sidebar.header("⚙️ 設定 & ポートフォリオ")
+    
+    # 将来的にAIと連携するためのAPIキー入力欄
+    st.sidebar.markdown("**🤖 AI診断用 API設定**")
+    ai_api_key = st.sidebar.text_input("API Key (現在プレースホルダー)", type="password", help="ここにOpenAI等のAPIキーを入れると本物のAIが動くようになります（次ステップ以降）")
+    st.sidebar.divider()
+    
     region = st.sidebar.selectbox("Market Region", ["US", "Japan"])
     
-    st.sidebar.markdown("**銘柄とウェイトを入力（直接編集可能）**")
+    st.sidebar.markdown("**📊 銘柄とウェイトを入力（直接編集可能）**")
     
     # セッションステートを使って初期データを保持
     if 'portfolio_data' not in st.session_state:
@@ -236,10 +243,33 @@ def main():
 
             # --- タブ1: 概要 ---
             with tab1:
-                st.header("1. Core Risk Metrics")
+                st.header("1. Core Risk Metrics & AI Diagnosis")
                 
-                # 【予告】ここに次回のステップでAI診断メッセージ（プロの小言）が入ります
-                st.info("🤖 **AI診断レポート:** (※次回のアップデートで、ここに決定係数の内訳やトヨタ支配率などの診断テキストが入ります)")
+                # 💡【新規追加】AIによる「プロの小言」セクション
+                st.subheader("🤖 クオンツマネージャーの辛口診断")
+                
+                # analytics.pyで追加したクラスを使ってプロンプト（命令書）を生成
+                ai_prompt = AIPromptBuilder.generate_quant_prompt(metrics, style, target_name="現在のポートフォリオ")
+                
+                if ai_api_key:
+                    # TODO: 実際のAPI呼び出し（OpenAI, Geminiなど）をここに実装予定
+                    st.info("APIキーが認識されました。（※実際の実装時はここでLLM APIを呼び出します）")
+                else:
+                    # APIキーがない場合のプレースホルダー表示
+                    st.markdown("""
+                    > **【AI診断ダミー表示】**
+                    > あなたのポートフォリオを拝見しました。分散投資をしているつもりかもしれませんが、
+                    > リスクの大半が特定の1銘柄に集中しており、実質的にその銘柄と心中している状態です。
+                    > また、市場との連動性（R2）が非常に高く、高い手数料を払ってインデックスファンドと
+                    > 同じ動きをしている「隠れインデックス」の兆候が見られます。
+                    > **[ネクストアクション]** 早急に最大リスク寄与銘柄のウェイトを下げ、他セクターへの分散を図りなさい。
+                    """)
+                
+                # 実際にどんな命令が裏で作られたのかを見せるアコーディオン
+                with st.expander("🔍 裏で生成されたAIへの命令書（プロンプト）を見る"):
+                    st.text(ai_prompt)
+                    
+                st.divider()
                 
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Expected Annual Return", f"{returns.mean() * 252 * 100:.2f}%")
@@ -303,14 +333,33 @@ def main():
                 st.subheader("Fama-French 3-Factor Model")
                 if style:
                     f_col1, f_col2, f_col3, f_col4 = st.columns(4)
-                    f_col1.metric("Market Beta (市場連動性)", f"{style['beta_market']:.2f}")
-                    f_col2.metric("Size (小型株効果)", f"{style['beta_size']:.2f}")
-                    f_col3.metric("Value (割安株効果)", f"{style['beta_value']:.2f}")
-                    f_col4.metric("Alpha", f"{style['alpha'] * 100:.3f}%")
+                    f_col1.metric("Market Beta (市場連動性)", f"{style.get('beta_market', 1.0):.2f}")
+                    f_col2.metric("Size (小型株効果)", f"{style.get('beta_size', 0.0):.2f}")
+                    f_col3.metric("Value (割安株効果)", f"{style.get('beta_value', 0.0):.2f}")
+                    f_col4.metric("Alpha", f"{style.get('alpha', 0.0) * 100:.3f}%")
                     
-                    st.caption("※ **予告**: 次回のバックエンド修正で、ここに「決定係数（R2）」と「ファクター同士の相関ヒートマップ」が追加されます。")
+                    # 💡【新規追加】統計的信頼性（決定係数とP値）の表示
+                    st.markdown("##### 📈 統計的信頼性 (Statistical Reliability)")
+                    s_col1, s_col2, s_col3 = st.columns(3)
+                    s_col1.metric("R-Squared (決定係数)", f"{style.get('r_squared', 0.0) * 100:.1f}%", help="この数値が高いほど、市場全体の動きだけでポートフォリオの動きが説明できる（インデックスに近い）ことを示します。")
+                    s_col2.metric("Market P-Value", f"{style.get('p_value_market', 1.0):.3f}")
+                    s_col3.metric("Size/Value P-Value", f"{style.get('p_value_size', 1.0):.3f} / {style.get('p_value_value', 1.0):.3f}")
                 else:
                     st.warning("ファクター分析に必要な期間のデータが不足しています。")
+                
+                st.divider()
+                
+                # 💡【新規追加】ファクター同士の相関クラウディング確認
+                st.subheader("Factor Correlation (ファクターのクラウディング確認)")
+                factor_corr = FactorAnalyzer.get_factor_correlation(region=region)
+                if factor_corr:
+                    corr_df = pd.DataFrame(factor_corr)
+                    fig_corr = px.imshow(
+                        corr_df, text_auto=".2f", color_continuous_scale="RdBu_r", 
+                        zmin=-1, zmax=1, title="Fama-French Factors Correlation"
+                    )
+                    fig_corr.update_layout(height=400, margin=dict(l=20, r=20, t=50, b=20))
+                    st.plotly_chart(fig_corr, use_container_width=True)
                 
                 st.divider()
                 st.subheader("Volatility Cycle Detection")
