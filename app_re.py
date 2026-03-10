@@ -1,7 +1,7 @@
 """
 app.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v3): FF5対応ダッシュボード、VIFアラート（多重共線性）、Adjusted R2に基づく因果的インサイトの自動生成
+※ 修正版(v4): 厳密化されたバックエンド(FF5/Inner Join)と完全に連動するプロフェッショナルUI
 """
 
 import streamlit as st
@@ -28,7 +28,7 @@ class AuditEngine:
         """ファクター同士の相関関係をヒートマップで可視化"""
         factor_corr = FactorAnalyzer.get_factor_correlation(region=region)
         if not factor_corr:
-            st.info("💡 ファクター相関データが取得できませんでしたが、分析は継続します。")
+            st.info("💡 ファクター相関データが取得できませんでした（データ期間が短い、またはAPI制限の可能性があります）。")
             return
             
         corr_df = pd.DataFrame(factor_corr)
@@ -108,7 +108,7 @@ class AuditEngine:
                 
         fig.add_hline(y=0, line_dash="dash", line_color="black", row=1, col=1)
         
-        # R2
+        # Adjusted R2
         fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df["Adjusted_R2"], name="Adj R2", line=dict(color='purple')), row=2, col=1)
         
         fig.update_layout(height=500, title_text="Dynamic Factor Exposure (Regime Stability Check)", margin=dict(l=20, r=20, t=50, b=20))
