@@ -94,8 +94,8 @@ class DataFetcher:
                 data.index = data.index.tz_localize(None)
             data.index = data.index.normalize()
 
-            # 前日値で埋めて祝日等の不整合を吸収
-            return data.ffill().dropna(how='all')
+            # 💡修正ポイント1: ffillに制限(limit=5)を設け、上場廃止・取引停止銘柄が「永遠に同じ価格で生き残る」ことを防ぐ
+            return data.ffill(limit=5).dropna(how='all')
         except Exception as e:
             print(f"Fetch Error: {e}")
             return pd.DataFrame()
@@ -146,12 +146,11 @@ class DataFetcher:
         if isinstance(bm_prices, pd.Series):
             bm_prices = bm_prices.to_frame(name=bm_ticker)
 
-        # リターンの算出
-        returns = raw_prices.pct_change()
-        bm_returns = bm_prices.pct_change().iloc[:, 0].rename("Benchmark")
+        # 💡修正ポイント2: 欠損値(NaN)のまま pct_change を計算させ、存在しない日のリターンを誤って0にしない (fill_method=None)
+        returns = raw_prices.pct_change(fill_method=None)
+        bm_returns = bm_prices.pct_change(fill_method=None).iloc[:, 0].rename("Benchmark")
         
-        # 💡【修正: 日付同期（インデックス・アライメント）の強化】
-        # reindexによる強引な結合を廃止し、pd.merge(how='inner') で両方のデータが確実に存在する日のみを抽出する
+        # 日付同期（インデックス・アライメント）の強化
         aligned_df = pd.merge(returns, bm_returns, left_index=True, right_index=True, how='inner')
         aligned_returns = aligned_df[tickers]
         
@@ -181,15 +180,18 @@ class DataFetcher:
         """
         Fama-Frenchの5ファクターデータ（Mkt-RF, SMB, HML, RMW, CMA）と
         無リスク金利（RF）をKenneth Frenchのライブラリから取得する。
-        💡【修正】データソースの明示的指定と、取得失敗時の堅牢化。
         """
         try:
             # 5ファクターデータセットの取得を試行
             ff_dict = web.DataReader(dataset_name, 'famafrench', start=start_date, end=end_date)
             if not ff_dict: return pd.DataFrame()
             
-            # 日米で異なるインデックス構造を安全に日付型へ変換（％表示を実数に変換）
-            ff_data = ff_dict[0] / 100.0
+            ff_data = ff_dict[0]
+            
+            # 💡修正ポイント3: パーセント表記（1.0 = 1%）と小数表記（0.01 = 1%）の自動判定と統一
+            # データ全体の絶対値の平均が 0.05 (5%) を超えている場合は、パーセント表記とみなして100で割る
+            if ff_data.abs().mean().mean() > 0.05:
+                ff_data = ff_data / 100.0
             
             # インデックスを確実にDatetime化
             ff_data.index = ff_data.index.to_timestamp()
@@ -200,7 +202,7 @@ class DataFetcher:
                 
             ff_data.columns = [c.strip() for c in ff_data.columns]
             
-            # 💡無リスク利子率（RF）の確実な分離と保証
+            # 無リスク利子率（RF）の確実な分離と保証
             if 'RF' not in ff_data.columns:
                 ff_data['RF'] = 0.0
             
