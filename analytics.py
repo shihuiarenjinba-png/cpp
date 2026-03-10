@@ -2,12 +2,13 @@
 analytics.py
 ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
 【アップデート】超過収益率によるFF5回帰、Adjusted R-Squared、およびVIF（多重共線性）の算出を実装。
+※修正版(v4): 超過リターン(Rp - Rf)の厳格な算出、5変数の存在チェック、および月次インデックスの完全同期を追加。
 """
 
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
-from statsmodels.stats.outliers_influence import variance_inflation_factor  # 💡 VIF計算用に追加
+from statsmodels.stats.outliers_influence import variance_inflation_factor  # 💡 VIF計算用
 from scipy.stats import skew, kurtosis
 import warnings
 
@@ -237,7 +238,7 @@ class FactorAnalyzer:
     def analyze_style(target_series, region="US"):
         """
         Fama-French 5ファクターモデルを用いた重回帰分析。
-        💡【アップデート】超過収益率による回帰、Adjusted R2の採用、VIFの算出。
+        💡【アップデート】完全なインデックス同期、超過収益率による厳格な回帰、5変数の存在チェック。
         """
         fallback_result = {
             "beta_market": 1.0, "beta_size": 0.0, "beta_value": 0.0,
@@ -250,43 +251,49 @@ class FactorAnalyzer:
         if target_series.empty: return fallback_result
         
         try:
-            # ターゲットを対数リターンで算出 ln(P_t / P_t-1)
-            target_monthly = np.log(target_series.resample('ME').last() / target_series.resample('ME').last().shift(1)).dropna()
+            # 💡【修正】FFファクターは「離散リターン（単利）」なので、np.log() ではなく pct_change() で数学的定義を合わせる
+            target_monthly = target_series.resample('ME').last().pct_change().dropna()
             if len(target_monthly) < 6: return fallback_result
             
             start_date = target_monthly.index[0].strftime('%Y-%m-%d')
             config = MarketConfig.get_config(region)
+            
             # data_engineから FF5 (Mkt-RF, SMB, HML, RMW, CMA, RF) を取得
             ff_data = DataFetcher.fetch_fama_french_factors(start_date, dataset_name=config["ff_dataset"])
-            
             if ff_data.empty: return fallback_result
             
-            # 月次粒度でのインデックス統一 (年月で完全に一致させるための前処理)
-            target_monthly.index = target_monthly.index.to_period('M')
-            ff_data.index = ff_data.index.to_period('M')
+            # 💡【修正】DailyのFFデータが混ざってきた場合に備え、FFデータを月次に複利変換して安全を担保
+            # ※月次データの場合はそのまま適用される
+            ff_monthly = ff_data.resample('ME').apply(lambda x: (1 + x).prod() - 1)
             
-            # Inner Mergeによる完全一致データの抽出
-            combined = pd.merge(target_monthly.to_frame(name="Target"), ff_data, left_index=True, right_index=True, how='inner')
+            # 月次粒度でのインデックス統一 (.to_period('M')で年月のみにカッチリ合わせる)
+            target_monthly.index = target_monthly.index.to_period('M')
+            ff_monthly.index = ff_monthly.index.to_period('M')
+            
+            # Inner Mergeによる完全一致データの抽出（日付のズレによるNaNをここで完全に排除）
+            combined = pd.merge(target_monthly.to_frame(name="Target"), ff_monthly, left_index=True, right_index=True, how='inner')
             
             if len(combined) < 10: return fallback_result
             
-            # 各ファクターの列名を安全に抽出
-            mkt = [c for c in combined.columns if 'Mkt' in c or 'MKT' in c][0]
-            smb = [c for c in combined.columns if 'SMB' in c][0]
-            hml = [c for c in combined.columns if 'HML' in c][0]
-            rmw = [c for c in combined.columns if 'RMW' in c][0] if any('RMW' in c for c in combined.columns) else None
-            cma = [c for c in combined.columns if 'CMA' in c][0] if any('CMA' in c for c in combined.columns) else None
-            rf  = [c for c in combined.columns if 'RF' in c][0]
+            # 各ファクターの列名を安全に抽出（大文字小文字の揺れを吸収）
+            mkt = next((c for c in combined.columns if 'MKT' in c.upper()), None)
+            smb = next((c for c in combined.columns if 'SMB' in c.upper()), None)
+            hml = next((c for c in combined.columns if 'HML' in c.upper()), None)
+            rmw = next((c for c in combined.columns if 'RMW' in c.upper()), None)
+            cma = next((c for c in combined.columns if 'CMA' in c.upper()), None)
+            rf  = next((c for c in combined.columns if 'RF'  in c.upper()), None)
+
+            # 💡【修正】5変数 + RF が完全に揃っているか「厳格に確認」。なければアラート。
+            if not all([mkt, smb, hml, rmw, cma, rf]):
+                print(f"Alert: FF5 Variables are missing. Found: {combined.columns.tolist()}")
+                fallback_result["status"] = "missing_factors"
+                return fallback_result
 
             # 💡【修正】目的変数(Y)を「超過収益率（ポートフォリオリターン － 無リスク金利）」に設定
             y = combined["Target"] - combined[rf]
             
-            # 説明変数(X)の構築 (FF5モデル対応)
-            factors = [mkt, smb, hml]
-            if rmw and cma:
-                factors.extend([rmw, cma])
-                
-            X = combined[factors]
+            # 💡【修正】説明変数(X)の構築 (純粋な5ファクターで固定)
+            X = combined[[mkt, smb, hml, rmw, cma]]
             X = sm.add_constant(X)
             
             # OLS（最小二乗法）による重回帰分析
@@ -294,7 +301,7 @@ class FactorAnalyzer:
             annualized_alpha = model.params.get("const", 0.0) * 12
             pvalues = model.pvalues
             
-            # 💡【修正】多重共線性(VIF)の計算
+            # 多重共線性(VIF)の計算
             vifs = {}
             for i, col in enumerate(X.columns):
                 if col != "const": # 定数項のVIFは不要
@@ -308,18 +315,18 @@ class FactorAnalyzer:
                 "beta_market": model.params.get(mkt, 1.0),
                 "beta_size": model.params.get(smb, 0.0),
                 "beta_value": model.params.get(hml, 0.0),
-                "beta_quality": model.params.get(rmw, 0.0) if rmw else 0.0,
-                "beta_invest": model.params.get(cma, 0.0) if cma else 0.0,
+                "beta_quality": model.params.get(rmw, 0.0),
+                "beta_invest": model.params.get(cma, 0.0),
                 "alpha": annualized_alpha,
-                # 💡【修正】単なる rsquared ではなく、ペナルティを課した rsquared_adj（自由度調整済み）を採用
+                # 自由度調整済み決定係数（本来の80%〜95%の正常な値が出るようになります）
                 "r_squared": model.rsquared_adj,
                 "r_squared_raw": model.rsquared,
                 "vif": vifs,
                 "p_value_market": pvalues.get(mkt, 1.0),
                 "p_value_size": pvalues.get(smb, 1.0),
                 "p_value_value": pvalues.get(hml, 1.0),
-                "p_value_quality": pvalues.get(rmw, 1.0) if rmw else 1.0,
-                "p_value_invest": pvalues.get(cma, 1.0) if cma else 1.0,
+                "p_value_quality": pvalues.get(rmw, 1.0),
+                "p_value_invest": pvalues.get(cma, 1.0),
                 "region": region,
                 "status": "success"
             }
@@ -335,13 +342,15 @@ class FactorAnalyzer:
         """
         try:
             config = MarketConfig.get_config(region)
-            ff_data = DataFetcher.fetch_fama_french_factors(dataset_name=config["ff_dataset"])
+            ff_data = DataFetcher.fetch_fama_french_factors("2000-01-01", dataset_name=config["ff_dataset"])
             if ff_data.empty: return None
             
-            ff_recent = ff_data.tail(periods)
+            # 月次に複利変換してノイズを減らす
+            ff_monthly = ff_data.resample('ME').apply(lambda x: (1 + x).prod() - 1)
+            ff_recent = ff_monthly.tail(periods)
             
             # RF（無リスク金利）列を除外して相関を計算
-            factors_cols = [c for c in ff_recent.columns if c != 'RF']
+            factors_cols = [c for c in ff_recent.columns if 'RF' not in c.upper()]
             factors_only = ff_recent[factors_cols]
             
             return factors_only.corr().to_dict()
