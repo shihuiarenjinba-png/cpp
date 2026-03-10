@@ -1,18 +1,19 @@
 """
 simulation.py
 GARCHモデル、t分布を用いたモンテカルロ・シミュレーション、および過去の危機のタイムマシンテストを行うモジュール
-【アップデート】過去危機のSurvivor Weighting（動的再配分）と、GARCH最尤法（MLE）による自由度の自動推定を実装。
+【アップデート】過去危機のSurvivor Weighting（動的再配分）、GARCH最尤法（MLE）、およびローリング回帰（動的エクスポージャー）を実装。
 """
 
 import numpy as np
 import pandas as pd
 from scipy import signal
 from scipy.stats import t
+import statsmodels.api as sm  # 💡 ローリング回帰用に追加
 import warnings
 
-# データ取得エンジンのインポート
+# データ取得エンジン等のインポート
 from data_engine import DataFetcher
-from config import TRADING_DAYS_PER_YEAR
+from config import TRADING_DAYS_PER_YEAR, MarketConfig  # 💡 FFデータ動的取得用に追加
 
 # 📌 GARCHモデルによる動的ボラティリティ予測用
 try:
@@ -22,6 +23,90 @@ except ImportError:
     HAS_ARCH = False
     
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# =========================================================
+# 🔄 動的ファクター・エクスポージャー解析クラス (ローリング回帰)
+# =========================================================
+class DynamicFactorAnalyzer:
+    @staticmethod
+    def calculate_rolling_exposure(target_series, region="US", window_months=36):
+        """
+        過去36ヶ月の窓をスライドさせながら、超過収益率によるFF5回帰を繰り返す。
+        因果的安定性（危機時にファクター関係が崩壊していないか、シンプソンのパラドックスが起きていないか）を検証する。
+        """
+        if target_series.empty: return None
+        
+        try:
+            # ターゲットを対数リターンで月次化
+            target_monthly = np.log(target_series.resample('ME').last() / target_series.resample('ME').last().shift(1)).dropna()
+            
+            # データ期間が窓の長さ（例:36ヶ月）に満たない場合は計算不可
+            if len(target_monthly) < window_months + 1: return None
+            
+            start_date = target_monthly.index[0].strftime('%Y-%m-%d')
+            config = MarketConfig.get_config(region)
+            ff_data = DataFetcher.fetch_fama_french_factors(start_date, dataset_name=config["ff_dataset"])
+            
+            if ff_data.empty: return None
+            
+            # 月次粒度でのインデックス統一
+            target_monthly.index = target_monthly.index.to_period('M')
+            ff_data.index = ff_data.index.to_period('M')
+            
+            # Inner Mergeによる完全一致データの抽出
+            combined = pd.merge(target_monthly.to_frame(name="Target"), ff_data, left_index=True, right_index=True, how='inner')
+            
+            if len(combined) < window_months + 1: return None
+            
+            mkt = [c for c in combined.columns if 'Mkt' in c or 'MKT' in c][0]
+            smb = [c for c in combined.columns if 'SMB' in c][0]
+            hml = [c for c in combined.columns if 'HML' in c][0]
+            rmw = [c for c in combined.columns if 'RMW' in c][0] if any('RMW' in c for c in combined.columns) else None
+            cma = [c for c in combined.columns if 'CMA' in c][0] if any('CMA' in c for c in combined.columns) else None
+            rf  = [c for c in combined.columns if 'RF' in c][0]
+
+            # 超過収益率（Y）と説明変数（X）の設定
+            y = combined["Target"] - combined[rf]
+            factors = [mkt, smb, hml]
+            if rmw and cma: factors.extend([rmw, cma])
+            
+            X = combined[factors]
+            X = sm.add_constant(X)
+            
+            rolling_results = []
+            
+            # 💡【手動ローリングOLS】 各ウィンドウで厳密に Adjusted R2 と P値を算出し続ける
+            for i in range(window_months, len(combined) + 1):
+                y_win = y.iloc[i - window_months : i]
+                X_win = X.iloc[i - window_months : i]
+                
+                try:
+                    model = sm.OLS(y_win, X_win).fit()
+                    row_data = {
+                        "Date": combined.index[i - 1].to_timestamp(), # 窓の「最終月」を日付として記録
+                        "Market_Beta": model.params.get(mkt, np.nan),
+                        "Size_Beta": model.params.get(smb, np.nan),
+                        "Value_Beta": model.params.get(hml, np.nan),
+                        "Quality_Beta": model.params.get(rmw, np.nan) if rmw else np.nan,
+                        "Invest_Beta": model.params.get(cma, np.nan) if cma else np.nan,
+                        "Alpha": model.params.get("const", 0.0) * 12, # 年率化アルファ
+                        "Adjusted_R2": model.rsquared_adj * 100
+                    }
+                    rolling_results.append(row_data)
+                except:
+                    # 逆行列が計算できない等、特異な期間はスキップ
+                    pass
+            
+            if not rolling_results: return None
+            
+            # DataFrame化して返す
+            df_rolling = pd.DataFrame(rolling_results).set_index("Date")
+            return df_rolling
+            
+        except Exception as e:
+            print(f"Rolling Exposure Error: {e}")
+            return None
+
 
 # =========================================================
 # 🌀 市場周期・レジーム解析クラス
@@ -63,7 +148,6 @@ class HistoryTimeMachine:
         """
         現在のポートフォリオ構成のまま過去の暴落期にタイムスリップし、
         最大下落幅（ドローダウン）をシミュレーションする。
-        💡【修正】当時データが存在する銘柄のみでウェイトを再正規化する（Survivor Weighting）。
         """
         if crisis_name not in HistoryTimeMachine.CRISES: return None
         start_date, end_date = HistoryTimeMachine.CRISES[crisis_name]
@@ -87,7 +171,7 @@ class HistoryTimeMachine:
         
         if len(crisis_returns) < 5: return None
         
-        # 💡動的ウェイト再配分（Survivor Weighting）ロジック
+        # 動的ウェイト再配分（Survivor Weighting）ロジック
         w_series = pd.Series(normalized_weights)
         common_assets = [c for c in crisis_returns.columns if c in w_series.index]
         if not common_assets: return None
@@ -130,7 +214,6 @@ class StochasticScenarioGenerator:
     def generate_paths(returns, n_scenarios=10000, n_days=252):
         """
         GARCH(1,1)とt分布を組み合わせたモンテカルロ・シミュレーション。
-        💡【修正】t分布の自由度を決め打ちせず、最尤法(MLE)でデータから自動推定する。
         """
         if len(returns) < 30: return None
         
@@ -151,7 +234,7 @@ class StochasticScenarioGenerator:
                 # 直近の予測ボラティリティ
                 current_vol = np.sqrt(forecasts.variance.values[-1, :][0]) / 100.0
                 
-                # 💡最尤推定されたt分布の自由度(nu)を取得 (ファットテールの厚み)
+                # 最尤推定されたt分布の自由度(nu)を取得 (ファットテールの厚み)
                 if 'nu' in res.params:
                     df = res.params['nu']
             except Exception as e:
