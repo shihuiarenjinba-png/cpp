@@ -1,6 +1,7 @@
 """
 config.py
 市場環境、ベンチマーク、およびシステム全体の静的設定を管理するモジュール
+※ 修正版(v5): FF5ファクターデータセットを「純粋な5ファクター（Daily）」に厳格指定
 """
 
 # =========================================================
@@ -15,21 +16,21 @@ class MarketConfig:
     REGIONS = {
         "US": {
             "name": "United States",
-            "ff_dataset": "F-F_Research_Data_Factors",
+            # 💡修正ポイント: 2x3ポートフォリオ(従属変数)などを排除し、純粋な5ファクター独立変数(Daily)を厳格指定
+            "ff_dataset": "North_America_5_Factors_Daily",
             "benchmark_ticker": "^GSPC",   # S&P 500 (米国市場全体のベンチマーク)
             "risk_free_ticker": "^TNX",    # 米国10年国債利回り (無リスク資産)
             "vix_ticker": "^VIX",          # 米国VIX (恐怖指数)
-            "fallback_rf_rate": 0.02       # 💡修正ポイント2: データ取得失敗時の固定利回り (年利2%)
+            "fallback_rf_rate": 0.02       # データ取得失敗時の固定利回り (年利2%)
         },
         "Japan": {
             "name": "Japan",
-            "ff_dataset": "Japan_3_Factors",
+            # 💡修正ポイント: 旧来のJapan_3_Factorsを廃止し、日本の純粋な5ファクター独立変数(Daily)を厳格指定
+            "ff_dataset": "Japan_5_Factors_Daily",
             "benchmark_ticker": "^N225",   # 日経225 (日本市場全体のベンチマーク)
-            # 💡修正ポイント1: 為替レートではなく、日本の10年国債利回りを指定。
-            # ただしYahoo Financeでは日本の国債データ(^JGBS等)が不安定なため、取得に失敗した場合は固定値に切り替える想定。
-            "risk_free_ticker": "^JGBS",   
+            "risk_free_ticker": "^JGBS",   # 日本の10年国債利回り
             "vix_ticker": "^JNIV",         # 日経VI (日本の恐怖指数)
-            "fallback_rf_rate": 0.001      # 💡修正ポイント2: 日本の超低金利環境を反映した固定利回り (年利0.1%)
+            "fallback_rf_rate": 0.001      # 日本の超低金利環境を反映した固定利回り (年利0.1%)
         }
     }
 
@@ -51,7 +52,7 @@ class MarketConfig:
 # =========================================================
 # 📝 用語マッピング・システム定数
 # =========================================================
-# 💡修正ポイント3: カラム名の揺れ（米国 Mkt-RF vs 日本 Mkt 等）を吸収するためのエイリアスマッピングを拡充。
+# カラム名の揺れ（米国 Mkt-RF vs 日本 Mkt 等）を吸収するためのエイリアスマッピング。
 # UIと分析エンジンの両方で、どの名称が来ても統一した日本語表示ができるようにする。
 FACTOR_TRANSLATION = {
     # 市場全体
