@@ -27,6 +27,7 @@ class AuditEngine:
     def plot_factor_correlation(region="US"):
         """ファクター同士の相関関係をヒートマップで可視化"""
         factor_corr = FactorAnalyzer.get_factor_correlation(region=region)
+        # 💡修正ポイント1: データ不足時の NoneType クラッシュ回避
         if not factor_corr:
             st.info("💡 ファクター相関データが取得できませんでした（データ期間が短い、またはAPI制限の可能性があります）。")
             return
@@ -46,8 +47,9 @@ class AuditEngine:
     def plot_rolling_correlation(port_returns, bm_returns, window=60):
         """市場との連動性（ローリング相関）の推移を可視化"""
         aligned = pd.concat([port_returns.rename("Portfolio"), bm_returns], axis=1).dropna()
+        # 💡修正ポイント1: 計算に必要な期間が足りない場合のフォールバック
         if len(aligned) < window:
-            st.info("💡 ローリング相関を描画するための期間データが不足していますが、全体の分析には影響しません。")
+            st.info(f"💡 ローリング相関を描画するための期間データ（{window}日分）が不足していますが、全体の分析には影響しません。")
             return
             
         rolling_corr = aligned.iloc[:, 0].rolling(window=window).corr(aligned.iloc[:, 1]).dropna()
@@ -82,6 +84,7 @@ class AuditEngine:
         names = list(crisis_results.keys())
         n_crises = len(names)
         
+        # 💡修正ポイント1: 危機期間にデータが存在しなかった場合の案内
         if n_crises == 0:
             st.info("💡 このポートフォリオを構成する銘柄は、指定された過去の危機期間にデータが存在しないため、シミュレーションをスキップしました。")
             return
@@ -109,7 +112,8 @@ class AuditEngine:
         fig.add_hline(y=0, line_dash="dash", line_color="black", row=1, col=1)
         
         # Adjusted R2
-        fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df["Adjusted_R2"], name="Adj R2", line=dict(color='purple')), row=2, col=1)
+        if "Adjusted_R2" in rolling_df.columns:
+            fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df["Adjusted_R2"], name="Adj R2", line=dict(color='purple')), row=2, col=1)
         
         fig.update_layout(height=500, title_text="Dynamic Factor Exposure (Regime Stability Check)", margin=dict(l=20, r=20, t=50, b=20))
         st.plotly_chart(fig, use_container_width=True)
@@ -117,6 +121,7 @@ class AuditEngine:
     @staticmethod
     def plot_monte_carlo_fanchart(paths):
         """1万回のシミュレーション推移を扇状（ファンチャート）で可視化"""
+        # 💡修正ポイント2: 1万本の線を全て描画するとブラウザがクラッシュするため、代表パーセンタイルに圧縮
         percentiles = np.percentile(paths, [5, 25, 50, 75, 95], axis=1)
         days = np.arange(paths.shape[0])
         
@@ -249,8 +254,9 @@ def main():
             
             synthetic_portfolio = DataFetcher.create_synthetic_portfolio(norm_weights, region=region)
             
+            # 💡修正ポイント1: データ構築失敗時のクラッシュ防止
             if synthetic_portfolio is None or synthetic_portfolio.empty:
-                st.error("データの構築に失敗しました。ティッカー記号を確認してください。")
+                st.error("データの構築に失敗しました。ティッカー記号（特に日本株の場合は .T の付与など）や期間を確認してください。")
                 return
             
             if valid_ticker_count == input_ticker_count:
@@ -366,22 +372,19 @@ def main():
                     recovery_rate = AuditEngine.analyze_recovery(projection["paths"])
                     st.info(f"📉 **回復力監査:** ドローダウン発生後、1年以内に元本を回復する確率: **{recovery_rate:.1f}%**")
 
-            # --- タブ4: ファクター解析 (💡 FF5 プロフェッショナル・ダッシュボード化) ---
+            # --- タブ4: ファクター解析 (FF5 プロフェッショナル・ダッシュボード化) ---
             with tab4:
                 st.header("4. Causal Factor Analysis (Fama-French 5-Factor)")
                 st.markdown("ポートフォリオの背後にある「リスクの源泉」を統計的に分解し、その因果的妥当性と安定性を評価します。")
                 
                 if style and style.get('status') != 'insufficient_data':
                     
-                    # 💡【修正】VIFアラート（多重共線性の警告）
                     high_vif_factors = [f for f, v in style.get('vif', {}).items() if v > 10]
                     if high_vif_factors:
                         st.warning(f"⚠️ **多重共線性の警告 (VIF > 10):** ファクター [{', '.join(high_vif_factors)}] の間で強い相関（似たような動き）が検出されました。これらのベータ値は統計的に不安定（信頼性が低い）可能性があります。")
 
-                    # 💡【修正】FF5対応 ダッシュボード
                     st.subheader("📊 Factor Sensitivity (市場・スタイル感度)")
                     
-                    # 上段：伝統的3ファクター + アルファ
                     f_col1, f_col2, f_col3, f_col4 = st.columns(4)
                     
                     mkt_beta = style.get('beta_market', 1.0)
@@ -396,7 +399,6 @@ def main():
                     alpha_val = style.get('alpha', 0.0) * 100
                     f_col4.metric("Alpha (年率超過収益)", f"{alpha_val:.3f}%", delta=f"{alpha_val:.3f}%", delta_color="normal")
                     
-                    # 下段：拡張2ファクター (AQR論文対応)
                     q_col1, q_col2, _, _ = st.columns(4)
                     quality_beta = style.get('beta_quality', 0.0)
                     q_col1.metric("RMW (クオリティ/収益力)", f"{quality_beta:.2f}", delta="高収益企業寄り" if quality_beta > 0 else "低収益企業寄り", delta_color="off")
@@ -406,18 +408,16 @@ def main():
 
                     st.divider()
                     
-                    # 💡【修正】Adjusted R2 と 拡張P値
                     st.subheader("📈 Model Reliability (統計的信頼性と因果的インサイト)")
                     s_col1, s_col2, s_col3 = st.columns(3)
                     
-                    r2 = style.get('r_squared', 0.0) * 100 # Adjusted R2
+                    r2 = style.get('r_squared', 0.0) * 100
                     p_val_market = style.get('p_value_market', 1.0)
                     
                     s_col1.metric("Adjusted R-Squared", f"{r2:.1f}%", help="変数の数によるペナルティを課した「真の決定係数」。この数値が高いほど、モデルの当てはまりが論理的に正しいことを示します。")
                     s_col2.metric("Market P-Value", f"{p_val_market:.3f}", help="0.05未満であれば統計的に有意（偶然ではない）です。")
                     s_col3.metric("Quality/Invest P-Value", f"{style.get('p_value_quality', 1.0):.3f} / {style.get('p_value_invest', 1.0):.3f}")
 
-                    # 💡【修正】因果的推論に基づく自動テキスト生成
                     st.markdown("#### 🧠 統計的因果推論による解釈")
                     
                     if p_val_market < 0.05 and not high_vif_factors:
@@ -434,7 +434,6 @@ def main():
 
                     st.info(insight)
                     
-                    # 💡【新規追加】ローリング回帰チャートの呼び出し
                     if rolling_exposure_df is not None:
                         AuditEngine.plot_rolling_exposure(rolling_exposure_df)
 
