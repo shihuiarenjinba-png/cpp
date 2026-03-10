@@ -1,7 +1,7 @@
 """
 app.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版: 計算有効銘柄数の明示、R2とP-Valueを用いた統計的インサイトの自動解説を実装
+※ 修正版(v3): FF5対応ダッシュボード、VIFアラート（多重共線性）、Adjusted R2に基づく因果的インサイトの自動生成
 """
 
 import streamlit as st
@@ -10,13 +10,13 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import re # 💡 CSVの列名ゆらぎ吸収用に追加
+import re 
 
 # これまでに作成したモジュールのインポート
 from config import MarketConfig, FACTOR_TRANSLATION
 from data_engine import DataFetcher
 from analytics import AdvancedStats, FactorAnalyzer, AIPromptBuilder
-from simulation import RegimeAnalyzer, HistoryTimeMachine, ProjectionCore
+from simulation import RegimeAnalyzer, HistoryTimeMachine, ProjectionCore, DynamicFactorAnalyzer
 
 # =========================================================
 # 📊 監査・可視化エンジンクラス (Plotly インタラクティブ版)
@@ -78,7 +78,7 @@ class AuditEngine:
 
     @staticmethod
     def plot_crisis_replays(crisis_results):
-        """過去の危機における累積リターンの推移を時系列チャート化"""
+        """過去の危機における最大下落幅の表示"""
         names = list(crisis_results.keys())
         n_crises = len(names)
         
@@ -86,17 +86,33 @@ class AuditEngine:
             st.info("💡 このポートフォリオを構成する銘柄は、指定された過去の危機期間にデータが存在しないため、シミュレーションをスキップしました。")
             return
             
-        fig = make_subplots(rows=n_crises, cols=1, subplot_titles=names, vertical_spacing=0.1)
-        
         for i, name in enumerate(names):
             data = crisis_results[name]
-            # cum_returns ではなくシミュレーション結果のキーに合わせる必要があるためダミーデータを回避し整合性を保つ
-            # 実際には HistoryTimeMachine は start_value, end_value, max_drawdown_pct を返す
             st.markdown(f"**{name}**")
             st.markdown(f"- 最大下落幅 (Max Drawdown): **{data['max_drawdown_pct']:.2f}%**")
         
-        # 💡 エラーではなく、インフォメーションとして生存バイアスを明記
         st.info("📌 **仕様メモ:** 指定期間にまだ上場していなかった銘柄は自動的に除外され、当時存在していた銘柄のみでポートフォリオ比率を再配分（100%に正規化）してシミュレーションを行っています。")
+
+    @staticmethod
+    def plot_rolling_exposure(rolling_df):
+        """ローリング回帰による動的エクスポージャーの推移を可視化（シンプソンのパラドックス検証用）"""
+        if rolling_df is None or rolling_df.empty: return
+        
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                            vertical_spacing=0.1, subplot_titles=("Factor Betas (36-Month Rolling)", "Adjusted R-Squared (%)"))
+        
+        # Betas
+        for col in ["Market_Beta", "Size_Beta", "Value_Beta", "Quality_Beta", "Invest_Beta"]:
+            if col in rolling_df.columns and not rolling_df[col].isna().all():
+                fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df[col], name=col, mode='lines'), row=1, col=1)
+                
+        fig.add_hline(y=0, line_dash="dash", line_color="black", row=1, col=1)
+        
+        # R2
+        fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df["Adjusted_R2"], name="Adj R2", line=dict(color='purple')), row=2, col=1)
+        
+        fig.update_layout(height=500, title_text="Dynamic Factor Exposure (Regime Stability Check)", margin=dict(l=20, r=20, t=50, b=20))
+        st.plotly_chart(fig, use_container_width=True)
 
     @staticmethod
     def plot_monte_carlo_fanchart(paths):
@@ -170,13 +186,13 @@ def main():
     st.sidebar.header("⚙️ 設定 & ポートフォリオ")
     
     st.sidebar.markdown("**🤖 AI診断用 API設定**")
-    ai_api_key = st.sidebar.text_input("API Key (現在プレースホルダー)", type="password", help="ここにOpenAI等のAPIキーを入れると本物のAIが動くようになります（次ステップ以降）")
+    ai_api_key = st.sidebar.text_input("API Key (現在プレースホルダー)", type="password", help="ここにOpenAI等のAPIキーを入れると本物のAIが動くようになります")
     st.sidebar.divider()
     
     region = st.sidebar.selectbox("Market Region", ["US", "Japan"])
     
     st.sidebar.markdown("**📤 1. ポートフォリオ一括読込 (オプション)**")
-    uploaded_file = st.sidebar.file_uploader("CSVファイル", type=["csv"], help="ティッカーと比率が書かれたCSVを読み込みます。列名は自動で推測します。")
+    uploaded_file = st.sidebar.file_uploader("CSVファイル", type=["csv"], help="ティッカーと比率が書かれたCSVを読み込みます。")
     
     if 'portfolio_data' not in st.session_state:
         st.session_state.portfolio_data = pd.DataFrame({
@@ -184,17 +200,13 @@ def main():
             "Weight": [40.0, 40.0, 20.0]
         })
 
-    # CSVインポートの「ゆらぎ」許容と自動クリーニング
     if uploaded_file is not None:
         try:
             df_csv = pd.read_csv(uploaded_file)
-            
-            # 正規表現でそれらしい列名をファジー検索
             ticker_col = next((c for c in df_csv.columns if re.search(r'(ticker|symbol|code|銘柄|コード)', str(c), re.IGNORECASE)), None)
             weight_col = next((c for c in df_csv.columns if re.search(r'(weight|ratio|percent|比率|割合|ウェイト|%)', str(c), re.IGNORECASE)), None)
 
             if ticker_col and weight_col:
-                # % やカンマを除去して数値型に変換
                 clean_weights = df_csv[weight_col].astype(str).str.replace(r'[%,]', '', regex=True)
                 df_csv["Weight"] = pd.to_numeric(clean_weights, errors='coerce').fillna(0)
                 df_csv["Ticker"] = df_csv[ticker_col].astype(str).str.strip().str.upper()
@@ -232,7 +244,6 @@ def main():
             norm_weights = DataFetcher.normalize_weights(weights_dict)
             input_ticker_count = len(norm_weights)
             
-            # 💡 計算有効銘柄数の確認（網羅性の可視化）
             raw_input_data = DataFetcher.fetch_market_data(list(norm_weights.keys()))
             valid_ticker_count = len(raw_input_data.columns) if not raw_input_data.empty else 0
             
@@ -242,11 +253,10 @@ def main():
                 st.error("データの構築に失敗しました。ティッカー記号を確認してください。")
                 return
             
-            # ✅ データ網羅性の通知
             if valid_ticker_count == input_ticker_count:
-                st.success(f"✅ **データ網羅性:** 入力された全 {input_ticker_count} 銘柄の有効なヒストリカルデータを取得し、シミュレーションに適用しました。")
+                st.success(f"✅ **データ網羅性:** 入力された全 {input_ticker_count} 銘柄のデータを取得し、シミュレーションに適用しました。")
             else:
-                st.warning(f"⚠️ **データ網羅性:** 入力された {input_ticker_count} 銘柄中、**{valid_ticker_count} 銘柄** のみが計算に適用されました。（上場廃止やティッカー誤りの可能性があります）")
+                st.warning(f"⚠️ **データ網羅性:** 入力された {input_ticker_count} 銘柄中、**{valid_ticker_count} 銘柄** のみが計算に適用されました。")
 
             returns = synthetic_portfolio.pct_change().dropna()
             
@@ -258,6 +268,7 @@ def main():
             metrics = AdvancedStats.calculate_metrics(returns, weights_dict=norm_weights, region=region)
             style = FactorAnalyzer.analyze_style(synthetic_portfolio, region=region)
             cycle_days = RegimeAnalyzer.detect_cycle(returns)
+            rolling_exposure_df = DynamicFactorAnalyzer.calculate_rolling_exposure(synthetic_portfolio, region=region)
             
             # 3. タイムマシン＆シミュレーション
             crises = ["リーマン・ショック (2007-2009)", "コロナ・ショック (2020)", "ドットコム・バブル崩壊 (2000-2002)"]
@@ -275,7 +286,7 @@ def main():
                 "📊 概要＆AI診断", 
                 "⚠️ リスク＆連動性", 
                 "🔮 将来シミュレーション", 
-                "🔬 ファクター解析"
+                "🔬 ファクター解析 (FF5)"
             ])
 
             # --- タブ1: 概要 ---
@@ -292,7 +303,7 @@ def main():
                     > **【AI診断ダミー表示】**
                     > あなたのポートフォリオを拝見しました。分散投資をしているつもりかもしれませんが、
                     > リスクの大半が特定の1銘柄に集中しており、実質的にその銘柄と心中している状態です。
-                    > また、市場との連動性（R-Squared）が非常に高く、高い手数料を払ってインデックスファンドと
+                    > また、市場との連動性（Adjusted R-Squared）が非常に高く、高い手数料を払ってインデックスファンドと
                     > 同じ動きをしている「隠れインデックス」の兆候が見られます。
                     > **[ネクストアクション]** 早急に最大リスク寄与銘柄のウェイトを下げ、他セクターへの分散を図りなさい。
                     """)
@@ -318,7 +329,7 @@ def main():
                 c_col1, c_col2 = st.columns(2)
                 
                 with c_col1:
-                    st.subheader("Factor Correlation Matrix")
+                    st.subheader("Factor Correlation Matrix (Ex. RF)")
                     AuditEngine.plot_factor_correlation(region=region)
                     
                 with c_col2:
@@ -355,60 +366,80 @@ def main():
                     recovery_rate = AuditEngine.analyze_recovery(projection["paths"])
                     st.info(f"📉 **回復力監査:** ドローダウン発生後、1年以内に元本を回復する確率: **{recovery_rate:.1f}%**")
 
-            # --- タブ4: ファクター解析 (💡 プロフェッショナル・ダッシュボード化) ---
+            # --- タブ4: ファクター解析 (💡 FF5 プロフェッショナル・ダッシュボード化) ---
             with tab4:
-                st.header("4. Market Regime & Factor Exposure")
-                st.markdown("ポートフォリオの背後にある「リスクの源泉（ファクター）」を統計的に分解し、その信頼性を評価します。")
+                st.header("4. Causal Factor Analysis (Fama-French 5-Factor)")
+                st.markdown("ポートフォリオの背後にある「リスクの源泉」を統計的に分解し、その因果的妥当性と安定性を評価します。")
                 
                 if style and style.get('status') != 'insufficient_data':
-                    # ダッシュボード風カードレイアウト
+                    
+                    # 💡【修正】VIFアラート（多重共線性の警告）
+                    high_vif_factors = [f for f, v in style.get('vif', {}).items() if v > 10]
+                    if high_vif_factors:
+                        st.warning(f"⚠️ **多重共線性の警告 (VIF > 10):** ファクター [{', '.join(high_vif_factors)}] の間で強い相関（似たような動き）が検出されました。これらのベータ値は統計的に不安定（信頼性が低い）可能性があります。")
+
+                    # 💡【修正】FF5対応 ダッシュボード
                     st.subheader("📊 Factor Sensitivity (市場・スタイル感度)")
+                    
+                    # 上段：伝統的3ファクター + アルファ
                     f_col1, f_col2, f_col3, f_col4 = st.columns(4)
                     
                     mkt_beta = style.get('beta_market', 1.0)
-                    f_col1.metric("Market Beta (市場連動性)", f"{mkt_beta:.2f}", delta="ハイリスク" if mkt_beta > 1.2 else ("ローリスク" if mkt_beta < 0.8 else ""), delta_color="inverse")
+                    f_col1.metric("Market (市場ベータ)", f"{mkt_beta:.2f}", delta="ハイリスク" if mkt_beta > 1.2 else ("ローリスク" if mkt_beta < 0.8 else ""), delta_color="inverse")
                     
                     size_beta = style.get('beta_size', 0.0)
-                    f_col2.metric("Size (企業規模)", f"{size_beta:.2f}", delta="小型株寄り" if size_beta > 0 else "大型株寄り", delta_color="off")
+                    f_col2.metric("SMB (企業規模)", f"{size_beta:.2f}", delta="小型株寄り" if size_beta > 0 else "大型株寄り", delta_color="off")
                     
                     val_beta = style.get('beta_value', 0.0)
-                    f_col3.metric("Value (割安性)", f"{val_beta:.2f}", delta="割安株寄り" if val_beta > 0 else "成長株寄り", delta_color="off")
+                    f_col3.metric("HML (割安性)", f"{val_beta:.2f}", delta="割安株寄り" if val_beta > 0 else "成長株寄り", delta_color="off")
                     
-                    # アルファがプラスなら緑色（強調）
                     alpha_val = style.get('alpha', 0.0) * 100
-                    f_col4.metric("Alpha (超過収益)", f"{alpha_val:.3f}%", delta=f"{alpha_val:.3f}%", delta_color="normal")
+                    f_col4.metric("Alpha (年率超過収益)", f"{alpha_val:.3f}%", delta=f"{alpha_val:.3f}%", delta_color="normal")
                     
+                    # 下段：拡張2ファクター (AQR論文対応)
+                    q_col1, q_col2, _, _ = st.columns(4)
+                    quality_beta = style.get('beta_quality', 0.0)
+                    q_col1.metric("RMW (クオリティ/収益力)", f"{quality_beta:.2f}", delta="高収益企業寄り" if quality_beta > 0 else "低収益企業寄り", delta_color="off")
+                    
+                    invest_beta = style.get('beta_invest', 0.0)
+                    q_col2.metric("CMA (インベストメント/堅実性)", f"{invest_beta:.2f}", delta="堅実投資寄り" if invest_beta > 0 else "過剰投資寄り", delta_color="off")
+
                     st.divider()
                     
-                    st.subheader("📈 Model Reliability (統計的信頼性とインサイト)")
+                    # 💡【修正】Adjusted R2 と 拡張P値
+                    st.subheader("📈 Model Reliability (統計的信頼性と因果的インサイト)")
                     s_col1, s_col2, s_col3 = st.columns(3)
                     
-                    r2 = style.get('r_squared', 0.0) * 100
+                    r2 = style.get('r_squared', 0.0) * 100 # Adjusted R2
                     p_val_market = style.get('p_value_market', 1.0)
                     
-                    s_col1.metric("R-Squared (決定係数)", f"{r2:.1f}%", help="この数値が高いほど、市場全体の動きだけでポートフォリオの動きが説明できることを示します。")
-                    s_col2.metric("Market P-Value", f"{p_val_market:.3f}", help="0.05未満であれば統計的に有意です。")
-                    s_col3.metric("Size/Value P-Value", f"{style.get('p_value_size', 1.0):.3f} / {style.get('p_value_value', 1.0):.3f}")
+                    s_col1.metric("Adjusted R-Squared", f"{r2:.1f}%", help="変数の数によるペナルティを課した「真の決定係数」。この数値が高いほど、モデルの当てはまりが論理的に正しいことを示します。")
+                    s_col2.metric("Market P-Value", f"{p_val_market:.3f}", help="0.05未満であれば統計的に有意（偶然ではない）です。")
+                    s_col3.metric("Quality/Invest P-Value", f"{style.get('p_value_quality', 1.0):.3f} / {style.get('p_value_invest', 1.0):.3f}")
 
-                    # 💡 P-ValueとR2を掛け合わせた論理的なインサイト自動生成
-                    st.markdown("#### 🧠 統計モデリングによる解釈 (R² & P-Value)")
+                    # 💡【修正】因果的推論に基づく自動テキスト生成
+                    st.markdown("#### 🧠 統計的因果推論による解釈")
                     
-                    if p_val_market < 0.05:
-                        significance = "統計的に有意（信頼できる）"
+                    if p_val_market < 0.05 and not high_vif_factors:
+                        significance = "統計的に有意かつ多重共線性の問題もない"
                         if r2 >= 80:
-                            insight = f"決定係数（R-Squared）が **{r2:.1f}%** と非常に高く、市場P値も **{p_val_market:.3f}** と0.05未満で{significance}です。これは、ポートフォリオのリターン変動の大部分（{r2:.1f}%）が市場全体（インデックス）の動きで**論理的に説明できる**ことを意味します。意図せずインデックスファンドと同じ動きをしている「隠れインデックス」状態の可能性があります。"
+                            insight = f"自由度調整済み決定係数が **{r2:.1f}%** と極めて高く、市場要因のP値も **{p_val_market:.3f}** であり、{significance}モデルです。このポートフォリオの変動は、実質的にFF5のシステム（特に市場平均）によって**構造的かつ因果的に説明される**と推論されます（隠れインデックスの可能性）。"
                         elif r2 >= 50:
-                            insight = f"決定係数（R-Squared）は **{r2:.1f}%** であり、市場P値（**{p_val_market:.3f}**）から見ても{significance}関係にあります。市場の動きにある程度連動しつつも、独自のアクティブな変動（固有のアルファや別テーマの動き）を半分程度持っている、バランス型の状態です。"
+                            insight = f"自由度調整済み決定係数は **{r2:.1f}%**、市場P値は **{p_val_market:.3f}** であり、{significance}状態です。市場全体のシステマティック・リスクに一定の影響を受けつつも、独自の非システマティックな要素（固有アルファ）を併せ持つ健全なアクティブ・ポートフォリオと推論されます。"
                         else:
-                            insight = f"決定係数（R-Squared）は **{r2:.1f}%** と低めですが、市場P値（**{p_val_market:.3f}**）から市場との関係は{significance}と判定されました。市場トレンドに流されにくく、**独自の要因（個別銘柄の特性や特定のセクター集中など）が値動きを支配**していることを示しています。"
+                            insight = f"自由度調整済み決定係数は **{r2:.1f}%** と低く、市場の動きだけでは説明できない**独自の変動因果**を持っています。P値（**{p_val_market:.3f}**）は有意であるため、市場とは無関係な特定セクターやテーマへの集中投資が値動きを支配していると推測されます。"
                     else:
-                        significance = "統計的に有意ではない（ノイズの可能性が高い）"
-                        insight = f"市場P値が **{p_val_market:.3f}** と0.05を上回っており、{significance}と判定されました。現在の決定係数（R-Squared = **{r2:.1f}%**）は偶然の産物である可能性が高く、このポートフォリオは市場ベンチマークとは全く異なる法則で動いているか、単にデータ蓄積期間が短すぎる状態です。"
+                        significance = "統計的に有意でない、あるいは多重共線性のノイズを含んでいる"
+                        insight = f"P値が **{p_val_market:.3f}** と高い、もしくはVIF警告が出ているため、現在の結果は{significance}と判定されます。決定係数（**{r2:.1f}%**）を鵜呑みにせず、シンプソンのパラドックス（特定期間だけの見せかけの相関）を疑う必要があります。下の「動的エクスポージャー（ローリング回帰）」チャートで、時間的な安定性を確認してください。"
 
                     st.info(insight)
+                    
+                    # 💡【新規追加】ローリング回帰チャートの呼び出し
+                    if rolling_exposure_df is not None:
+                        AuditEngine.plot_rolling_exposure(rolling_exposure_df)
 
                 else:
-                    st.info("💡 ファクター分析を行うための月次データが不足しています（最低6ヶ月分以上の運用履歴が必要です）。")
+                    st.info("💡 ファクター分析を行うためのデータが不足しています（最低36ヶ月分のデータが推奨されます）。")
                 
                 st.divider()
                 st.subheader("⏳ Volatility Cycle Detection")
