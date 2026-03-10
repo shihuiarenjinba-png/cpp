@@ -3,6 +3,7 @@ data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
 ※ 修正版: タイムゾーン同期、生存銘柄による動的ウェイト再配分、カレンダーアライメントの徹底
 ※ 修正版(v2): FF5ファクターへの拡張、無リスク利子率(RF)の厳密分離
+※ 修正版(v3): Inner Joinによる日付完全同期の徹底（ノイズデータの排除）
 """
 
 import pandas as pd
@@ -149,9 +150,10 @@ class DataFetcher:
         returns = raw_prices.pct_change()
         bm_returns = bm_prices.pct_change().iloc[:, 0].rename("Benchmark")
         
-        # カレンダー・アライメント
-        # ベンチマークの営業日カレンダーにポートフォリオ側を強制適合させる
-        aligned_returns = returns.reindex(bm_returns.index)
+        # 💡【修正: 日付同期（インデックス・アライメント）の強化】
+        # reindexによる強引な結合を廃止し、pd.merge(how='inner') で両方のデータが確実に存在する日のみを抽出する
+        aligned_df = pd.merge(returns, bm_returns, left_index=True, right_index=True, how='inner')
+        aligned_returns = aligned_df[tickers]
         
         # 「生存銘柄のみ」による動的重み再配分 (Survivor Weighting)
         w_series = pd.Series(ticker_weights) / 100.0
@@ -175,18 +177,21 @@ class DataFetcher:
 
     @staticmethod
     @st.cache_data(ttl=86400)
-    # 💡【修正】デフォルトをFF5（5ファクター）のデータセットに変更
     def fetch_fama_french_factors(start_date, end_date=None, dataset_name="F-F_Research_Data_5_Factors_2x3"):
         """
         Fama-Frenchの5ファクターデータ（Mkt-RF, SMB, HML, RMW, CMA）と
         無リスク金利（RF）をKenneth Frenchのライブラリから取得する。
+        💡【修正】データソースの明示的指定と、取得失敗時の堅牢化。
         """
         try:
+            # 5ファクターデータセットの取得を試行
             ff_dict = web.DataReader(dataset_name, 'famafrench', start=start_date, end=end_date)
             if not ff_dict: return pd.DataFrame()
             
             # 日米で異なるインデックス構造を安全に日付型へ変換（％表示を実数に変換）
             ff_data = ff_dict[0] / 100.0
+            
+            # インデックスを確実にDatetime化
             ff_data.index = ff_data.index.to_timestamp()
             
             # タイムゾーンの完全剥奪 (Tz-Naive)
@@ -195,12 +200,12 @@ class DataFetcher:
                 
             ff_data.columns = [c.strip() for c in ff_data.columns]
             
-            # 💡【修正】無リスク利子率（RF）の確実な分離と保証
+            # 💡無リスク利子率（RF）の確実な分離と保証
             if 'RF' not in ff_data.columns:
-                # 取得データにRFが含まれない場合の安全装置（実務上はほぼ無いが堅牢化のため）
                 ff_data['RF'] = 0.0
             
             return ff_data
         except Exception as e:
-            print(f"FF Data Error: {e}")
+            # エラー時は何が失敗したのかログに残す
+            print(f"FF Data Error for dataset '{dataset_name}': {e}")
             return pd.DataFrame()
