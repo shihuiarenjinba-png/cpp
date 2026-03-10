@@ -2,6 +2,7 @@
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
 ※ 修正版: タイムゾーン同期、生存銘柄による動的ウェイト再配分、カレンダーアライメントの徹底
+※ 修正版(v2): FF5ファクターへの拡張、無リスク利子率(RF)の厳密分離
 """
 
 import pandas as pd
@@ -61,7 +62,7 @@ class DataFetcher:
             
             if data.empty: return pd.DataFrame()
             
-            # 💡【修正1】データ構造の確実なクレンジング（不要な階層の削ぎ落とし）
+            # データ構造の確実なクレンジング（不要な階層の削ぎ落とし）
             # MultiIndex（複数階層）で返ってきた場合、純粋なティッカー名だけを残す
             if isinstance(data.columns, pd.MultiIndex):
                 if 'Close' in data.columns.get_level_values(0):
@@ -75,7 +76,7 @@ class DataFetcher:
                 elif 'Adj Close' in data.columns:
                     data = data[['Adj Close']]
             
-            # 💡【修正2】1銘柄・複数銘柄の取得パターンの統一
+            # 1銘柄・複数銘柄の取得パターンの統一
             if isinstance(data, pd.Series):
                 data = data.to_frame()
                 
@@ -86,7 +87,7 @@ class DataFetcher:
             # 列名を確実に文字列化
             data.columns = [str(c).strip() for c in data.columns]
             
-            # 💡【修正: タイムゾーンの完全剥奪 (Tz-Naive)】
+            # タイムゾーンの完全剥奪 (Tz-Naive)
             # インデックスを「日付」のみに標準化し、結合時のズレを根絶する
             if data.index.tz is not None: 
                 data.index = data.index.tz_localize(None)
@@ -148,36 +149,23 @@ class DataFetcher:
         returns = raw_prices.pct_change()
         bm_returns = bm_prices.pct_change().iloc[:, 0].rename("Benchmark")
         
-        # 💡【修正: カレンダー・アライメント】
+        # カレンダー・アライメント
         # ベンチマークの営業日カレンダーにポートフォリオ側を強制適合させる
         aligned_returns = returns.reindex(bm_returns.index)
         
-        # 💡【修正: 「生存銘柄のみ」による動的重み再配分 (Survivor Weighting)】
-        # 銘柄ごとの初期ウェイトをSeries化
+        # 「生存銘柄のみ」による動的重み再配分 (Survivor Weighting)
         w_series = pd.Series(ticker_weights) / 100.0
-        
-        # 生存フラグ（NaNでない＝その日上場しており価格が存在するならTrue）
         is_alive = aligned_returns.notna()
-        
-        # その日に存在する銘柄にのみウェイトを割り当てる
         active_weights = is_alive.multiply(w_series, axis=1)
-        
-        # その日の「生きている銘柄のウェイト合計」を算出
         weight_sums = active_weights.sum(axis=1)
         
         # ゼロ割り防止（全銘柄が存在しない日はNaNにする）
         weight_sums = weight_sums.replace(0, np.nan)
-        
-        # ウェイトの再正規化（生存している銘柄だけで合計が必ず100%になるように割り直す）
         normalized_weights = active_weights.div(weight_sums, axis=0)
         
         # ポートフォリオのリターン = Σ(各銘柄リターン * 再正規化ウェイト)
         weighted_returns = (aligned_returns.fillna(0) * normalized_weights.fillna(0)).sum(axis=1)
-        
-        # 有効な銘柄が1つもない日はNaNに戻す
         weighted_returns.loc[weight_sums.isna()] = np.nan
-        
-        # ポートフォリオが成立する期間のみに絞る（先頭のNaNを削除）
         weighted_returns = weighted_returns.dropna()
         
         if weighted_returns.empty: return None
@@ -186,10 +174,12 @@ class DataFetcher:
         return (1 + weighted_returns).cumprod() * 100
 
     @staticmethod
-    @st.cache_data(ttl=86400)  # ファクターデータは更新頻度が低いため1日キャッシュ
-    def fetch_fama_french_factors(start_date, end_date=None, dataset_name="F-F_Research_Data_Factors"):
+    @st.cache_data(ttl=86400)
+    # 💡【修正】デフォルトをFF5（5ファクター）のデータセットに変更
+    def fetch_fama_french_factors(start_date, end_date=None, dataset_name="F-F_Research_Data_5_Factors_2x3"):
         """
-        Fama-FrenchのファクターデータをKenneth Frenchのライブラリから取得する。
+        Fama-Frenchの5ファクターデータ（Mkt-RF, SMB, HML, RMW, CMA）と
+        無リスク金利（RF）をKenneth Frenchのライブラリから取得する。
         """
         try:
             ff_dict = web.DataReader(dataset_name, 'famafrench', start=start_date, end=end_date)
@@ -199,11 +189,16 @@ class DataFetcher:
             ff_data = ff_dict[0] / 100.0
             ff_data.index = ff_data.index.to_timestamp()
             
-            # 💡【修正: タイムゾーンの完全剥奪 (Tz-Naive)】
+            # タイムゾーンの完全剥奪 (Tz-Naive)
             if ff_data.index.tz is not None: 
                 ff_data.index = ff_data.index.tz_localize(None)
                 
             ff_data.columns = [c.strip() for c in ff_data.columns]
+            
+            # 💡【修正】無リスク利子率（RF）の確実な分離と保証
+            if 'RF' not in ff_data.columns:
+                # 取得データにRFが含まれない場合の安全装置（実務上はほぼ無いが堅牢化のため）
+                ff_data['RF'] = 0.0
             
             return ff_data
         except Exception as e:
