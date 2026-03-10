@@ -1,7 +1,7 @@
 """
 app.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v4): 厳密化されたバックエンド(FF5/Inner Join)と完全に連動するプロフェッショナルUI
+※ 修正版(v5): 地域(US/JP)の動的切り替えと、超過リターンベースのAlpha/Betaの正確なUI表示に対応
 """
 
 import streamlit as st
@@ -27,7 +27,6 @@ class AuditEngine:
     def plot_factor_correlation(region="US"):
         """ファクター同士の相関関係をヒートマップで可視化"""
         factor_corr = FactorAnalyzer.get_factor_correlation(region=region)
-        # 💡修正ポイント1: データ不足時の NoneType クラッシュ回避
         if not factor_corr:
             st.info("💡 ファクター相関データが取得できませんでした（データ期間が短い、またはAPI制限の可能性があります）。")
             return
@@ -38,7 +37,7 @@ class AuditEngine:
             text_auto=".2f", 
             color_continuous_scale="RdBu_r", 
             zmin=-1, zmax=1,
-            title="Factor Correlation (クラウディング・重複リスクの確認)"
+            title=f"Factor Correlation ({region} Region - クラウディング・重複リスクの確認)"
         )
         fig.update_layout(height=400, margin=dict(l=20, r=20, t=50, b=20))
         st.plotly_chart(fig, use_container_width=True)
@@ -47,7 +46,6 @@ class AuditEngine:
     def plot_rolling_correlation(port_returns, bm_returns, window=60):
         """市場との連動性（ローリング相関）の推移を可視化"""
         aligned = pd.concat([port_returns.rename("Portfolio"), bm_returns], axis=1).dropna()
-        # 💡修正ポイント1: 計算に必要な期間が足りない場合のフォールバック
         if len(aligned) < window:
             st.info(f"💡 ローリング相関を描画するための期間データ（{window}日分）が不足していますが、全体の分析には影響しません。")
             return
@@ -84,7 +82,6 @@ class AuditEngine:
         names = list(crisis_results.keys())
         n_crises = len(names)
         
-        # 💡修正ポイント1: 危機期間にデータが存在しなかった場合の案内
         if n_crises == 0:
             st.info("💡 このポートフォリオを構成する銘柄は、指定された過去の危機期間にデータが存在しないため、シミュレーションをスキップしました。")
             return
@@ -104,7 +101,7 @@ class AuditEngine:
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                             vertical_spacing=0.1, subplot_titles=("Factor Betas (36-Month Rolling)", "Adjusted R-Squared (%)"))
         
-        # Betas
+        # Betas (超過リターンベース)
         for col in ["Market_Beta", "Size_Beta", "Value_Beta", "Quality_Beta", "Invest_Beta"]:
             if col in rolling_df.columns and not rolling_df[col].isna().all():
                 fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df[col], name=col, mode='lines'), row=1, col=1)
@@ -121,7 +118,6 @@ class AuditEngine:
     @staticmethod
     def plot_monte_carlo_fanchart(paths):
         """1万回のシミュレーション推移を扇状（ファンチャート）で可視化"""
-        # 💡修正ポイント2: 1万本の線を全て描画するとブラウザがクラッシュするため、代表パーセンタイルに圧縮
         percentiles = np.percentile(paths, [5, 25, 50, 75, 95], axis=1)
         days = np.arange(paths.shape[0])
         
@@ -194,14 +190,17 @@ def main():
     ai_api_key = st.sidebar.text_input("API Key (現在プレースホルダー)", type="password", help="ここにOpenAI等のAPIキーを入れると本物のAIが動くようになります")
     st.sidebar.divider()
     
-    region = st.sidebar.selectbox("Market Region", ["US", "Japan"])
+    # 💡修正ポイント: 地域(Region)の選択。ここで選択された内容が以降のすべての計算ロジックに波及する。
+    region = st.sidebar.selectbox("Market Region", ["US", "Japan"], help="対象市場を選択してください。バックエンドの参照ファイルや無リスク金利が切り替わります。")
+    config = MarketConfig.get_config(region)
+    st.sidebar.caption(f"📌 **設定情報:**\n- データセット: `{config['ff_dataset']}`\n- ベンチマーク: `{config['benchmark_ticker']}`")
     
     st.sidebar.markdown("**📤 1. ポートフォリオ一括読込 (オプション)**")
     uploaded_file = st.sidebar.file_uploader("CSVファイル", type=["csv"], help="ティッカーと比率が書かれたCSVを読み込みます。")
     
     if 'portfolio_data' not in st.session_state:
         st.session_state.portfolio_data = pd.DataFrame({
-            "Ticker": ["AAPL", "MSFT", "GOOGL"],
+            "Ticker": ["AAPL", "MSFT", "GOOGL"] if region == "US" else ["7203.T", "8306.T", "9984.T"],
             "Weight": [40.0, 40.0, 20.0]
         })
 
@@ -224,10 +223,11 @@ def main():
             st.sidebar.error(f"CSV読み込みエラー: {e}")
 
     st.sidebar.markdown("**✏️ 2. 銘柄とウェイト調整（直接編集可能）**")
+    # 💡修正ポイント: ログの警告(use_container_width deprecated)に対応し width="stretch" を使用
     edited_df = st.sidebar.data_editor(
         st.session_state.portfolio_data, 
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         hide_index=True
     )
     
@@ -238,12 +238,13 @@ def main():
             weights_dict[ticker] = float(row["Weight"])
 
     # --- 実行ボタン ---
+    # 💡修正ポイント: ボタンも同様に警告対応
     if st.sidebar.button("Run Advanced Analysis", type="primary", use_container_width=True):
         if not weights_dict:
             st.error("有効なティッカーとウェイトを入力してください。")
             return
             
-        with st.spinner("Initializing Quantitative Engine & Fetching Data..."):
+        with st.spinner(f"Initializing Quantitative Engine ({region} Market) & Fetching Data..."):
             
             # 1. データの準備
             norm_weights = DataFetcher.normalize_weights(weights_dict)
@@ -254,7 +255,6 @@ def main():
             
             synthetic_portfolio = DataFetcher.create_synthetic_portfolio(norm_weights, region=region)
             
-            # 💡修正ポイント1: データ構築失敗時のクラッシュ防止
             if synthetic_portfolio is None or synthetic_portfolio.empty:
                 st.error("データの構築に失敗しました。ティッカー記号（特に日本株の場合は .T の付与など）や期間を確認してください。")
                 return
@@ -266,11 +266,10 @@ def main():
 
             returns = synthetic_portfolio.pct_change().dropna()
             
-            config = MarketConfig.get_config(region)
             bm_prices = DataFetcher.fetch_market_data([config["benchmark_ticker"]])
             bm_returns = bm_prices.pct_change().iloc[:, 0].rename("Benchmark")
 
-            # 2. 解析
+            # 2. 解析 (regionを渡して超過リターン等を含めて厳密に計算)
             metrics = AdvancedStats.calculate_metrics(returns, weights_dict=norm_weights, region=region)
             style = FactorAnalyzer.analyze_style(synthetic_portfolio, region=region)
             cycle_days = RegimeAnalyzer.detect_cycle(returns)
@@ -297,7 +296,7 @@ def main():
 
             # --- タブ1: 概要 ---
             with tab1:
-                st.header("1. Core Risk Metrics & AI Diagnosis")
+                st.header(f"1. Core Risk Metrics & AI Diagnosis ({region} Market)")
                 st.subheader("🤖 クオンツマネージャーの辛口診断")
                 
                 ai_prompt = AIPromptBuilder.generate_quant_prompt(metrics, style, target_name="現在のポートフォリオ")
@@ -335,7 +334,7 @@ def main():
                 c_col1, c_col2 = st.columns(2)
                 
                 with c_col1:
-                    st.subheader("Factor Correlation Matrix (Ex. RF)")
+                    st.subheader(f"Factor Correlation Matrix ({region})")
                     AuditEngine.plot_factor_correlation(region=region)
                     
                 with c_col2:
@@ -374,8 +373,8 @@ def main():
 
             # --- タブ4: ファクター解析 (FF5 プロフェッショナル・ダッシュボード化) ---
             with tab4:
-                st.header("4. Causal Factor Analysis (Fama-French 5-Factor)")
-                st.markdown("ポートフォリオの背後にある「リスクの源泉」を統計的に分解し、その因果的妥当性と安定性を評価します。")
+                st.header(f"4. Causal Factor Analysis ({region} Fama-French 5-Factor)")
+                st.markdown("ポートフォリオの背後にある「リスクの源泉」を統計的に分解し、その因果的妥当性と安定性を評価します。無リスク金利(RF)を控除した**超過リターンベース**で計算されています。")
                 
                 if style and style.get('status') != 'insufficient_data':
                     
@@ -387,8 +386,9 @@ def main():
                     
                     f_col1, f_col2, f_col3, f_col4 = st.columns(4)
                     
+                    # 💡修正ポイント: 超過リターンであることをUI上で明示
                     mkt_beta = style.get('beta_market', 1.0)
-                    f_col1.metric("Market (市場ベータ)", f"{mkt_beta:.2f}", delta="ハイリスク" if mkt_beta > 1.2 else ("ローリスク" if mkt_beta < 0.8 else ""), delta_color="inverse")
+                    f_col1.metric("Market-RF (市場超過ベータ)", f"{mkt_beta:.2f}", delta="ハイリスク" if mkt_beta > 1.2 else ("ローリスク" if mkt_beta < 0.8 else ""), delta_color="inverse")
                     
                     size_beta = style.get('beta_size', 0.0)
                     f_col2.metric("SMB (企業規模)", f"{size_beta:.2f}", delta="小型株寄り" if size_beta > 0 else "大型株寄り", delta_color="off")
@@ -397,7 +397,7 @@ def main():
                     f_col3.metric("HML (割安性)", f"{val_beta:.2f}", delta="割安株寄り" if val_beta > 0 else "成長株寄り", delta_color="off")
                     
                     alpha_val = style.get('alpha', 0.0) * 100
-                    f_col4.metric("Alpha (年率超過収益)", f"{alpha_val:.3f}%", delta=f"{alpha_val:.3f}%", delta_color="normal")
+                    f_col4.metric("Alpha (年率固有・超過収益)", f"{alpha_val:.3f}%", delta=f"{alpha_val:.3f}%", delta_color="normal", help="無リスク金利と市場・スタイルの要因を差し引いた後の、ポートフォリオ固有の純粋な超過リターン（年率）です。")
                     
                     q_col1, q_col2, _, _ = st.columns(4)
                     quality_beta = style.get('beta_quality', 0.0)
