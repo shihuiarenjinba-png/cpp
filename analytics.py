@@ -1,7 +1,7 @@
 """
 analytics.py
 ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
-【アップデート】動的ウェイト再配分（Survivor Weighting）と、堅牢なフォールバックロジックを実装。
+【アップデート】対数リターンの採用、Inner Mergeによる完全同期、Ledoit-Wolf法の堅牢化を実装。
 """
 
 import pandas as pd
@@ -22,7 +22,7 @@ except ImportError:
     HAS_SKLEARN = False
 
 # =========================================================
-# 🕰️ タイムマシン・シミュレーション (新規追加)
+# 🕰️ タイムマシン・シミュレーション
 # =========================================================
 class HistoryTimeMachine:
     @staticmethod
@@ -75,9 +75,8 @@ class AdvancedStats:
     def calculate_metrics(returns, benchmark_returns=None, weights_dict=None, region="US"):
         """
         日次リターン系列から各種リスク指標を計算する。
-        計算エラー時もシステムを止めず、安全なデフォルト値を返すガードレールを実装。
+        💡【修正】対数リターンによる加法性の確保と、Inner Mergeによる日付の完全同期。
         """
-        # 💡【ガードレール】データがない場合は安全な空の辞書（デフォルト値）を返す
         default_metrics = {
             "sharpe": 0.0, "sortino": 0.0, "calmar": 0.0, "omega": 0.0, "cvar_95": 0.0,
             "ulcer_index": 0.0, "kelly_criterion": 0.0, "max_dd": 0.0, "info_ratio": 0.0,
@@ -91,12 +90,10 @@ class AdvancedStats:
             return default_metrics
         
         try:
-            # 正規化・リスケール
             weights_dict = DataFetcher.normalize_weights(weights_dict)
             
             # 1. 集中投資ペナルティ(HHI)
             hhi, penalty, enc = 0.0, 1.0, 0.0 
-            
             if weights_dict is not None and sum(weights_dict.values()) > 0:
                 weights = np.array(list(weights_dict.values())) / 100.0
                 hhi = np.sum(weights**2)
@@ -105,7 +102,9 @@ class AdvancedStats:
                 
             # 2. リスク（ボラティリティ）とリスク寄与度の計算
             ann_factor = np.sqrt(TRADING_DAYS_PER_YEAR)
-            raw_sigma = returns.std() * ann_factor
+            # 統計学的に正確な対数リターンへ変換 ln(1 + R)
+            log_returns = np.log1p(returns.dropna())
+            raw_sigma = log_returns.std() * ann_factor
             lw_sigma = raw_sigma
             risk_contribution = {}
             
@@ -116,19 +115,23 @@ class AdvancedStats:
                     if not raw_comp.empty:
                         if isinstance(raw_comp, pd.Series):
                             raw_comp = raw_comp.to_frame(name=tickers[0])
-                        comp_returns = raw_comp.pct_change().dropna()
                         
-                        valid_tickers = [t for t in tickers if t in comp_returns.columns]
+                        # 💡【修正】各構成銘柄の対数リターン ln(P_t / P_t-1)
+                        # dropna()による全消去を防ぎ、存在しない期間は0（価格変動なし＝リスクゼロ）とする
+                        comp_log_returns = np.log(raw_comp / raw_comp.shift(1)).fillna(0.0)
+                        
+                        valid_tickers = [t for t in tickers if t in comp_log_returns.columns]
                         if len(valid_tickers) > 0:
-                            comp_returns = comp_returns[valid_tickers]
+                            comp_log_returns = comp_log_returns[valid_tickers]
                             new_weights = np.array([weights_dict[t] for t in valid_tickers])
                             new_weights = new_weights / np.sum(new_weights)
                             
-                            if HAS_SKLEARN and len(comp_returns) > 10:
-                                lw = LedoitWolf().fit(comp_returns)
+                            # 💡【修正】Shrinkage共分散行列の採用 (Ledoit-Wolf)
+                            if HAS_SKLEARN and len(comp_log_returns) > 10:
+                                lw = LedoitWolf().fit(comp_log_returns)
                                 cov_matrix = lw.covariance_
                             else:
-                                cov_matrix = comp_returns.cov().values
+                                cov_matrix = comp_log_returns.cov().values
                                 
                             port_var = np.dot(new_weights.T, np.dot(cov_matrix, new_weights))
                             if port_var > 0:
@@ -142,8 +145,7 @@ class AdvancedStats:
             
             sigma = lw_sigma * penalty 
             
-            # リターン計算 (ボラティリティ・ドラッグを考慮)
-            arithmetic_mu = returns.mean() * TRADING_DAYS_PER_YEAR
+            arithmetic_mu = log_returns.mean() * TRADING_DAYS_PER_YEAR
             mu = arithmetic_mu - 0.5 * (sigma ** 2) 
             
             cumulative = (1 + returns).cumprod()
@@ -157,7 +159,7 @@ class AdvancedStats:
             risk_free_rate = DEFAULT_RISK_FREE_RATE 
             sharpe = (mu - risk_free_rate) / sigma if sigma > 0 else 0
             
-            downside_returns = returns[returns < 0]
+            downside_returns = log_returns[log_returns < 0]
             downside_dev = downside_returns.std() * ann_factor * penalty if not downside_returns.empty else 0
             sortino = (mu - risk_free_rate) / downside_dev if downside_dev > 0 else 0
             
@@ -167,8 +169,8 @@ class AdvancedStats:
             losses = abs(returns[returns < 0].sum())
             omega = gains / losses if losses > 0 else np.inf
             
-            var_95 = np.percentile(returns.dropna(), 5) * penalty 
-            cvar_95 = returns[returns <= var_95].mean() * penalty if len(returns[returns <= var_95]) > 0 else 0
+            var_95 = np.percentile(log_returns.dropna(), 5) * penalty 
+            cvar_95 = log_returns[log_returns <= var_95].mean() * penalty if len(log_returns[log_returns <= var_95]) > 0 else 0
             
             kelly = mu / (sigma ** 2) if sigma > 0 else 0
             info_ratio = 0.0
@@ -184,14 +186,20 @@ class AdvancedStats:
                         benchmark_returns = bm_prices.pct_change().iloc[:, 0].dropna()
                         
                 if benchmark_returns is not None and not benchmark_returns.empty:
-                    if returns.index.tz is not None: returns.index = returns.index.tz_localize(None)
-                    if benchmark_returns.index.tz is not None: benchmark_returns.index = benchmark_returns.index.tz_localize(None)
-                    returns.index = returns.index.normalize()
-                    benchmark_returns.index = benchmark_returns.index.normalize()
+                    # 💡【修正】OLS回帰前に対数リターン化
+                    log_ret_df = log_returns.to_frame(name="Port")
+                    log_bm_df = np.log1p(benchmark_returns.dropna()).to_frame(name="BM")
                     
-                    aligned = pd.concat([returns, benchmark_returns.rename("BM")], axis=1).dropna()
+                    if log_ret_df.index.tz is not None: log_ret_df.index = log_ret_df.index.tz_localize(None)
+                    if log_bm_df.index.tz is not None: log_bm_df.index = log_bm_df.index.tz_localize(None)
+                    log_ret_df.index = log_ret_df.index.normalize()
+                    log_bm_df.index = log_bm_df.index.normalize()
+                    
+                    # 💡【修正】明示的な pd.merge (how='inner') による100%完全同期
+                    aligned = pd.merge(log_ret_df, log_bm_df, left_index=True, right_index=True, how='inner')
+                    
                     if len(aligned) > 30:
-                        cov_bm = np.cov(aligned.iloc[:, 0], aligned["BM"])
+                        cov_bm = np.cov(aligned["Port"], aligned["BM"])
                         if cov_bm[1, 1] > 0:
                             portfolio_beta = cov_bm[0, 1] / cov_bm[1, 1]
                             sys_var = (portfolio_beta ** 2) * cov_bm[1, 1]
@@ -199,14 +207,14 @@ class AdvancedStats:
                             systematic_risk = np.sqrt(sys_var) * ann_factor
                             idiosyncratic_risk = np.sqrt(idio_var) * ann_factor
                             
-                            active_ret = aligned.iloc[:, 0] - aligned["BM"]
+                            active_ret = aligned["Port"] - aligned["BM"]
                             track_err = active_ret.std() * ann_factor
                             if track_err > 0:
                                 info_ratio = (active_ret.mean() * TRADING_DAYS_PER_YEAR) / track_err
             except Exception as e:
                 print(f"Risk Separation Fallback: {e}")
 
-            clean_returns = returns.dropna()
+            clean_returns = log_returns.dropna()
             return {
                 "sharpe": sharpe, "sortino": sortino, "calmar": calmar,
                 "omega": omega, "cvar_95": cvar_95, "ulcer_index": ulcer_index,
@@ -232,9 +240,8 @@ class FactorAnalyzer:
     def analyze_style(target_series, region="US"):
         """
         Fama-French 3ファクターモデルを用いた重回帰分析。
-        💡【堅牢化】期間ズレやデータ不足によるエラー回避（フォールバック）を強化。
+        💡【修正】Inner Mergeを用いた厳密な同期と対数リターンの適用。
         """
-        # デフォルトの安全な戻り値
         fallback_result = {
             "beta_market": 1.0, "beta_size": 0.0, "beta_value": 0.0,
             "alpha": 0.0, "r_squared": 0.0,
@@ -245,7 +252,8 @@ class FactorAnalyzer:
         if target_series.empty: return fallback_result
         
         try:
-            target_monthly = target_series.resample('ME').last().pct_change().dropna()
+            # 💡【修正】ターゲットを対数リターンで算出 ln(P_t / P_t-1)
+            target_monthly = np.log(target_series.resample('ME').last() / target_series.resample('ME').last().shift(1)).dropna()
             if len(target_monthly) < 6: return fallback_result
             
             start_date = target_monthly.index[0].strftime('%Y-%m-%d')
@@ -254,12 +262,13 @@ class FactorAnalyzer:
             
             if ff_data.empty: return fallback_result
             
-            # 月次粒度で厳密な結合（これで1日ズレなどは吸収される）
+            # 月次粒度でのインデックス統一
             target_monthly.index = target_monthly.index.to_period('M')
             ff_data.index = ff_data.index.to_period('M')
-            combined = pd.concat([target_monthly.rename("Target"), ff_data], axis=1).dropna()
             
-            # データポイントが足りない場合は安全な値を返す（エラー画面回避）
+            # 💡【修正】Inner Mergeによる完全一致データの抽出 (dropna()による事故防止)
+            combined = pd.merge(target_monthly.to_frame(name="Target"), ff_data, left_index=True, right_index=True, how='inner')
+            
             if len(combined) < 10: return fallback_result
             
             mkt = [c for c in combined.columns if 'Mkt' in c or 'MKT' in c][0]
@@ -267,6 +276,7 @@ class FactorAnalyzer:
             hml = [c for c in combined.columns if 'HML' in c][0]
             rf  = [c for c in combined.columns if 'RF' in c][0]
 
+            # 超過リターン
             y = combined["Target"] - combined[rf]
             X = combined[[mkt, smb, hml]]
             X = sm.add_constant(X)
@@ -294,7 +304,7 @@ class FactorAnalyzer:
     @staticmethod
     def get_factor_correlation(region="US", periods=60):
         """
-        ファクター同士の相関行列計算。エラー時は空ではなく単位行列などを返すよう堅牢化可能。
+        ファクター同士の相関行列計算。
         """
         try:
             config = MarketConfig.get_config(region)
@@ -315,7 +325,7 @@ class FactorAnalyzer:
 
 
 # =========================================================
-# 🤖 AIアドバイザープロンプト生成 (Step 3: AIの診断能力)
+# 🤖 AIアドバイザープロンプト生成
 # =========================================================
 class AIPromptBuilder:
     @staticmethod
