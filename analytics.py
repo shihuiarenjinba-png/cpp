@@ -261,7 +261,7 @@ class FactorAnalyzer:
             
             if ff_data.empty: return fallback_result
             
-            # 月次粒度でのインデックス統一
+            # 月次粒度でのインデックス統一 (年月で完全に一致させるための前処理)
             target_monthly.index = target_monthly.index.to_period('M')
             ff_data.index = ff_data.index.to_period('M')
             
