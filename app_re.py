@@ -1,7 +1,7 @@
 """
 app.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版: CSVゆらぎ許容、過去危機のチャート化、Tab4プロフェッショナルダッシュボード化、エラーのインフォメーション化
+※ 修正版: 計算有効銘柄数の明示、R2とP-Valueを用いた統計的インサイトの自動解説を実装
 """
 
 import streamlit as st
@@ -90,17 +90,11 @@ class AuditEngine:
         
         for i, name in enumerate(names):
             data = crisis_results[name]
-            if 'cum_returns' in data:
-                series = data['cum_returns']
-                fig.add_trace(
-                    go.Scatter(x=series.index, y=series.values, name=name, fill='tozeroy', line=dict(color='firebrick')),
-                    row=i+1, col=1
-                )
-                base_val = 100.0 if series.iloc[0] > 10 else 1.0
-                fig.add_hline(y=base_val, line_dash="dash", line_color="gray", row=i+1, col=1)
+            # cum_returns ではなくシミュレーション結果のキーに合わせる必要があるためダミーデータを回避し整合性を保つ
+            # 実際には HistoryTimeMachine は start_value, end_value, max_drawdown_pct を返す
+            st.markdown(f"**{name}**")
+            st.markdown(f"- 最大下落幅 (Max Drawdown): **{data['max_drawdown_pct']:.2f}%**")
         
-        fig.update_layout(height=300 * n_crises, showlegend=False, title_text="Historical Stress Tests (Recovery Paths)", margin=dict(l=20, r=20, t=50, b=20))
-        st.plotly_chart(fig, use_container_width=True)
         # 💡 エラーではなく、インフォメーションとして生存バイアスを明記
         st.info("📌 **仕様メモ:** 指定期間にまだ上場していなかった銘柄は自動的に除外され、当時存在していた銘柄のみでポートフォリオ比率を再配分（100%に正規化）してシミュレーションを行っています。")
 
@@ -190,7 +184,7 @@ def main():
             "Weight": [40.0, 40.0, 20.0]
         })
 
-    # 💡 修正点: CSVインポートの「ゆらぎ」許容と自動クリーニング
+    # CSVインポートの「ゆらぎ」許容と自動クリーニング
     if uploaded_file is not None:
         try:
             df_csv = pd.read_csv(uploaded_file)
@@ -236,12 +230,24 @@ def main():
             
             # 1. データの準備
             norm_weights = DataFetcher.normalize_weights(weights_dict)
+            input_ticker_count = len(norm_weights)
+            
+            # 💡 計算有効銘柄数の確認（網羅性の可視化）
+            raw_input_data = DataFetcher.fetch_market_data(list(norm_weights.keys()))
+            valid_ticker_count = len(raw_input_data.columns) if not raw_input_data.empty else 0
+            
             synthetic_portfolio = DataFetcher.create_synthetic_portfolio(norm_weights, region=region)
             
             if synthetic_portfolio is None or synthetic_portfolio.empty:
                 st.error("データの構築に失敗しました。ティッカー記号を確認してください。")
                 return
             
+            # ✅ データ網羅性の通知
+            if valid_ticker_count == input_ticker_count:
+                st.success(f"✅ **データ網羅性:** 入力された全 {input_ticker_count} 銘柄の有効なヒストリカルデータを取得し、シミュレーションに適用しました。")
+            else:
+                st.warning(f"⚠️ **データ網羅性:** 入力された {input_ticker_count} 銘柄中、**{valid_ticker_count} 銘柄** のみが計算に適用されました。（上場廃止やティッカー誤りの可能性があります）")
+
             returns = synthetic_portfolio.pct_change().dropna()
             
             config = MarketConfig.get_config(region)
@@ -286,7 +292,7 @@ def main():
                     > **【AI診断ダミー表示】**
                     > あなたのポートフォリオを拝見しました。分散投資をしているつもりかもしれませんが、
                     > リスクの大半が特定の1銘柄に集中しており、実質的にその銘柄と心中している状態です。
-                    > また、市場との連動性（R2）が非常に高く、高い手数料を払ってインデックスファンドと
+                    > また、市場との連動性（R-Squared）が非常に高く、高い手数料を払ってインデックスファンドと
                     > 同じ動きをしている「隠れインデックス」の兆候が見られます。
                     > **[ネクストアクション]** 早急に最大リスク寄与銘柄のウェイトを下げ、他セクターへの分散を図りなさい。
                     """)
@@ -378,18 +384,28 @@ def main():
                     s_col1, s_col2, s_col3 = st.columns(3)
                     
                     r2 = style.get('r_squared', 0.0) * 100
+                    p_val_market = style.get('p_value_market', 1.0)
+                    
                     s_col1.metric("R-Squared (決定係数)", f"{r2:.1f}%", help="この数値が高いほど、市場全体の動きだけでポートフォリオの動きが説明できることを示します。")
-                    s_col2.metric("Market P-Value", f"{style.get('p_value_market', 1.0):.3f}", help="0.05未満であれば統計的に有意です。")
+                    s_col2.metric("Market P-Value", f"{p_val_market:.3f}", help="0.05未満であれば統計的に有意です。")
                     s_col3.metric("Size/Value P-Value", f"{style.get('p_value_size', 1.0):.3f} / {style.get('p_value_value', 1.0):.3f}")
 
-                    # 💡 インサイト解説の自動生成（ダッシュボード機能）
-                    if r2 > 90:
-                        st.warning("⚠️ **高相関の警告 (R-Squared > 90%)**: ポートフォリオの動きの大部分が市場平均（インデックス）と同じです。アクティブファンドとして運用している場合、いわゆる『隠れインデックス』となっている可能性があります。")
-                    elif r2 < 60:
-                        st.success("✨ **独自の動き (R-Squared < 60%)**: 市場平均とは異なる独自のリスク・リターン特性を持っています。意図的なアクティブ運用や、特定のセクター・テーマへの集中投資が反映されています。")
-                        
-                    if alpha_val > 0 and style.get('p_value_market', 1.0) < 0.05:
-                        st.info("💡 **良好なアルファ**: 市場の動き（ベータ）やスタイル要因（サイズ・バリュー）を差し引いた後も、プラスの超過収益（アルファ）を生み出しています。")
+                    # 💡 P-ValueとR2を掛け合わせた論理的なインサイト自動生成
+                    st.markdown("#### 🧠 統計モデリングによる解釈 (R² & P-Value)")
+                    
+                    if p_val_market < 0.05:
+                        significance = "統計的に有意（信頼できる）"
+                        if r2 >= 80:
+                            insight = f"決定係数（R-Squared）が **{r2:.1f}%** と非常に高く、市場P値も **{p_val_market:.3f}** と0.05未満で{significance}です。これは、ポートフォリオのリターン変動の大部分（{r2:.1f}%）が市場全体（インデックス）の動きで**論理的に説明できる**ことを意味します。意図せずインデックスファンドと同じ動きをしている「隠れインデックス」状態の可能性があります。"
+                        elif r2 >= 50:
+                            insight = f"決定係数（R-Squared）は **{r2:.1f}%** であり、市場P値（**{p_val_market:.3f}**）から見ても{significance}関係にあります。市場の動きにある程度連動しつつも、独自のアクティブな変動（固有のアルファや別テーマの動き）を半分程度持っている、バランス型の状態です。"
+                        else:
+                            insight = f"決定係数（R-Squared）は **{r2:.1f}%** と低めですが、市場P値（**{p_val_market:.3f}**）から市場との関係は{significance}と判定されました。市場トレンドに流されにくく、**独自の要因（個別銘柄の特性や特定のセクター集中など）が値動きを支配**していることを示しています。"
+                    else:
+                        significance = "統計的に有意ではない（ノイズの可能性が高い）"
+                        insight = f"市場P値が **{p_val_market:.3f}** と0.05を上回っており、{significance}と判定されました。現在の決定係数（R-Squared = **{r2:.1f}%**）は偶然の産物である可能性が高く、このポートフォリオは市場ベンチマークとは全く異なる法則で動いているか、単にデータ蓄積期間が短すぎる状態です。"
+
+                    st.info(insight)
 
                 else:
                     st.info("💡 ファクター分析を行うための月次データが不足しています（最低6ヶ月分以上の運用履歴が必要です）。")
