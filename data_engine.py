@@ -4,6 +4,7 @@ data_engine.py
 ※ 修正版: タイムゾーン同期、生存銘柄による動的ウェイト再配分、カレンダーアライメントの徹底
 ※ 修正版(v2): FF5ファクターへの拡張、無リスク利子率(RF)の厳密分離
 ※ 修正版(v3): Inner Joinによる日付完全同期の徹底（ノイズデータの排除）
+※ 修正版(v4): 2x3の排除、純粋な5ファクター（RF込み）の取得と厳格なインデックス正規化
 """
 
 import pandas as pd
@@ -94,7 +95,7 @@ class DataFetcher:
                 data.index = data.index.tz_localize(None)
             data.index = data.index.normalize()
 
-            # 💡修正ポイント1: ffillに制限(limit=5)を設け、上場廃止・取引停止銘柄が「永遠に同じ価格で生き残る」ことを防ぐ
+            # ffillに制限(limit=5)を設け、上場廃止・取引停止銘柄が「永遠に同じ価格で生き残る」ことを防ぐ
             return data.ffill(limit=5).dropna(how='all')
         except Exception as e:
             print(f"Fetch Error: {e}")
@@ -146,7 +147,7 @@ class DataFetcher:
         if isinstance(bm_prices, pd.Series):
             bm_prices = bm_prices.to_frame(name=bm_ticker)
 
-        # 💡修正ポイント2: 欠損値(NaN)のまま pct_change を計算させ、存在しない日のリターンを誤って0にしない (fill_method=None)
+        # 欠損値(NaN)のまま pct_change を計算させ、存在しない日のリターンを誤って0にしない (fill_method=None)
         returns = raw_prices.pct_change(fill_method=None)
         bm_returns = bm_prices.pct_change(fill_method=None).iloc[:, 0].rename("Benchmark")
         
@@ -176,34 +177,52 @@ class DataFetcher:
 
     @staticmethod
     @st.cache_data(ttl=86400)
-    def fetch_fama_french_factors(start_date, end_date=None, dataset_name="F-F_Research_Data_5_Factors_2x3"):
+    def fetch_fama_french_factors(start_date, end_date=None, dataset_name="North_America_5_Factors_Daily"):
         """
-        Fama-Frenchの5ファクターデータ（Mkt-RF, SMB, HML, RMW, CMA）と
+        Fama-Frenchの純粋な5ファクターデータ（Mkt-RF, SMB, HML, RMW, CMA）と
         無リスク金利（RF）をKenneth Frenchのライブラリから取得する。
+        💡修正ポイント: 2x3のポートフォリオデータを排除し、純粋な5ファクターを確実に取得。
         """
         try:
             # 5ファクターデータセットの取得を試行
             ff_dict = web.DataReader(dataset_name, 'famafrench', start=start_date, end=end_date)
-            if not ff_dict: return pd.DataFrame()
+            if not ff_dict: 
+                print(f"Warning: Empty dictionary returned for dataset {dataset_name}")
+                return pd.DataFrame()
             
+            # データ辞書の最初の要素（通常は日次または月次ファクター）を取得
             ff_data = ff_dict[0]
             
-            # 💡修正ポイント3: パーセント表記（1.0 = 1%）と小数表記（0.01 = 1%）の自動判定と統一
+            # 💡修正ポイント: カラムの確実な抽出と正規化
+            ff_data.columns = [c.strip() for c in ff_data.columns]
+            
+            # 必要なカラムが含まれているか確認 (Mkt-RF or Mkt, SMB, HML, RMW, CMA, RF)
+            required_cols = ['SMB', 'HML', 'RMW', 'CMA', 'RF']
+            # MktはMkt-RFだったりMktだったりするので柔軟に対応
+            has_mkt = any('MKT' in c.upper() for c in ff_data.columns)
+            
+            if not has_mkt or not all(any(req in c.upper() for c in ff_data.columns) for req in required_cols):
+                print(f"Warning: Dataset {dataset_name} does not contain all required 5 factors and RF.")
+                # 不足しているカラムがあればログを出力するが、手元にあるデータだけでDataFrameは返す（後段でハンドリング）
+            
+            # パーセント表記（1.0 = 1%）と小数表記（0.01 = 1%）の自動判定と統一
             # データ全体の絶対値の平均が 0.05 (5%) を超えている場合は、パーセント表記とみなして100で割る
             if ff_data.abs().mean().mean() > 0.05:
                 ff_data = ff_data / 100.0
             
-            # インデックスを確実にDatetime化
-            ff_data.index = ff_data.index.to_timestamp()
+            # 💡修正ポイント: インデックスの厳密な正規化 (.to_period('M') への準備として)
+            # pandas_datareaderの返り値はPeriodIndexの場合とDatetimeIndexの場合がある
+            if isinstance(ff_data.index, pd.PeriodIndex):
+                ff_data.index = ff_data.index.to_timestamp()
+            else:
+                ff_data.index = pd.to_datetime(ff_data.index)
             
             # タイムゾーンの完全剥奪 (Tz-Naive)
             if ff_data.index.tz is not None: 
                 ff_data.index = ff_data.index.tz_localize(None)
-                
-            ff_data.columns = [c.strip() for c in ff_data.columns]
             
-            # 無リスク利子率（RF）の確実な分離と保証
-            if 'RF' not in ff_data.columns:
+            # 無リスク利子率（RF）の確実な分離と保証（万が一欠損していた場合）
+            if not any('RF' in c.upper() for c in ff_data.columns):
                 ff_data['RF'] = 0.0
             
             return ff_data
