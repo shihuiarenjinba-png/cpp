@@ -8,12 +8,12 @@ import numpy as np
 import pandas as pd
 from scipy import signal
 from scipy.stats import t
-import statsmodels.api as sm  # 💡 ローリング回帰用に追加
+import statsmodels.api as sm  
 import warnings
 
 # データ取得エンジン等のインポート
 from data_engine import DataFetcher
-from config import TRADING_DAYS_PER_YEAR, MarketConfig  # 💡 FFデータ動的取得用に追加
+from config import TRADING_DAYS_PER_YEAR, MarketConfig  
 
 # 📌 GARCHモデルによる動的ボラティリティ予測用
 try:
@@ -34,48 +34,61 @@ class DynamicFactorAnalyzer:
         過去36ヶ月の窓をスライドさせながら、超過収益率によるFF5回帰を繰り返す。
         因果的安定性（危機時にファクター関係が崩壊していないか、シンプソンのパラドックスが起きていないか）を検証する。
         """
-        if target_series.empty: return None
+        if target_series is None or target_series.empty: return None
         
         try:
             # ターゲットを対数リターンで月次化
             target_monthly = np.log(target_series.resample('ME').last() / target_series.resample('ME').last().shift(1)).dropna()
             
-            # データ期間が窓の長さ（例:36ヶ月）に満たない場合は計算不可
             if len(target_monthly) < window_months + 1: return None
             
             start_date = target_monthly.index[0].strftime('%Y-%m-%d')
             config = MarketConfig.get_config(region)
             ff_data = DataFetcher.fetch_fama_french_factors(start_date, dataset_name=config["ff_dataset"])
             
-            if ff_data.empty: return None
+            if ff_data is None or ff_data.empty: return None
             
-            # 月次粒度でのインデックス統一
-            target_monthly.index = target_monthly.index.to_period('M')
-            ff_data.index = ff_data.index.to_period('M')
+            # 💡 修正ポイント1: インデックスの型を明示的にDatetimeに変換してからPeriodにすることで、マージの空振りを防ぐ
+            target_monthly.index = pd.to_datetime(target_monthly.index).to_period('M')
+            ff_data.index = pd.to_datetime(ff_data.index).to_period('M')
             
             # Inner Mergeによる完全一致データの抽出
             combined = pd.merge(target_monthly.to_frame(name="Target"), ff_data, left_index=True, right_index=True, how='inner')
             
             if len(combined) < window_months + 1: return None
             
-            mkt = [c for c in combined.columns if 'Mkt' in c or 'MKT' in c][0]
-            smb = [c for c in combined.columns if 'SMB' in c][0]
-            hml = [c for c in combined.columns if 'HML' in c][0]
-            rmw = [c for c in combined.columns if 'RMW' in c][0] if any('RMW' in c for c in combined.columns) else None
-            cma = [c for c in combined.columns if 'CMA' in c][0] if any('CMA' in c for c in combined.columns) else None
-            rf  = [c for c in combined.columns if 'RF' in c][0]
+            # 💡 修正ポイント2: カラム取得を安全な関数に切り出し、[0]での IndexError (即死) を回避
+            def _get_col(search_terms):
+                cols = [c for c in combined.columns if any(term in c.upper() for term in search_terms)]
+                return cols[0] if cols else None
+
+            mkt = _get_col(['MKT'])
+            smb = _get_col(['SMB'])
+            hml = _get_col(['HML'])
+            rmw = _get_col(['RMW'])
+            cma = _get_col(['CMA'])
+            rf  = _get_col(['RF', 'RISKFREE'])
+
+            # 市場要因か無リスク利回りのカラムが見つからない場合は計算不可として安全に終了
+            if not mkt or not rf:
+                return None
 
             # 超過収益率（Y）と説明変数（X）の設定
             y = combined["Target"] - combined[rf]
-            factors = [mkt, smb, hml]
-            if rmw and cma: factors.extend([rmw, cma])
+            
+            # 存在するファクターのみを動的に追加（日本市場の3ファクター等にも対応）
+            factors = [mkt]
+            if smb: factors.append(smb)
+            if hml: factors.append(hml)
+            if rmw: factors.append(rmw)
+            if cma: factors.append(cma)
             
             X = combined[factors]
             X = sm.add_constant(X)
             
             rolling_results = []
             
-            # 💡【手動ローリングOLS】 各ウィンドウで厳密に Adjusted R2 と P値を算出し続ける
+            # 【手動ローリングOLS】 各ウィンドウで厳密に Adjusted R2 と P値を算出し続ける
             for i in range(window_months, len(combined) + 1):
                 y_win = y.iloc[i - window_months : i]
                 X_win = X.iloc[i - window_months : i]
@@ -85,8 +98,8 @@ class DynamicFactorAnalyzer:
                     row_data = {
                         "Date": combined.index[i - 1].to_timestamp(), # 窓の「最終月」を日付として記録
                         "Market_Beta": model.params.get(mkt, np.nan),
-                        "Size_Beta": model.params.get(smb, np.nan),
-                        "Value_Beta": model.params.get(hml, np.nan),
+                        "Size_Beta": model.params.get(smb, np.nan) if smb else np.nan,
+                        "Value_Beta": model.params.get(hml, np.nan) if hml else np.nan,
                         "Quality_Beta": model.params.get(rmw, np.nan) if rmw else np.nan,
                         "Invest_Beta": model.params.get(cma, np.nan) if cma else np.nan,
                         "Alpha": model.params.get("const", 0.0) * 12, # 年率化アルファ
@@ -117,7 +130,7 @@ class RegimeAnalyzer:
         """
         ウェルチ法（パワースペクトル密度）を用いて、市場のボラティリティ周期（レジーム）を検知する。
         """
-        if len(returns) < 252: return None
+        if returns is None or len(returns) < 252: return None
         
         # 20日ローリングボラティリティを算出し、その波の周期を解析
         rolling_vol = returns.rolling(window=20).std().dropna()
@@ -160,7 +173,7 @@ class HistoryTimeMachine:
         
         # 過去の生データを直接取得
         raw_data = DataFetcher.fetch_market_data(tickers, start_date=fetch_start)
-        if raw_data.empty: return None
+        if raw_data is None or raw_data.empty: return None
 
         # 日次リターンを計算
         daily_returns = raw_data.pct_change().dropna(how='all')
@@ -183,7 +196,7 @@ class HistoryTimeMachine:
         is_alive = crisis_returns.notna()
         active_weights = is_alive.multiply(w_series, axis=1)
         
-        # 生きている銘柄のウェイト合計を算出し、100%になるよう再正規化
+        # 💡 修正ポイント3: ウェイト合計が0になる日（全銘柄データなし）のゼロ除算を防ぐガード処理
         weight_sums = active_weights.sum(axis=1).replace(0, np.nan)
         normalized_active_weights = active_weights.div(weight_sums, axis=0)
         
@@ -215,7 +228,7 @@ class StochasticScenarioGenerator:
         """
         GARCH(1,1)とt分布を組み合わせたモンテカルロ・シミュレーション。
         """
-        if len(returns) < 30: return None
+        if returns is None or len(returns) < 30: return None
         
         mu_daily = returns.mean()
         
@@ -226,9 +239,9 @@ class StochasticScenarioGenerator:
         # 1. 現在のボラティリティ・レジームと分布の厚みをGARCHモデルから取得
         if HAS_ARCH and len(returns) > 252:
             try:
-                # GARCH(1,1)でボラティリティ・クラスタリングをモデル化
-                am = arch_model(returns * 100, vol='Garch', p=1, q=1, dist='t')
-                res = am.fit(disp='off')
+                # 💡 修正ポイント4: GARCHモデルの収束失敗（Iteration limit等）を防ぐため rescale=False 等の安全パラメータを追加
+                am = arch_model(returns * 100, vol='Garch', p=1, q=1, dist='t', rescale=False)
+                res = am.fit(disp='off', show_warning=False)
                 forecasts = res.forecast(horizon=1)
                 
                 # 直近の予測ボラティリティ
@@ -238,7 +251,9 @@ class StochasticScenarioGenerator:
                 if 'nu' in res.params:
                     df = res.params['nu']
             except Exception as e:
-                print(f"GARCH Error: {e}, falling back to standard std.")
+                # 収束しなかった場合は通常の標準偏差へ静かにフォールバック
+                print(f"GARCH fallback triggered: {e}")
+                pass
         
         # 自由度が2以下になると分散が無限大になるため、安全装置を設ける
         df = max(df, 2.1)
