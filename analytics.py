@@ -1,12 +1,13 @@
 """
 analytics.py
 ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
-【アップデート】対数リターンの採用、Inner Mergeによる完全同期、Ledoit-Wolf法の堅牢化を実装。
+【アップデート】超過収益率によるFF5回帰、Adjusted R-Squared、およびVIF（多重共線性）の算出を実装。
 """
 
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor  # 💡 VIF計算用に追加
 from scipy.stats import skew, kurtosis
 import warnings
 
@@ -75,7 +76,6 @@ class AdvancedStats:
     def calculate_metrics(returns, benchmark_returns=None, weights_dict=None, region="US"):
         """
         日次リターン系列から各種リスク指標を計算する。
-        💡【修正】対数リターンによる加法性の確保と、Inner Mergeによる日付の完全同期。
         """
         default_metrics = {
             "sharpe": 0.0, "sortino": 0.0, "calmar": 0.0, "omega": 0.0, "cvar_95": 0.0,
@@ -116,8 +116,7 @@ class AdvancedStats:
                         if isinstance(raw_comp, pd.Series):
                             raw_comp = raw_comp.to_frame(name=tickers[0])
                         
-                        # 💡【修正】各構成銘柄の対数リターン ln(P_t / P_t-1)
-                        # dropna()による全消去を防ぎ、存在しない期間は0（価格変動なし＝リスクゼロ）とする
+                        # 各構成銘柄の対数リターン ln(P_t / P_t-1)
                         comp_log_returns = np.log(raw_comp / raw_comp.shift(1)).fillna(0.0)
                         
                         valid_tickers = [t for t in tickers if t in comp_log_returns.columns]
@@ -126,7 +125,7 @@ class AdvancedStats:
                             new_weights = np.array([weights_dict[t] for t in valid_tickers])
                             new_weights = new_weights / np.sum(new_weights)
                             
-                            # 💡【修正】Shrinkage共分散行列の採用 (Ledoit-Wolf)
+                            # Shrinkage共分散行列の採用 (Ledoit-Wolf)
                             if HAS_SKLEARN and len(comp_log_returns) > 10:
                                 lw = LedoitWolf().fit(comp_log_returns)
                                 cov_matrix = lw.covariance_
@@ -186,7 +185,6 @@ class AdvancedStats:
                         benchmark_returns = bm_prices.pct_change().iloc[:, 0].dropna()
                         
                 if benchmark_returns is not None and not benchmark_returns.empty:
-                    # 💡【修正】OLS回帰前に対数リターン化
                     log_ret_df = log_returns.to_frame(name="Port")
                     log_bm_df = np.log1p(benchmark_returns.dropna()).to_frame(name="BM")
                     
@@ -195,7 +193,6 @@ class AdvancedStats:
                     log_ret_df.index = log_ret_df.index.normalize()
                     log_bm_df.index = log_bm_df.index.normalize()
                     
-                    # 💡【修正】明示的な pd.merge (how='inner') による100%完全同期
                     aligned = pd.merge(log_ret_df, log_bm_df, left_index=True, right_index=True, how='inner')
                     
                     if len(aligned) > 30:
@@ -239,12 +236,13 @@ class FactorAnalyzer:
     @staticmethod
     def analyze_style(target_series, region="US"):
         """
-        Fama-French 3ファクターモデルを用いた重回帰分析。
-        💡【修正】Inner Mergeを用いた厳密な同期と対数リターンの適用。
+        Fama-French 5ファクターモデルを用いた重回帰分析。
+        💡【アップデート】超過収益率による回帰、Adjusted R2の採用、VIFの算出。
         """
         fallback_result = {
             "beta_market": 1.0, "beta_size": 0.0, "beta_value": 0.0,
-            "alpha": 0.0, "r_squared": 0.0,
+            "beta_quality": 0.0, "beta_invest": 0.0,
+            "alpha": 0.0, "r_squared": 0.0, "vif": {},
             "p_value_market": 1.0, "p_value_size": 1.0, "p_value_value": 1.0,
             "region": region, "status": "insufficient_data"
         }
@@ -252,12 +250,13 @@ class FactorAnalyzer:
         if target_series.empty: return fallback_result
         
         try:
-            # 💡【修正】ターゲットを対数リターンで算出 ln(P_t / P_t-1)
+            # ターゲットを対数リターンで算出 ln(P_t / P_t-1)
             target_monthly = np.log(target_series.resample('ME').last() / target_series.resample('ME').last().shift(1)).dropna()
             if len(target_monthly) < 6: return fallback_result
             
             start_date = target_monthly.index[0].strftime('%Y-%m-%d')
             config = MarketConfig.get_config(region)
+            # data_engineから FF5 (Mkt-RF, SMB, HML, RMW, CMA, RF) を取得
             ff_data = DataFetcher.fetch_fama_french_factors(start_date, dataset_name=config["ff_dataset"])
             
             if ff_data.empty: return fallback_result
@@ -266,34 +265,61 @@ class FactorAnalyzer:
             target_monthly.index = target_monthly.index.to_period('M')
             ff_data.index = ff_data.index.to_period('M')
             
-            # 💡【修正】Inner Mergeによる完全一致データの抽出 (dropna()による事故防止)
+            # Inner Mergeによる完全一致データの抽出
             combined = pd.merge(target_monthly.to_frame(name="Target"), ff_data, left_index=True, right_index=True, how='inner')
             
             if len(combined) < 10: return fallback_result
             
+            # 各ファクターの列名を安全に抽出
             mkt = [c for c in combined.columns if 'Mkt' in c or 'MKT' in c][0]
             smb = [c for c in combined.columns if 'SMB' in c][0]
             hml = [c for c in combined.columns if 'HML' in c][0]
+            rmw = [c for c in combined.columns if 'RMW' in c][0] if any('RMW' in c for c in combined.columns) else None
+            cma = [c for c in combined.columns if 'CMA' in c][0] if any('CMA' in c for c in combined.columns) else None
             rf  = [c for c in combined.columns if 'RF' in c][0]
 
-            # 超過リターン
+            # 💡【修正】目的変数(Y)を「超過収益率（ポートフォリオリターン － 無リスク金利）」に設定
             y = combined["Target"] - combined[rf]
-            X = combined[[mkt, smb, hml]]
+            
+            # 説明変数(X)の構築 (FF5モデル対応)
+            factors = [mkt, smb, hml]
+            if rmw and cma:
+                factors.extend([rmw, cma])
+                
+            X = combined[factors]
             X = sm.add_constant(X)
             
+            # OLS（最小二乗法）による重回帰分析
             model = sm.OLS(y, X).fit()
             annualized_alpha = model.params.get("const", 0.0) * 12
             pvalues = model.pvalues
+            
+            # 💡【修正】多重共線性(VIF)の計算
+            vifs = {}
+            for i, col in enumerate(X.columns):
+                if col != "const": # 定数項のVIFは不要
+                    try:
+                        vif_val = variance_inflation_factor(X.values, i)
+                        vifs[col] = vif_val
+                    except:
+                        vifs[col] = np.nan
             
             return {
                 "beta_market": model.params.get(mkt, 1.0),
                 "beta_size": model.params.get(smb, 0.0),
                 "beta_value": model.params.get(hml, 0.0),
+                "beta_quality": model.params.get(rmw, 0.0) if rmw else 0.0,
+                "beta_invest": model.params.get(cma, 0.0) if cma else 0.0,
                 "alpha": annualized_alpha,
-                "r_squared": model.rsquared,
+                # 💡【修正】単なる rsquared ではなく、ペナルティを課した rsquared_adj（自由度調整済み）を採用
+                "r_squared": model.rsquared_adj,
+                "r_squared_raw": model.rsquared,
+                "vif": vifs,
                 "p_value_market": pvalues.get(mkt, 1.0),
                 "p_value_size": pvalues.get(smb, 1.0),
                 "p_value_value": pvalues.get(hml, 1.0),
+                "p_value_quality": pvalues.get(rmw, 1.0) if rmw else 1.0,
+                "p_value_invest": pvalues.get(cma, 1.0) if cma else 1.0,
                 "region": region,
                 "status": "success"
             }
@@ -305,6 +331,7 @@ class FactorAnalyzer:
     def get_factor_correlation(region="US", periods=60):
         """
         ファクター同士の相関行列計算。
+        💡【修正】FF5に対応し、無リスク金利(RF)を除外した純粋なファクター間相関を計算する。
         """
         try:
             config = MarketConfig.get_config(region)
@@ -313,11 +340,10 @@ class FactorAnalyzer:
             
             ff_recent = ff_data.tail(periods)
             
-            mkt = [c for c in ff_recent.columns if 'Mkt' in c or 'MKT' in c][0]
-            smb = [c for c in ff_recent.columns if 'SMB' in c][0]
-            hml = [c for c in ff_recent.columns if 'HML' in c][0]
+            # RF（無リスク金利）列を除外して相関を計算
+            factors_cols = [c for c in ff_recent.columns if c != 'RF']
+            factors_only = ff_recent[factors_cols]
             
-            factors_only = ff_recent[[mkt, smb, hml]]
             return factors_only.corr().to_dict()
         except Exception as e:
             print(f"Factor Correlation Fallback Triggered: {e}")
@@ -348,7 +374,7 @@ class AIPromptBuilder:
 【ポートフォリオの客観的データ】
 - 分析対象: {target_name}
 - リスクの支配者（最大リスク寄与銘柄）: {top_risk_asset} ({top_risk_value:.1f}%)
-- 市場との連動性 (R2): {r_squared:.1f}% (※この数値が高いほど、ただのインデックスファンドと同じ動きをしています)
+- 市場との連動性 (Adjusted R2): {r_squared:.1f}% (※この数値が高いほど、ただのインデックスファンドと同じ動きをしています)
 - 年率アルファ (超過収益): {alpha:.2f}%
 - ボラティリティ: {stats_data.get("volatility", 0) * 100:.1f}%
 - 最大ドローダウン: {stats_data.get("max_dd", 0) * 100:.1f}%
@@ -356,7 +382,7 @@ class AIPromptBuilder:
 【指示】
 1. 専門的なクオンツの視点から、厳しいが的確で愛のあるアドバイスをしてください。
 2. もし「リスクの支配者」が50%を超えている場合、「分散投資になっているつもりか？実質的に{top_risk_asset}と心中しているだけだぞ」と厳しく指摘してください。
-3. もしR2が90%を超えていて、かつアルファがマイナスまたはゼロ付近の場合は、「高い手数料（または手間）を払ってインデックス以下の成果を出す、典型的な『隠れインデックスファンド』だ」と警告してください。
+3. もしAdjusted R2が90%を超えていて、かつアルファがマイナスまたはゼロ付近の場合は、「高い手数料（または手間）を払ってインデックス以下の成果を出す、典型的な『隠れインデックスファンド』だ」と警告してください。
 4. 最後に、改善のための具体的なネクストアクションを1つ提示してください。
 5. 出力はMarkdown形式で、見出しを使って読みやすくしてください。ですます調で構いませんが、プロとしての威厳を保ってください。
 """
