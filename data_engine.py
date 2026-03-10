@@ -1,6 +1,7 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
+※ 修正版: タイムゾーン同期、生存銘柄による動的ウェイト再配分、カレンダーアライメントの徹底
 """
 
 import pandas as pd
@@ -75,7 +76,6 @@ class DataFetcher:
                     data = data[['Adj Close']]
             
             # 💡【修正2】1銘柄・複数銘柄の取得パターンの統一
-            # 1銘柄取得時などにデータがSeries（1列のリスト）に潰れた場合、表（DataFrame）に直す
             if isinstance(data, pd.Series):
                 data = data.to_frame()
                 
@@ -83,14 +83,16 @@ class DataFetcher:
             if len(data.columns) == 1 and len(tickers) == 1:
                 data.columns = [tickers[0]]
                 
-            # 列名を確実に文字列化（ここでタプルの混入を最終ブロック）
+            # 列名を確実に文字列化
             data.columns = [str(c).strip() for c in data.columns]
             
-            # タイムゾーンを削除してインデックスを「日付」のみに標準化（結合時のズレを防止）
-            if data.index.tz is not None: data.index = data.index.tz_localize(None)
+            # 💡【修正: タイムゾーンの完全剥奪 (Tz-Naive)】
+            # インデックスを「日付」のみに標準化し、結合時のズレを根絶する
+            if data.index.tz is not None: 
+                data.index = data.index.tz_localize(None)
             data.index = data.index.normalize()
 
-            # 前日値で埋めて歯抜けを防止（祝日等の不整合を吸収）
+            # 前日値で埋めて祝日等の不整合を吸収
             return data.ffill().dropna(how='all')
         except Exception as e:
             print(f"Fetch Error: {e}")
@@ -121,8 +123,8 @@ class DataFetcher:
     @staticmethod
     def create_synthetic_portfolio(ticker_weights, region="US"):
         """
-        各銘柄の生データを取得し、上場前期間を「ベンチマークリターン × ベータ値」で
-        バックフィルした上で、合成ポートフォリオの累積リターンを算出する。
+        各銘柄の生データを取得し、「生存銘柄のみ」による動的ウェイト再配分を行い、
+        正確な合成ポートフォリオの累積リターンを算出する。
         """
         ticker_weights = DataFetcher.normalize_weights(ticker_weights)
         tickers = list(ticker_weights.keys())
@@ -136,48 +138,50 @@ class DataFetcher:
         bm_ticker = config["benchmark_ticker"]
         bm_prices = DataFetcher.fetch_market_data([bm_ticker])
         
-        # 💡【修正3】合成計算前の安全化（列名の確実な文字列化と次元統一）
+        # 合成計算前の安全化（列名の確実な文字列化と次元統一）
         if isinstance(raw_prices, pd.Series):
             raw_prices = raw_prices.to_frame(name=tickers[0])
         if isinstance(bm_prices, pd.Series):
             bm_prices = bm_prices.to_frame(name=bm_ticker)
 
+        # リターンの算出
         returns = raw_prices.pct_change()
         bm_returns = bm_prices.pct_change().iloc[:, 0].rename("Benchmark")
         
-        # 銘柄とベンチマークの日付を完全に結合（ズレを吸収）
-        master_index = returns.index.union(bm_returns.index).sort_values()
-        aligned_data = pd.DataFrame(index=master_index)
-        aligned_data = aligned_data.join(returns).join(bm_returns)
-        aligned_data = aligned_data.dropna(subset=["Benchmark"])
+        # 💡【修正: カレンダー・アライメント】
+        # ベンチマークの営業日カレンダーにポートフォリオ側を強制適合させる
+        aligned_returns = returns.reindex(bm_returns.index)
         
-        for ticker in tickers:
-            ticker_str = str(ticker).strip()
-            
-            # その時代に全く上場していなかった場合（完全欠損）のフォールバック
-            if ticker_str not in aligned_data.columns or aligned_data[ticker_str].isna().all():
-                aligned_data[ticker_str] = aligned_data["Benchmark"] 
-                continue
-            
-            # 有効な重複期間からベータ値の算出
-            valid_mask = aligned_data[ticker_str].notna() & aligned_data["Benchmark"].notna()
-            if valid_mask.sum() > 30:
-                cov = np.cov(aligned_data.loc[valid_mask, ticker_str], aligned_data.loc[valid_mask, "Benchmark"])
-                beta = cov[0, 1] / cov[1, 1] if cov[1, 1] != 0 else 1.0
-            else:
-                beta = 1.0
-            
-            # 上場前の空白期間を「ベンチマークリターン * ベータ」でバックフィル生成
-            missing_mask = aligned_data[ticker_str].isna()
-            aligned_data.loc[missing_mask, ticker_str] = aligned_data.loc[missing_mask, "Benchmark"] * beta
+        # 💡【修正: 「生存銘柄のみ」による動的重み再配分 (Survivor Weighting)】
+        # 銘柄ごとの初期ウェイトをSeries化
+        w_series = pd.Series(ticker_weights) / 100.0
         
-        # ウェイトに基づく加重平均リターンの算出
-        weighted_returns = pd.Series(0, index=aligned_data.index)
-        for ticker, weight in ticker_weights.items():
-            ticker_str = str(ticker).strip()
-            # 最後の細かい休場のズレは 0 (変動なし) として処理
-            weighted_returns += aligned_data[ticker_str].fillna(0) * (weight / 100.0)
-                
+        # 生存フラグ（NaNでない＝その日上場しており価格が存在するならTrue）
+        is_alive = aligned_returns.notna()
+        
+        # その日に存在する銘柄にのみウェイトを割り当てる
+        active_weights = is_alive.multiply(w_series, axis=1)
+        
+        # その日の「生きている銘柄のウェイト合計」を算出
+        weight_sums = active_weights.sum(axis=1)
+        
+        # ゼロ割り防止（全銘柄が存在しない日はNaNにする）
+        weight_sums = weight_sums.replace(0, np.nan)
+        
+        # ウェイトの再正規化（生存している銘柄だけで合計が必ず100%になるように割り直す）
+        normalized_weights = active_weights.div(weight_sums, axis=0)
+        
+        # ポートフォリオのリターン = Σ(各銘柄リターン * 再正規化ウェイト)
+        weighted_returns = (aligned_returns.fillna(0) * normalized_weights.fillna(0)).sum(axis=1)
+        
+        # 有効な銘柄が1つもない日はNaNに戻す
+        weighted_returns.loc[weight_sums.isna()] = np.nan
+        
+        # ポートフォリオが成立する期間のみに絞る（先頭のNaNを削除）
+        weighted_returns = weighted_returns.dropna()
+        
+        if weighted_returns.empty: return None
+
         # 100をベースとした累積リターン(価格推移)を返す
         return (1 + weighted_returns).cumprod() * 100
 
@@ -194,7 +198,11 @@ class DataFetcher:
             # 日米で異なるインデックス構造を安全に日付型へ変換（％表示を実数に変換）
             ff_data = ff_dict[0] / 100.0
             ff_data.index = ff_data.index.to_timestamp()
-            if ff_data.index.tz is not None: ff_data.index = ff_data.index.tz_localize(None)
+            
+            # 💡【修正: タイムゾーンの完全剥奪 (Tz-Naive)】
+            if ff_data.index.tz is not None: 
+                ff_data.index = ff_data.index.tz_localize(None)
+                
             ff_data.columns = [c.strip() for c in ff_data.columns]
             
             return ff_data
