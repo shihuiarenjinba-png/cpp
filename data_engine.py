@@ -5,6 +5,7 @@ data_engine.py
 ※ 修正版(v2): FF5ファクターへの拡張、無リスク利子率(RF)の厳密分離
 ※ 修正版(v3): Inner Joinによる日付完全同期の徹底（ノイズデータの排除）
 ※ 修正版(v4): 2x3の排除、純粋な5ファクター（RF込み）の取得と厳格なインデックス正規化
+※ 修正版(v5): スケールの完全統一（100割り）と結合後のデータ行数監査を追加
 """
 
 import pandas as pd
@@ -151,8 +152,18 @@ class DataFetcher:
         returns = raw_prices.pct_change(fill_method=None)
         bm_returns = bm_prices.pct_change(fill_method=None).iloc[:, 0].rename("Benchmark")
         
+        # 💡修正ポイント: 結合前に日付フォーマット(YYYY-MM-DD)を強制的に揃える
+        returns.index = pd.to_datetime(returns.index).normalize().tz_localize(None)
+        bm_returns.index = pd.to_datetime(bm_returns.index).normalize().tz_localize(None)
+        
         # 日付同期（インデックス・アライメント）の強化
         aligned_df = pd.merge(returns, bm_returns, left_index=True, right_index=True, how='inner')
+        
+        # 💡修正ポイント: 結合後にデータがごっそり消えていないか監査
+        if len(aligned_df) < 20:
+            st.error(f"⚠️ データ結合後の有効日数が {len(aligned_df)} 日しかありません。期間設定やティッカーの地域設定が合っているか確認してください。")
+            return None
+
         aligned_returns = aligned_df[tickers]
         
         # 「生存銘柄のみ」による動的重み再配分 (Survivor Weighting)
@@ -181,7 +192,6 @@ class DataFetcher:
         """
         Fama-Frenchの純粋な5ファクターデータ（Mkt-RF, SMB, HML, RMW, CMA）と
         無リスク金利（RF）をKenneth Frenchのライブラリから取得する。
-        💡修正ポイント: 2x3のポートフォリオデータを排除し、純粋な5ファクターを確実に取得。
         """
         try:
             # 5ファクターデータセットの取得を試行
@@ -193,7 +203,7 @@ class DataFetcher:
             # データ辞書の最初の要素（通常は日次または月次ファクター）を取得
             ff_data = ff_dict[0]
             
-            # 💡修正ポイント: カラムの確実な抽出と正規化
+            # カラムの確実な抽出と正規化
             ff_data.columns = [c.strip() for c in ff_data.columns]
             
             # 必要なカラムが含まれているか確認 (Mkt-RF or Mkt, SMB, HML, RMW, CMA, RF)
@@ -203,21 +213,21 @@ class DataFetcher:
             
             if not has_mkt or not all(any(req in c.upper() for c in ff_data.columns) for req in required_cols):
                 print(f"Warning: Dataset {dataset_name} does not contain all required 5 factors and RF.")
-                # 不足しているカラムがあればログを出力するが、手元にあるデータだけでDataFrameは返す（後段でハンドリング）
             
-            # パーセント表記（1.0 = 1%）と小数表記（0.01 = 1%）の自動判定と統一
-            # データ全体の絶対値の平均が 0.05 (5%) を超えている場合は、パーセント表記とみなして100で割る
-            if ff_data.abs().mean().mean() > 0.05:
+            # 💡修正ポイント: スケール統一の厳格化
+            # Ken Frenchのデータは原則パーセント（1.0 = 1%）。
+            # yfinanceのpct_change()は小数（0.01 = 1%）なので、確実に100で割る。
+            if ff_data.abs().max().max() > 1.0 or ff_data.abs().mean().mean() > 0.05:
                 ff_data = ff_data / 100.0
             
-            # 💡修正ポイント: インデックスの厳密な正規化 (.to_period('M') への準備として)
-            # pandas_datareaderの返り値はPeriodIndexの場合とDatetimeIndexの場合がある
+            # 💡修正ポイント: インデックスの厳密な正規化 (.to_period('M') への準備として YYYY-MM-DD へ固定)
             if isinstance(ff_data.index, pd.PeriodIndex):
                 ff_data.index = ff_data.index.to_timestamp()
             else:
                 ff_data.index = pd.to_datetime(ff_data.index)
             
-            # タイムゾーンの完全剥奪 (Tz-Naive)
+            # タイムゾーンの完全剥奪と時刻リセット
+            ff_data.index = ff_data.index.normalize()
             if ff_data.index.tz is not None: 
                 ff_data.index = ff_data.index.tz_localize(None)
             
