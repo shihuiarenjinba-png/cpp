@@ -1,7 +1,7 @@
 """
-app.py
+app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v5): 地域(US/JP)の動的切り替えと、超過リターンベースのAlpha/Betaの正確なUI表示に対応
+※ 修正版(v6): チャートのマルチプロット化と地域・銘柄バリデーションの追加
 """
 
 import streamlit as st
@@ -98,21 +98,40 @@ class AuditEngine:
         """ローリング回帰による動的エクスポージャーの推移を可視化（シンプソンのパラドックス検証用）"""
         if rolling_df is None or rolling_df.empty: return
         
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                            vertical_spacing=0.1, subplot_titles=("Factor Betas (36-Month Rolling)", "Adjusted R-Squared (%)"))
+        # 💡修正ポイント: チャートのマルチプロット化（サブプロットで縦に分割）
+        factors = ["Market_Beta", "Size_Beta", "Value_Beta", "Quality_Beta", "Invest_Beta"]
+        valid_factors = [col for col in factors if col in rolling_df.columns and not rolling_df[col].isna().all()]
+        has_r2 = "Adjusted_R2" in rolling_df.columns
         
-        # Betas (超過リターンベース)
-        for col in ["Market_Beta", "Size_Beta", "Value_Beta", "Quality_Beta", "Invest_Beta"]:
-            if col in rolling_df.columns and not rolling_df[col].isna().all():
-                fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df[col], name=col, mode='lines'), row=1, col=1)
-                
-        fig.add_hline(y=0, line_dash="dash", line_color="black", row=1, col=1)
+        n_rows = len(valid_factors) + (1 if has_r2 else 0)
+        if n_rows == 0: return
         
-        # Adjusted R2
-        if "Adjusted_R2" in rolling_df.columns:
-            fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df["Adjusted_R2"], name="Adj R2", line=dict(color='purple')), row=2, col=1)
+        titles = valid_factors + (["Adjusted R-Squared (%)"] if has_r2 else [])
         
-        fig.update_layout(height=500, title_text="Dynamic Factor Exposure (Regime Stability Check)", margin=dict(l=20, r=20, t=50, b=20))
+        fig = make_subplots(
+            rows=n_rows, cols=1, 
+            shared_xaxes=True, 
+            vertical_spacing=0.04, 
+            subplot_titles=titles
+        )
+        
+        row_idx = 1
+        # Betas (超過リターンベース) をそれぞれ独立したグラフに
+        for col in valid_factors:
+            fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df[col], name=col, mode='lines'), row=row_idx, col=1)
+            fig.add_hline(y=0, line_dash="dash", line_color="black", row=row_idx, col=1)
+            row_idx += 1
+            
+        # Adjusted R2 を一番下に
+        if has_r2:
+            fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df["Adjusted_R2"], name="Adj R2", line=dict(color='purple')), row=row_idx, col=1)
+        
+        fig.update_layout(
+            height=150 * n_rows, # グラフの数に応じて高さを動的に調整
+            title_text="Dynamic Factor Exposure (Regime Stability Check)", 
+            margin=dict(l=20, r=20, t=50, b=20),
+            showlegend=False # プロット毎にタイトルがあるため凡例は非表示でスッキリさせる
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     @staticmethod
@@ -190,7 +209,6 @@ def main():
     ai_api_key = st.sidebar.text_input("API Key (現在プレースホルダー)", type="password", help="ここにOpenAI等のAPIキーを入れると本物のAIが動くようになります")
     st.sidebar.divider()
     
-    # 💡修正ポイント: 地域(Region)の選択。ここで選択された内容が以降のすべての計算ロジックに波及する。
     region = st.sidebar.selectbox("Market Region", ["US", "Japan"], help="対象市場を選択してください。バックエンドの参照ファイルや無リスク金利が切り替わります。")
     config = MarketConfig.get_config(region)
     st.sidebar.caption(f"📌 **設定情報:**\n- データセット: `{config['ff_dataset']}`\n- ベンチマーク: `{config['benchmark_ticker']}`")
@@ -223,7 +241,6 @@ def main():
             st.sidebar.error(f"CSV読み込みエラー: {e}")
 
     st.sidebar.markdown("**✏️ 2. 銘柄とウェイト調整（直接編集可能）**")
-    # 💡修正ポイント: ログの警告(use_container_width deprecated)に対応し width="stretch" を使用
     edited_df = st.sidebar.data_editor(
         st.session_state.portfolio_data, 
         num_rows="dynamic",
@@ -238,11 +255,25 @@ def main():
             weights_dict[ticker] = float(row["Weight"])
 
     # --- 実行ボタン ---
-    # 💡修正ポイント: ボタンも同様に警告対応
     if st.sidebar.button("Run Advanced Analysis", type="primary", use_container_width=True):
         if not weights_dict:
             st.error("有効なティッカーとウェイトを入力してください。")
             return
+            
+        # 💡修正ポイント: 入力バリデーション（地域設定と銘柄の矛盾チェック）
+        mismatch = False
+        for ticker in weights_dict.keys():
+            # 日本市場設定なのに .T がない、または米国市場設定なのに .T がある場合
+            if region == "Japan" and not ticker.endswith('.T'):
+                mismatch = True
+                break
+            elif region == "US" and ticker.endswith('.T'):
+                mismatch = True
+                break
+                
+        if mismatch:
+            # HTMLを用いて赤字で警告メッセージを表示
+            st.markdown("<p style='color:red; font-weight:bold; font-size:1.1em;'>⚠️ 地域設定と銘柄が一致していないため、R2 が低くなる可能性があります</p>", unsafe_allow_html=True)
             
         with st.spinner(f"Initializing Quantitative Engine ({region} Market) & Fetching Data..."):
             
@@ -386,7 +417,6 @@ def main():
                     
                     f_col1, f_col2, f_col3, f_col4 = st.columns(4)
                     
-                    # 💡修正ポイント: 超過リターンであることをUI上で明示
                     mkt_beta = style.get('beta_market', 1.0)
                     f_col1.metric("Market-RF (市場超過ベータ)", f"{mkt_beta:.2f}", delta="ハイリスク" if mkt_beta > 1.2 else ("ローリスク" if mkt_beta < 0.8 else ""), delta_color="inverse")
                     
