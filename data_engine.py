@@ -1,11 +1,7 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
-※ 修正版: タイムゾーン同期、生存銘柄による動的ウェイト再配分、カレンダーアライメントの徹底
-※ 修正版(v2): FF5ファクターへの拡張、無リスク利子率(RF)の厳密分離
-※ 修正版(v3): Inner Joinによる日付完全同期の徹底（ノイズデータの排除）
-※ 修正版(v4): 2x3の排除、純粋な5ファクター（RF込み）の取得と厳格なインデックス正規化
-※ 修正版(v5): スケールの完全統一（100割り）と結合後のデータ行数監査を追加
+※ 修正版(v6): リバランス・ロジックの導入（ドリフトの再現とTEの正確な計測）
 """
 
 import pandas as pd
@@ -66,7 +62,6 @@ class DataFetcher:
             if data.empty: return pd.DataFrame()
             
             # データ構造の確実なクレンジング（不要な階層の削ぎ落とし）
-            # MultiIndex（複数階層）で返ってきた場合、純粋なティッカー名だけを残す
             if isinstance(data.columns, pd.MultiIndex):
                 if 'Close' in data.columns.get_level_values(0):
                     data = data['Close']
@@ -125,10 +120,11 @@ class DataFetcher:
         return valid_data, invalid_tickers
 
     @staticmethod
-    def create_synthetic_portfolio(ticker_weights, region="US"):
+    def create_synthetic_portfolio(ticker_weights, region="US", rebalance_freq="M"):
         """
         各銘柄の生データを取得し、「生存銘柄のみ」による動的ウェイト再配分を行い、
         正確な合成ポートフォリオの累積リターンを算出する。
+        💡【修正】rebalance_freq ("M"=月次, "Y"=年次, "D"=日次, None=放置) を追加。
         """
         ticker_weights = DataFetcher.normalize_weights(ticker_weights)
         tickers = list(ticker_weights.keys())
@@ -152,35 +148,81 @@ class DataFetcher:
         returns = raw_prices.pct_change(fill_method=None)
         bm_returns = bm_prices.pct_change(fill_method=None).iloc[:, 0].rename("Benchmark")
         
-        # 💡修正ポイント: 結合前に日付フォーマット(YYYY-MM-DD)を強制的に揃える
+        # 結合前に日付フォーマット(YYYY-MM-DD)を強制的に揃える
         returns.index = pd.to_datetime(returns.index).normalize().tz_localize(None)
         bm_returns.index = pd.to_datetime(bm_returns.index).normalize().tz_localize(None)
         
         # 日付同期（インデックス・アライメント）の強化
         aligned_df = pd.merge(returns, bm_returns, left_index=True, right_index=True, how='inner')
         
-        # 💡修正ポイント: 結合後にデータがごっそり消えていないか監査
+        # 結合後にデータがごっそり消えていないか監査
         if len(aligned_df) < 20:
             st.error(f"⚠️ データ結合後の有効日数が {len(aligned_df)} 日しかありません。期間設定やティッカーの地域設定が合っているか確認してください。")
             return None
 
         aligned_returns = aligned_df[tickers]
         
-        # 「生存銘柄のみ」による動的重み再配分 (Survivor Weighting)
+        # --- 💡【修正】ここからリバランス・ドリフト計算ロジック ---
         w_series = pd.Series(ticker_weights) / 100.0
         is_alive = aligned_returns.notna()
-        active_weights = is_alive.multiply(w_series, axis=1)
-        weight_sums = active_weights.sum(axis=1)
+        clean_returns = aligned_returns.fillna(0)
+
+        if rebalance_freq == "D":
+            # 毎日リバランス（従来のドリフトなしロジック）
+            active_weights = is_alive.multiply(w_series, axis=1)
+            weight_sums = active_weights.sum(axis=1).replace(0, np.nan)
+            normalized_weights = active_weights.div(weight_sums, axis=0)
+            weighted_returns = (clean_returns * normalized_weights.fillna(0)).sum(axis=1)
+            weighted_returns.loc[weight_sums.isna()] = np.nan
+        else:
+            # ドリフト（放置）を考慮するロジック (定期リバランス or Buy & Hold)
+            rebalance_mask = pd.Series(False, index=aligned_returns.index)
+            rebalance_mask.iloc[0] = True  # 運用初日は必ず設定
+
+            # 定期リバランス日のマーキング
+            if rebalance_freq == "M":
+                period_ends = aligned_returns.resample('ME').last().index
+                rebalance_mask.loc[aligned_returns.index.intersection(period_ends)] = True
+            elif rebalance_freq == "Y":
+                period_ends = aligned_returns.resample('YE').last().index
+                rebalance_mask.loc[aligned_returns.index.intersection(period_ends)] = True
+            
+            # 生存銘柄の増減があった日も強制再配分（Survivor Weightingの維持）
+            alive_changed = is_alive.astype(int).diff().fillna(0).abs().sum(axis=1) > 0
+            rebalance_mask = rebalance_mask | alive_changed
+
+            # 期間ごとのID（リバランスのたびにインクリメント）
+            period_ids = rebalance_mask.cumsum()
+
+            # 期間ごとの累積乗数 (Drift) を計算
+            gross_returns = 1 + clean_returns
+            drift_multipliers = gross_returns.groupby(period_ids).cumprod()
+
+            # 期首のターゲットウェイト（その時点で生存している銘柄のみで100%になるよう再正規化）
+            target_weights = is_alive.multiply(w_series, axis=1)
+            target_weights = target_weights.div(target_weights.sum(axis=1).replace(0, np.nan), axis=0)
+
+            # 各日における「その期間の期首ウェイト」を前方に埋める(ffill)
+            period_start_weights = target_weights.where(rebalance_mask).ffill()
+
+            # ドリフト計算：各日の「開始時点」でのウェイトを出すため、前日の累積乗数を使用
+            prev_drift = drift_multipliers.shift(1)
+            prev_drift[rebalance_mask] = 1.0  # リバランス日はドリフトをリセット
+            prev_drift.iloc[0] = 1.0
+
+            # 価格変動で崩れた後の未正規化ウェイト
+            unnormalized_w = period_start_weights * prev_drift
+
+            # ドリフト後の正規化ウェイト（現実のポートフォリオ内の保有比率）
+            actual_weights = unnormalized_w.div(unnormalized_w.sum(axis=1), axis=0)
+
+            # ポートフォリオの日次リターン = Σ( 当日リターン * 当日開始時点のドリフト後ウェイト )
+            weighted_returns = (clean_returns * actual_weights.fillna(0)).sum(axis=1)
+            
+            # 全滅している日はNaNにする
+            weighted_returns.loc[is_alive.sum(axis=1) == 0] = np.nan
         
-        # ゼロ割り防止（全銘柄が存在しない日はNaNにする）
-        weight_sums = weight_sums.replace(0, np.nan)
-        normalized_weights = active_weights.div(weight_sums, axis=0)
-        
-        # ポートフォリオのリターン = Σ(各銘柄リターン * 再正規化ウェイト)
-        weighted_returns = (aligned_returns.fillna(0) * normalized_weights.fillna(0)).sum(axis=1)
-        weighted_returns.loc[weight_sums.isna()] = np.nan
         weighted_returns = weighted_returns.dropna()
-        
         if weighted_returns.empty: return None
 
         # 100をベースとした累積リターン(価格推移)を返す
@@ -214,13 +256,13 @@ class DataFetcher:
             if not has_mkt or not all(any(req in c.upper() for c in ff_data.columns) for req in required_cols):
                 print(f"Warning: Dataset {dataset_name} does not contain all required 5 factors and RF.")
             
-            # 💡修正ポイント: スケール統一の厳格化
+            # スケール統一の厳格化
             # Ken Frenchのデータは原則パーセント（1.0 = 1%）。
             # yfinanceのpct_change()は小数（0.01 = 1%）なので、確実に100で割る。
             if ff_data.abs().max().max() > 1.0 or ff_data.abs().mean().mean() > 0.05:
                 ff_data = ff_data / 100.0
             
-            # 💡修正ポイント: インデックスの厳密な正規化 (.to_period('M') への準備として YYYY-MM-DD へ固定)
+            # インデックスの厳密な正規化 (.to_period('M') への準備として YYYY-MM-DD へ固定)
             if isinstance(ff_data.index, pd.PeriodIndex):
                 ff_data.index = ff_data.index.to_timestamp()
             else:
