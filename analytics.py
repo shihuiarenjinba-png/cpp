@@ -1,7 +1,7 @@
 """
 analytics.py
 ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
-※修正版(v5): 'Mkt-RF'の誤検知バグ修正、完全一致による厳密なRF控除、欠損値排除によるAlpha（定数項）保護
+※修正版(v6): ページ間の重複(max_dd)を削除、Tracking Error(TE)を新設、IR計算の整合性向上。
 """
 
 import pandas as pd
@@ -77,9 +77,10 @@ class AdvancedStats:
         """
         日次リターン系列から各種リスク指標を計算する。
         """
+        # 💡【修正】"max_dd" を削除し、"tracking_error" を追加
         default_metrics = {
             "sharpe": 0.0, "sortino": 0.0, "calmar": 0.0, "omega": 0.0, "cvar_95": 0.0,
-            "ulcer_index": 0.0, "kelly_criterion": 0.0, "max_dd": 0.0, "info_ratio": 0.0,
+            "ulcer_index": 0.0, "kelly_criterion": 0.0, "tracking_error": 0.0, "info_ratio": 0.0,
             "skewness": 0.0, "kurtosis": 0.0, "hhi_index": 0.0, "effective_n": 1.0,
             "risk_penalty_ratio": 1.0, "volatility": 0.0, "raw_volatility": 0.0,
             "systematic_risk": 0.0, "idiosyncratic_risk": 0.0, "portfolio_beta": 1.0,
@@ -147,10 +148,11 @@ class AdvancedStats:
             arithmetic_mu = log_returns.mean() * TRADING_DAYS_PER_YEAR
             mu = arithmetic_mu - 0.5 * (sigma ** 2) 
             
+            # 💡【修正】max_ddは出力しないが、他指標の計算用に内部変数として保持
             cumulative = (1 + returns).cumprod()
             peak = cumulative.cummax()
             drawdown = (cumulative - peak) / peak
-            max_dd = drawdown.min()
+            current_max_dd = drawdown.min()
             
             ulcer_sq = (drawdown ** 2).mean()
             ulcer_index = np.sqrt(ulcer_sq)
@@ -162,7 +164,7 @@ class AdvancedStats:
             downside_dev = downside_returns.std() * ann_factor * penalty if not downside_returns.empty else 0
             sortino = (mu - risk_free_rate) / downside_dev if downside_dev > 0 else 0
             
-            calmar = mu / abs(max_dd) if max_dd != 0 else 0
+            calmar = mu / abs(current_max_dd) if current_max_dd != 0 else 0
             
             gains = returns[returns > 0].sum()
             losses = abs(returns[returns < 0].sum())
@@ -172,8 +174,10 @@ class AdvancedStats:
             cvar_95 = log_returns[log_returns <= var_95].mean() * penalty if len(log_returns[log_returns <= var_95]) > 0 else 0
             
             kelly = mu / (sigma ** 2) if sigma > 0 else 0
-            info_ratio = 0.0
             
+            # 💡【修正】TEの初期化
+            info_ratio = 0.0
+            tracking_error = 0.0
             systematic_risk, idiosyncratic_risk, portfolio_beta = 0.0, 0.0, 1.0
             
             try:
@@ -204,18 +208,21 @@ class AdvancedStats:
                             systematic_risk = np.sqrt(sys_var) * ann_factor
                             idiosyncratic_risk = np.sqrt(idio_var) * ann_factor
                             
+                            # 💡【修正】トラッキングエラーとインフォメーション・レシオの算出
                             active_ret = aligned["Port"] - aligned["BM"]
-                            track_err = active_ret.std() * ann_factor
-                            if track_err > 0:
-                                info_ratio = (active_ret.mean() * TRADING_DAYS_PER_YEAR) / track_err
+                            tracking_error = active_ret.std() * ann_factor
+                            if tracking_error > 0:
+                                info_ratio = (active_ret.mean() * TRADING_DAYS_PER_YEAR) / tracking_error
             except Exception as e:
                 print(f"Risk Separation Fallback: {e}")
 
             clean_returns = log_returns.dropna()
+            
+            # 💡【修正】戻り値から "max_dd" を外し、"tracking_error" を追加
             return {
                 "sharpe": sharpe, "sortino": sortino, "calmar": calmar,
                 "omega": omega, "cvar_95": cvar_95, "ulcer_index": ulcer_index,
-                "kelly_criterion": kelly, "max_dd": max_dd, "info_ratio": info_ratio,
+                "kelly_criterion": kelly, "tracking_error": tracking_error, "info_ratio": info_ratio,
                 "skewness": skew(clean_returns) if len(clean_returns) > 3 else 0, 
                 "kurtosis": kurtosis(clean_returns) if len(clean_returns) > 3 else 0,
                 "hhi_index": hhi, "effective_n": enc, "risk_penalty_ratio": penalty,
@@ -265,12 +272,10 @@ class FactorAnalyzer:
             
             combined = pd.merge(target_monthly.to_frame(name="Target"), ff_monthly, left_index=True, right_index=True, how='inner')
             
-            # 💡【修正】ここでNaNを含む行を事前に完全に削除し、sm.add_constant()が失敗するのを防ぐ
             combined = combined.dropna()
 
             if len(combined) < 10: return fallback_result
             
-            # 💡【修正】部分一致による誤検知（'Mkt-RF'を'RF'として取得してしまうバグ）を防止するための完全一致検索
             cols_upper = {c: c.strip().upper() for c in combined.columns}
             
             mkt = next((c for c, up in cols_upper.items() if up in ['MKT-RF', 'MKT_RF', 'MKT - RF']), None)
@@ -280,31 +285,22 @@ class FactorAnalyzer:
             cma = next((c for c, up in cols_upper.items() if up == 'CMA'), None)
             rf  = next((c for c, up in cols_upper.items() if up == 'RF'), None)
 
-            # 5変数 + RF が揃っているか確認
             if not all([mkt, smb, hml, rmw, cma, rf]):
                 print(f"Alert: FF5 Variables are missing. Found: {combined.columns.tolist()}")
                 fallback_result["status"] = "missing_factors"
                 return fallback_result
 
-            # 💡【修正】目的変数(Y)を「超過収益率（ポートフォリオリターン － 無リスク金利）」に設定
-            # これで初めて正しい RF が引かれるようになります
             y = combined["Target"] - combined[rf]
-            
-            # 説明変数(X)の構築 (純粋な5ファクターで固定)
             X = combined[[mkt, smb, hml, rmw, cma]]
-            
-            # 💡【修正】定数項（Alpha）の追加。事前の .dropna() のおかげで確実に付与されます
             X = sm.add_constant(X)
             
-            # OLS（最小二乗法）による重回帰分析
             model = sm.OLS(y, X).fit()
             annualized_alpha = model.params.get("const", 0.0) * 12
             pvalues = model.pvalues
             
-            # 多重共線性(VIF)の計算
             vifs = {}
             for i, col in enumerate(X.columns):
-                if col != "const": # 定数項のVIFは不要
+                if col != "const":
                     try:
                         vif_val = variance_inflation_factor(X.values, i)
                         vifs[col] = vif_val
@@ -318,7 +314,6 @@ class FactorAnalyzer:
                 "beta_quality": model.params.get(rmw, 0.0),
                 "beta_invest": model.params.get(cma, 0.0),
                 "alpha": annualized_alpha,
-                # 自由度調整済み決定係数（本来の80%〜95%の正常な値が出るようになります）
                 "r_squared": model.rsquared_adj,
                 "r_squared_raw": model.rsquared,
                 "vif": vifs,
@@ -336,9 +331,6 @@ class FactorAnalyzer:
 
     @staticmethod
     def get_factor_correlation(region="US", periods=60):
-        """
-        ファクター同士の相関行列計算。
-        """
         try:
             config = MarketConfig.get_config(region)
             ff_data = DataFetcher.fetch_fama_french_factors("2000-01-01", dataset_name=config["ff_dataset"])
@@ -347,7 +339,6 @@ class FactorAnalyzer:
             ff_monthly = ff_data.resample('ME').apply(lambda x: (1 + x).prod() - 1)
             ff_recent = ff_monthly.tail(periods)
             
-            # 💡【修正】ここでも誤検知を防ぐため、完全一致でRFを除外する
             factors_cols = [c for c in ff_recent.columns if c.strip().upper() != 'RF']
             factors_only = ff_recent[factors_cols]
             
@@ -373,7 +364,11 @@ class AIPromptBuilder:
 
         r_squared = factor_data.get("r_squared", 0) * 100 if factor_data else 0.0
         alpha = factor_data.get("alpha", 0) * 100 if factor_data else 0.0
+        
+        # 💡【修正】max_dd を外し、TE を取得
+        te = stats_data.get("tracking_error", 0) * 100
 
+        # 💡【修正】プロンプト内容をTEベースに刷新
         prompt = f"""
 あなたはウォール街で長年活躍する、非常に優秀だが少し辛口なクオンツ・ポートフォリオマネージャーです。
 以下の計算結果データに基づいて、個人投資家向けに「プロの小言（診断レポート）」を作成してください。
@@ -382,15 +377,16 @@ class AIPromptBuilder:
 - 分析対象: {target_name}
 - リスクの支配者（最大リスク寄与銘柄）: {top_risk_asset} ({top_risk_value:.1f}%)
 - 市場との連動性 (Adjusted R2): {r_squared:.1f}% (※この数値が高いほど、ただのインデックスファンドと同じ動きをしています)
+- 年率トラッキングエラー (TE): {te:.2f}% (※これが低いほど市場のコピー、高いほど独自路線です)
 - 年率アルファ (超過収益): {alpha:.2f}%
 - ボラティリティ: {stats_data.get("volatility", 0) * 100:.1f}%
-- 最大ドローダウン: {stats_data.get("max_dd", 0) * 100:.1f}%
 
 【指示】
 1. 専門的なクオンツの視点から、厳しいが的確で愛のあるアドバイスをしてください。
 2. もし「リスクの支配者」が50%を超えている場合、「分散投資になっているつもりか？実質的に{top_risk_asset}と心中しているだけだぞ」と厳しく指摘してください。
-3. もしAdjusted R2が90%を超えていて、かつアルファがマイナスまたはゼロ付近の場合は、「高い手数料（または手間）を払ってインデックス以下の成果を出す、典型的な『隠れインデックスファンド』だ」と警告してください。
-4. 最後に、改善のための具体的なネクストアクションを1つ提示してください。
-5. 出力はMarkdown形式で、見出しを使って読みやすくしてください。ですます調で構いませんが、プロとしての威厳を保ってください。
+3. トラッキングエラー(TE)が非常に低い(例: 2%未満)のにアルファがマイナスまたはゼロ付近の場合は、「高い手数料（または手間）を払ってインデックス以下の成果を出す、典型的な『隠れインデックスファンド』だ」と警告してください。
+4. TEが高い(例: 10%超)場合は、その独自リスクに見合うだけのアルファ（リターン）が出ているかを厳しく評価してください。
+5. 最後に、改善のための具体的なネクストアクションを1つ提示してください。
+6. 出力はMarkdown形式で、見出しを使って読みやすくしてください。ですます調で構いませんが、プロとしての威厳を保ってください。
 """
         return prompt
