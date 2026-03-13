@@ -1,7 +1,7 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
-※ 修正版(v6): リバランス・ロジックの導入（ドリフトの再現とTEの正確な計測）
+※ 修正版(v8): yfinanceのRate Limit対策（リトライ・指数バックオフ）と特殊ティッカー(BRK-B等)の完全対応
 """
 
 import pandas as pd
@@ -10,6 +10,7 @@ import yfinance as yf
 import pandas_datareader.data as web
 import warnings
 import streamlit as st
+import time  # 💡 リトライ待機用に新規追加
 
 # 先ほど作成したconfigからMarketConfigを読み込む
 from config import MarketConfig
@@ -27,15 +28,21 @@ class DataFetcher:
     def normalize_weights(weights_dict):
         """
         ティッカー名の正規化と、ウェイトの自動リスケール（合計100%化）を行う。
-        例: 'BRK-B' -> 'BRK.B' (Yahoo Finance形式)
+        💡 修正: 一律のドット変換を廃止し、yfinance特有の記法(BRK-Bなど)を保護する。
         """
         if not weights_dict: return {}
         normalized = {}
         total = 0.0
         
         for k, v in weights_dict.items():
-            # Yahoo Finance形式への正規化 (ハイフンをドットに変換)
-            new_k = str(k).strip().upper().replace('-', '.') 
+            new_k = str(k).strip().upper()
+            
+            # yfinanceではクラス株をハイフンで繋ぐのが正解 (BRK.B -> BRK-B)
+            if new_k == "BRK.B" or new_k == "BRK_B":
+                new_k = "BRK-B"
+            elif new_k == "BF.B" or new_k == "BF_B":
+                new_k = "BF-B"
+                
             normalized[new_k] = float(v)
             total += float(v)
         
@@ -48,54 +55,64 @@ class DataFetcher:
 
     @staticmethod
     @st.cache_data(ttl=3600)  # 1時間のキャッシュ化で通信API制限を大幅削減
-    def fetch_market_data(tickers, start_date="2000-01-01"):
+    def fetch_market_data(tickers, start_date="2000-01-01", max_retries=3):
         """
         指定されたティッカーのヒストリカルデータを取得し、クレンジングする。
+        💡 修正: Rate Limit対策として、指数バックオフを伴うリトライロジックを追加。
         """
         if not tickers: return pd.DataFrame()
-        try:
-            if isinstance(tickers, str): tickers = [tickers]
-            
-            # threads=False でマルチスレッドを無効化しAPI制限(Rate Limit)を回避
-            data = yf.download(tickers, start=start_date, progress=False, auto_adjust=True, threads=False)
-            
-            if data.empty: return pd.DataFrame()
-            
-            # データ構造の確実なクレンジング（不要な階層の削ぎ落とし）
-            if isinstance(data.columns, pd.MultiIndex):
-                if 'Close' in data.columns.get_level_values(0):
-                    data = data['Close']
-                elif 'Adj Close' in data.columns.get_level_values(0):
-                    data = data['Adj Close']
-            else:
-                # 古い形式の場合の対応
-                if 'Close' in data.columns:
-                    data = data[['Close']]
-                elif 'Adj Close' in data.columns:
-                    data = data[['Adj Close']]
-            
-            # 1銘柄・複数銘柄の取得パターンの統一
-            if isinstance(data, pd.Series):
-                data = data.to_frame()
+        if isinstance(tickers, str): tickers = [tickers]
+        
+        for attempt in range(max_retries):
+            try:
+                # threads=False でマルチスレッドを無効化しAPI制限(Rate Limit)を回避
+                data = yf.download(tickers, start=start_date, progress=False, auto_adjust=True, threads=False)
                 
-            # 列名が 'Close' 等の一般名詞になってしまっている場合は、ティッカー名に強制上書き
-            if len(data.columns) == 1 and len(tickers) == 1:
-                data.columns = [tickers[0]]
+                # 取得データが空の場合は一時的なブロックの可能性があるのでリトライへ
+                if data.empty:
+                    time.sleep(2 ** attempt)
+                    continue
                 
-            # 列名を確実に文字列化
-            data.columns = [str(c).strip() for c in data.columns]
-            
-            # タイムゾーンの完全剥奪 (Tz-Naive)
-            # インデックスを「日付」のみに標準化し、結合時のズレを根絶する
-            if data.index.tz is not None: 
-                data.index = data.index.tz_localize(None)
-            data.index = data.index.normalize()
+                # データ構造の確実なクレンジング（不要な階層の削ぎ落とし）
+                if isinstance(data.columns, pd.MultiIndex):
+                    if 'Close' in data.columns.get_level_values(0):
+                        data = data['Close']
+                    elif 'Adj Close' in data.columns.get_level_values(0):
+                        data = data['Adj Close']
+                else:
+                    # 古い形式の場合の対応
+                    if 'Close' in data.columns:
+                        data = data[['Close']]
+                    elif 'Adj Close' in data.columns:
+                        data = data[['Adj Close']]
+                
+                # 1銘柄・複数銘柄の取得パターンの統一
+                if isinstance(data, pd.Series):
+                    data = data.to_frame()
+                    
+                # 列名が 'Close' 等の一般名詞になってしまっている場合は、ティッカー名に強制上書き
+                if len(data.columns) == 1 and len(tickers) == 1:
+                    data.columns = [tickers[0]]
+                    
+                # 列名を確実に文字列化
+                data.columns = [str(c).strip() for c in data.columns]
+                
+                # タイムゾーンの完全剥奪 (Tz-Naive)
+                # インデックスを「日付」のみに標準化し、結合時のズレを根絶する
+                if data.index.tz is not None: 
+                    data.index = data.index.tz_localize(None)
+                data.index = data.index.normalize()
 
-            # ffillに制限(limit=5)を設け、上場廃止・取引停止銘柄が「永遠に同じ価格で生き残る」ことを防ぐ
-            return data.ffill(limit=5).dropna(how='all')
-        except Exception as e:
-            print(f"Fetch Error: {e}")
-            return pd.DataFrame()
+                # ffillに制限(limit=5)を設け、上場廃止・取引停止銘柄が「永遠に同じ価格で生き残る」ことを防ぐ
+                return data.ffill(limit=5).dropna(how='all')
+                
+            except Exception as e:
+                # エラー発生時は待機して再試行 (例: 1秒 -> 2秒 -> 4秒)
+                print(f"Fetch Error for {tickers} on attempt {attempt+1}: {e}")
+                time.sleep(2 ** attempt)
+                
+        # 全リトライ失敗時は空のDataFrameを返す
+        return pd.DataFrame()
 
     @staticmethod
     def validate_tickers(input_dict):
@@ -124,7 +141,6 @@ class DataFetcher:
         """
         各銘柄の生データを取得し、「生存銘柄のみ」による動的ウェイト再配分を行い、
         正確な合成ポートフォリオの累積リターンを算出する。
-        💡【修正】rebalance_freq ("M"=月次, "Y"=年次, "D"=日次, None=放置) を追加。
         """
         ticker_weights = DataFetcher.normalize_weights(ticker_weights)
         tickers = list(ticker_weights.keys())
@@ -162,7 +178,7 @@ class DataFetcher:
 
         aligned_returns = aligned_df[tickers]
         
-        # --- 💡【修正】ここからリバランス・ドリフト計算ロジック ---
+        # --- リバランス・ドリフト計算ロジック ---
         w_series = pd.Series(ticker_weights) / 100.0
         is_alive = aligned_returns.notna()
         clean_returns = aligned_returns.fillna(0)
