@@ -1,7 +1,8 @@
 """
 simulation.py
 GARCHモデル、t分布を用いたモンテカルロ・シミュレーション、および過去の危機のタイムマシンテストを行うモジュール
-【アップデート】過去危機のSurvivor Weighting（動的再配分）、GARCH最尤法（MLE）、およびローリング回帰（動的エクスポージャー）を実装。
+【アップデート】過去危機のSurvivor Weighting（動的再配分）、GARCH最尤法（MLE）、ローリング回帰（動的エクスポージャー）、
+および トラッキングエラー（TE）を反映した確率的シナリオ生成を実装。
 """
 
 import numpy as np
@@ -224,9 +225,10 @@ class HistoryTimeMachine:
 # =========================================================
 class StochasticScenarioGenerator:
     @staticmethod
-    def generate_paths(returns, n_scenarios=10000, n_days=252):
+    def generate_paths(returns, n_scenarios=10000, n_days=252, tracking_error_annual=0.0):
         """
         GARCH(1,1)とt分布を組み合わせたモンテカルロ・シミュレーション。
+        ポートフォリオ固有のトラッキングエラー（TE）を分散に加味する。
         """
         if returns is None or len(returns) < 30: return None
         
@@ -255,19 +257,24 @@ class StochasticScenarioGenerator:
                 print(f"GARCH fallback triggered: {e}")
                 pass
         
+        # 💡 追加実装: トラッキングエラー（アクティブリスク）を分散に加算
+        # TE(年率)を日次化し、市場ボラティリティと合成 (σ_total^2 = σ_market^2 + σ_TE^2)
+        te_daily = tracking_error_annual / np.sqrt(TRADING_DAYS_PER_YEAR)
+        adjusted_vol = np.sqrt(current_vol**2 + te_daily**2)
+        
         # 自由度が2以下になると分散が無限大になるため、安全装置を設ける
         df = max(df, 2.1)
         
         # 2. t分布による乱数生成（ファットテールの考慮）
-        # t分布の分散は df/(df-2) になるため、標準偏差に合わせるようスケーリング
-        scale_factor = np.sqrt((df - 2) / df) * current_vol
+        # t分布の分散は df/(df-2) になるため、合成された標準偏差(adjusted_vol)に合わせるようスケーリング
+        scale_factor = np.sqrt((df - 2) / df) * adjusted_vol
         
         # Z_t ~ t(df)
         random_shocks = t.rvs(df, loc=0, scale=scale_factor, size=(n_days, n_scenarios))
         
         # 3. シナリオパスの生成 (ベクトル化演算で高速化)
         # S_t = S_{t-1} * exp((mu - sigma^2/2) + shock)
-        drift = mu_daily - (0.5 * current_vol**2)
+        drift = mu_daily - (0.5 * adjusted_vol**2)
         daily_log_returns = drift + random_shocks
         
         # 累積リターンを計算 (初期値 1.0 = 100%)
@@ -284,12 +291,19 @@ class StochasticScenarioGenerator:
 # =========================================================
 class ProjectionCore:
     @staticmethod
-    def run_projection(returns, n_scenarios=10000, n_years=1):
+    def run_projection(returns, n_scenarios=10000, n_years=1, tracking_error_annual=0.0):
         """
-        シナリオジェネレータを呼び出し、最終的なパーセンタイル値などを算出する。
+        シナリオジェネレータを呼び出し、TEを加味した上で最終的なパーセンタイル値などを算出する。
         """
         n_days = int(n_years * TRADING_DAYS_PER_YEAR)
-        paths = StochasticScenarioGenerator.generate_paths(returns, n_scenarios=n_scenarios, n_days=n_days)
+        
+        # TEパラメータをジェネレータに渡す
+        paths = StochasticScenarioGenerator.generate_paths(
+            returns, 
+            n_scenarios=n_scenarios, 
+            n_days=n_days,
+            tracking_error_annual=tracking_error_annual
+        )
         
         if paths is None: return None
         
