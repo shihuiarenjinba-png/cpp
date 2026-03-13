@@ -1,7 +1,7 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v6): チャートのマルチプロット化と地域・銘柄バリデーションの追加
+※ 修正版(v7): 引数の明示的指定（エラー解消）、データ欠損ガード、およびリバランスUIの追加。
 """
 
 import streamlit as st
@@ -45,6 +45,9 @@ class AuditEngine:
     @staticmethod
     def plot_rolling_correlation(port_returns, bm_returns, window=60):
         """市場との連動性（ローリング相関）の推移を可視化"""
+        if port_returns.empty or bm_returns.empty:
+            return
+            
         aligned = pd.concat([port_returns.rename("Portfolio"), bm_returns], axis=1).dropna()
         if len(aligned) < window:
             st.info(f"💡 ローリング相関を描画するための期間データ（{window}日分）が不足していますが、全体の分析には影響しません。")
@@ -95,10 +98,9 @@ class AuditEngine:
 
     @staticmethod
     def plot_rolling_exposure(rolling_df):
-        """ローリング回帰による動的エクスポージャーの推移を可視化（シンプソンのパラドックス検証用）"""
+        """ローリング回帰による動的エクスポージャーの推移を可視化"""
         if rolling_df is None or rolling_df.empty: return
         
-        # 💡修正ポイント: チャートのマルチプロット化（サブプロットで縦に分割）
         factors = ["Market_Beta", "Size_Beta", "Value_Beta", "Quality_Beta", "Invest_Beta"]
         valid_factors = [col for col in factors if col in rolling_df.columns and not rolling_df[col].isna().all()]
         has_r2 = "Adjusted_R2" in rolling_df.columns
@@ -116,21 +118,19 @@ class AuditEngine:
         )
         
         row_idx = 1
-        # Betas (超過リターンベース) をそれぞれ独立したグラフに
         for col in valid_factors:
             fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df[col], name=col, mode='lines'), row=row_idx, col=1)
             fig.add_hline(y=0, line_dash="dash", line_color="black", row=row_idx, col=1)
             row_idx += 1
             
-        # Adjusted R2 を一番下に
         if has_r2:
             fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df["Adjusted_R2"], name="Adj R2", line=dict(color='purple')), row=row_idx, col=1)
         
         fig.update_layout(
-            height=150 * n_rows, # グラフの数に応じて高さを動的に調整
+            height=150 * n_rows, 
             title_text="Dynamic Factor Exposure (Regime Stability Check)", 
             margin=dict(l=20, r=20, t=50, b=20),
-            showlegend=False # プロット毎にタイトルがあるため凡例は非表示でスッキリさせる
+            showlegend=False
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -211,6 +211,12 @@ def main():
     
     region = st.sidebar.selectbox("Market Region", ["US", "Japan"], help="対象市場を選択してください。バックエンドの参照ファイルや無リスク金利が切り替わります。")
     config = MarketConfig.get_config(region)
+    
+    # 💡 修正ポイント: リバランス設定のUI追加
+    rebalance_options = {"Monthly (月次)": "M", "Annually (年次)": "Y", "Daily (日次)": "D", "Buy & Hold (放置)": None}
+    rebalance_choice = st.sidebar.selectbox("Rebalance Frequency", list(rebalance_options.keys()), help="ポートフォリオの比率を元に戻す頻度。放置すると強い銘柄の比率が勝手に増えます(ドリフト)。")
+    rebalance_freq = rebalance_options[rebalance_choice]
+
     st.sidebar.caption(f"📌 **設定情報:**\n- データセット: `{config['ff_dataset']}`\n- ベンチマーク: `{config['benchmark_ticker']}`")
     
     st.sidebar.markdown("**📤 1. ポートフォリオ一括読込 (オプション)**")
@@ -260,20 +266,16 @@ def main():
             st.error("有効なティッカーとウェイトを入力してください。")
             return
             
-        # 💡修正ポイント: 入力バリデーション（地域設定と銘柄の矛盾チェック）
+        # 💡 入力バリデーション（地域設定と銘柄の矛盾チェック）
         mismatch = False
         for ticker in weights_dict.keys():
-            # 日本市場設定なのに .T がない、または米国市場設定なのに .T がある場合
             if region == "Japan" and not ticker.endswith('.T'):
-                mismatch = True
-                break
+                mismatch = True; break
             elif region == "US" and ticker.endswith('.T'):
-                mismatch = True
-                break
+                mismatch = True; break
                 
         if mismatch:
-            # HTMLを用いて赤字で警告メッセージを表示
-            st.markdown("<p style='color:red; font-weight:bold; font-size:1.1em;'>⚠️ 地域設定と銘柄が一致していないため、R2 が低くなる可能性があります</p>", unsafe_allow_html=True)
+            st.markdown("<p style='color:red; font-weight:bold; font-size:1.1em;'>⚠️ 地域設定と銘柄が一致していないため、データ取得や分析に失敗する可能性があります。</p>", unsafe_allow_html=True)
             
         with st.spinner(f"Initializing Quantitative Engine ({region} Market) & Fetching Data..."):
             
@@ -284,24 +286,30 @@ def main():
             raw_input_data = DataFetcher.fetch_market_data(list(norm_weights.keys()))
             valid_ticker_count = len(raw_input_data.columns) if not raw_input_data.empty else 0
             
-            synthetic_portfolio = DataFetcher.create_synthetic_portfolio(norm_weights, region=region)
+            # リバランス頻度を渡して合成ポートフォリオを作成
+            synthetic_portfolio = DataFetcher.create_synthetic_portfolio(norm_weights, region=region, rebalance_freq=rebalance_freq)
             
             if synthetic_portfolio is None or synthetic_portfolio.empty:
-                st.error("データの構築に失敗しました。ティッカー記号（特に日本株の場合は .T の付与など）や期間を確認してください。")
+                st.error("データの構築に失敗しました。ティッカー記号や期間、通信制限(Rate Limit)を確認してください。")
                 return
             
             if valid_ticker_count == input_ticker_count:
-                st.success(f"✅ **データ網羅性:** 入力された全 {input_ticker_count} 銘柄のデータを取得し、シミュレーションに適用しました。")
+                st.success(f"✅ **データ網羅性:** 入力された全 {input_ticker_count} 銘柄のデータを取得しました。")
             else:
                 st.warning(f"⚠️ **データ網羅性:** 入力された {input_ticker_count} 銘柄中、**{valid_ticker_count} 銘柄** のみが計算に適用されました。")
 
             returns = synthetic_portfolio.pct_change().dropna()
             
+            # 💡 修正ポイント: ベンチマーク取得時のエラーガード
             bm_prices = DataFetcher.fetch_market_data([config["benchmark_ticker"]])
-            bm_returns = bm_prices.pct_change().iloc[:, 0].rename("Benchmark")
+            if not bm_prices.empty:
+                bm_returns = bm_prices.pct_change().iloc[:, 0].rename("Benchmark")
+            else:
+                st.warning("⚠️ ベンチマークデータの取得に失敗しました（API制限等）。市場比較やTEの計算はスキップされます。")
+                bm_returns = pd.Series(dtype=float)
 
-            # 2. 解析 (regionを渡して超過リターン等を含めて厳密に計算)
-            metrics = AdvancedStats.calculate_metrics(returns, weights_dict=norm_weights, region=region)
+            # 2. 解析 
+            metrics = AdvancedStats.calculate_metrics(returns, benchmark_returns=bm_returns if not bm_returns.empty else None, weights_dict=norm_weights, region=region)
             style = FactorAnalyzer.analyze_style(synthetic_portfolio, region=region)
             cycle_days = RegimeAnalyzer.detect_cycle(returns)
             rolling_exposure_df = DynamicFactorAnalyzer.calculate_rolling_exposure(synthetic_portfolio, region=region)
@@ -313,7 +321,13 @@ def main():
                 res = HistoryTimeMachine.replay_crisis(norm_weights, crisis, region)
                 if res: crisis_results[crisis] = res
                 
-            projection = ProjectionCore.run_projection(returns, bm_returns, n_scenarios=10000, n_years=1)
+            # 💡 修正ポイント: 引数をキーワード指定（名前付き）にし、順番ミスマッチエラーを根絶。
+            projection = ProjectionCore.run_projection(
+                returns=returns, 
+                bm_returns=bm_returns if not bm_returns.empty else None, 
+                n_scenarios=10000, 
+                n_years=1
+            )
 
             # ==========================================
             # 🗂️ 描画レイヤー (4つのタブ構成)
@@ -339,8 +353,6 @@ def main():
                     > **【AI診断ダミー表示】**
                     > あなたのポートフォリオを拝見しました。分散投資をしているつもりかもしれませんが、
                     > リスクの大半が特定の1銘柄に集中しており、実質的にその銘柄と心中している状態です。
-                    > また、市場との連動性（Adjusted R-Squared）が非常に高く、高い手数料を払ってインデックスファンドと
-                    > 同じ動きをしている「隠れインデックス」の兆候が見られます。
                     > **[ネクストアクション]** 早急に最大リスク寄与銘柄のウェイトを下げ、他セクターへの分散を図りなさい。
                     """)
                 
@@ -348,29 +360,46 @@ def main():
                     st.text(ai_prompt)
                     
                 st.divider()
+                
+                # 💡 1ページ目には全体のドローダウンを直接計算して表示（健全性チェックの一本化）
+                peak = synthetic_portfolio.cummax()
+                calc_dd = ((synthetic_portfolio - peak) / peak).min() * 100
+                
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Expected Annual Return", f"{returns.mean() * 252 * 100:.2f}%")
-                col2.metric("Portfolio Volatility (Shrunk)", f"{metrics.get('volatility', 0) * 100:.2f}%")
+                col2.metric("Portfolio Volatility", f"{metrics.get('volatility', 0) * 100:.2f}%")
                 col3.metric("Sharpe Ratio", f"{metrics.get('sharpe', 0):.2f}")
-                col4.metric("Max Drawdown", f"{metrics.get('max_dd', 0) * 100:.2f}%")
+                col4.metric("Max Drawdown", f"{calc_dd:.2f}%") 
                 
                 st.subheader("Historical Cumulative Growth")
-                aligned_growth = pd.concat([synthetic_portfolio.rename("Portfolio"), (1+bm_returns).cumprod()*100], axis=1).dropna()
-                st.line_chart(aligned_growth)
+                if not bm_returns.empty:
+                    aligned_growth = pd.concat([synthetic_portfolio.rename("Portfolio"), (1+bm_returns).cumprod()*100], axis=1).dropna()
+                    st.line_chart(aligned_growth)
+                else:
+                    st.line_chart(synthetic_portfolio)
+                    
                 AuditEngine.plot_underwater_drawdown(synthetic_portfolio)
 
             # --- タブ2: リスクと連動性 ---
             with tab2:
-                st.header("2. Risk Diversification & Stress Tests")
-                c_col1, c_col2 = st.columns(2)
+                st.header("2. Risk Diversification & Tracking")
                 
+                # 💡 新設: トラッキングエラーとIRの表示
+                te_col1, te_col2, _ = st.columns(3)
+                te_col1.metric("Tracking Error (対市場乖離リスク)", f"{metrics.get('tracking_error', 0) * 100:.2f}%", help="この数値が高いほど、市場平均から外れた独自の値動きをしています。")
+                te_col2.metric("Information Ratio (情報レシオ)", f"{metrics.get('info_ratio', 0):.2f}", help="取った乖離リスク(TE)に対して、どれだけ超過リターンを稼げたかを示す「アクティブ運用のコスパ」です。")
+                
+                st.divider()
+                
+                c_col1, c_col2 = st.columns(2)
                 with c_col1:
                     st.subheader(f"Factor Correlation Matrix ({region})")
                     AuditEngine.plot_factor_correlation(region=region)
                     
                 with c_col2:
                     st.subheader("Market Correlation (Rolling 60-Day)")
-                    AuditEngine.plot_rolling_correlation(returns, bm_returns)
+                    if not bm_returns.empty:
+                        AuditEngine.plot_rolling_correlation(returns, bm_returns)
                 
                 st.divider()
                 st.subheader("History Time Machine (Crash Recovery Paths)")
