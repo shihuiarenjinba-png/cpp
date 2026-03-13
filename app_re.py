@@ -313,7 +313,7 @@ def main():
                 res = HistoryTimeMachine.replay_crisis(norm_weights, crisis, region)
                 if res: crisis_results[crisis] = res
                 
-            projection = ProjectionCore.run_projection(returns, n_scenarios=10000, n_years=1)
+            projection = ProjectionCore.run_projection(returns, bm_returns, n_scenarios=10000, n_years=1)
 
             # ==========================================
             # 🗂️ 描画レイヤー (4つのタブ構成)
