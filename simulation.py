@@ -291,12 +291,24 @@ class StochasticScenarioGenerator:
 # =========================================================
 class ProjectionCore:
     @staticmethod
-    def run_projection(returns, n_scenarios=10000, n_years=1, tracking_error_annual=0.0):
+    def run_projection(returns, bm_returns=None, n_scenarios=10000, n_years=1):
         """
         シナリオジェネレータを呼び出し、TEを加味した上で最終的なパーセンタイル値などを算出する。
+        💡 エラー解消：app_re.pyからの引数順序(returns, bm_returns, n_scenarios, n_years)に合わせ、
+           かつ bm_returns を受け取るように修正しました。
         """
         n_days = int(n_years * TRADING_DAYS_PER_YEAR)
-        
+        tracking_error_annual = 0.0
+
+        # 💡 TEの自動計算ロジック
+        if bm_returns is not None:
+            # ポートフォリオとベンチマークの日付を同期して差分を計算
+            aligned = pd.concat([returns.rename("Port"), bm_returns.rename("BM")], axis=1).dropna()
+            if len(aligned) > 30:
+                active_ret = aligned["Port"] - aligned["BM"]
+                # 標準偏差を年率換算してTEとする
+                tracking_error_annual = active_ret.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+
         # TEパラメータをジェネレータに渡す
         paths = StochasticScenarioGenerator.generate_paths(
             returns, 
