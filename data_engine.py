@@ -1,7 +1,7 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
-※ 修正版(v8): yfinanceのRate Limit対策（リトライ・指数バックオフ）と特殊ティッカー(BRK-B等)の完全対応、データアライメント強化
+※ 修正版(v9): 予測モデル連携に向けた、インデックス（日付・タイムゾーン）の厳密な同期と欠損値処理の強化
 """
 
 import pandas as pd
@@ -10,7 +10,7 @@ import yfinance as yf
 import pandas_datareader.data as web
 import warnings
 import streamlit as st
-import time  # 💡 リトライ待機用に新規追加
+import time  # リトライ待機用に新規追加
 
 # 先ほど作成したconfigからMarketConfigを読み込む
 from config import MarketConfig
@@ -28,7 +28,7 @@ class DataFetcher:
     def normalize_weights(weights_dict):
         """
         ティッカー名の正規化と、ウェイトの自動リスケール（合計100%化）を行う。
-        💡 修正: 一律のドット変換を廃止し、yfinance特有の記法(BRK-Bなど)を保護する。
+        一律のドット変換を廃止し、yfinance特有の記法(BRK-Bなど)を保護する。
         """
         if not weights_dict: return {}
         normalized = {}
@@ -58,7 +58,7 @@ class DataFetcher:
     def fetch_market_data(tickers, start_date="2000-01-01", max_retries=3):
         """
         指定されたティッカーのヒストリカルデータを取得し、クレンジングする。
-        💡 修正: Rate Limit対策として、指数バックオフを伴うリトライロジックを追加。
+        Rate Limit対策として、指数バックオフを伴うリトライロジックを追加。
         """
         if not tickers: return pd.DataFrame()
         if isinstance(tickers, str): tickers = [tickers]
@@ -97,11 +97,10 @@ class DataFetcher:
                 # 列名を確実に文字列化
                 data.columns = [str(c).strip() for c in data.columns]
                 
-                # タイムゾーンの完全剥奪 (Tz-Naive)
-                # インデックスを「日付」のみに標準化し、結合時のズレを根絶する
+                # 💡【重要】タイムゾーンの完全剥奪と日付の正規化
                 if data.index.tz is not None: 
                     data.index = data.index.tz_localize(None)
-                data.index = data.index.normalize()
+                data.index = pd.to_datetime(data.index).normalize()
 
                 # ffillに制限(limit=5)を設け、上場廃止・取引停止銘柄が「永遠に同じ価格で生き残る」ことを防ぐ
                 return data.ffill(limit=5).dropna(how='all')
@@ -164,7 +163,7 @@ class DataFetcher:
         returns = raw_prices.pct_change(fill_method=None)
         bm_returns = bm_prices.pct_change(fill_method=None).iloc[:, 0].rename("Benchmark")
         
-        # 💡 修正ポイント: 結合前に日付フォーマット(YYYY-MM-DD)とタイムゾーン(None)を強制的に揃える（データアライメント強化）
+        # 💡【重要】結合前に日付フォーマット(YYYY-MM-DD)とタイムゾーン(None)を強制的に揃える
         if returns.index.tz is not None:
             returns.index = returns.index.tz_localize(None)
         returns.index = pd.to_datetime(returns.index).normalize()
@@ -173,7 +172,7 @@ class DataFetcher:
             bm_returns.index = bm_returns.index.tz_localize(None)
         bm_returns.index = pd.to_datetime(bm_returns.index).normalize()
         
-        # 日付同期（インデックス・アライメント）の強化: TE計算のズレをなくすため inner結合
+        # 日付同期（インデックス・アライメント）の強化: TE計算や予測モデル連携のズレをなくすため inner結合
         aligned_df = pd.merge(returns, bm_returns, left_index=True, right_index=True, how='inner')
         
         # 結合後にデータがごっそり消えていないか監査
@@ -186,6 +185,7 @@ class DataFetcher:
         # --- リバランス・ドリフト計算ロジック ---
         w_series = pd.Series(ticker_weights) / 100.0
         is_alive = aligned_returns.notna()
+        # 💡 エラーハンドリング: 計算途中の欠損は0リターンとして扱い、グラフの不自然な切断を防ぐ
         clean_returns = aligned_returns.fillna(0)
 
         if rebalance_freq == "D":
@@ -283,14 +283,14 @@ class DataFetcher:
             if ff_data.abs().max().max() > 1.0 or ff_data.abs().mean().mean() > 0.05:
                 ff_data = ff_data / 100.0
             
-            # インデックスの厳密な正規化 (.to_period('M') への準備として YYYY-MM-DD へ固定)
+            # 💡【重要】インデックスの厳密な正規化 (予測モデルとの完全同期のため)
             if isinstance(ff_data.index, pd.PeriodIndex):
                 ff_data.index = ff_data.index.to_timestamp()
             else:
                 ff_data.index = pd.to_datetime(ff_data.index)
             
             # タイムゾーンの完全剥奪と時刻リセット
-            ff_data.index = ff_data.index.normalize()
+            ff_data.index = pd.to_datetime(ff_data.index).normalize()
             if ff_data.index.tz is not None: 
                 ff_data.index = ff_data.index.tz_localize(None)
             
@@ -298,7 +298,8 @@ class DataFetcher:
             if not any('RF' in c.upper() for c in ff_data.columns):
                 ff_data['RF'] = 0.0
             
-            return ff_data
+            # 💡 エラーハンドリング: ファクターデータの欠損を直前の値で埋める
+            return ff_data.ffill()
         except Exception as e:
             # エラー時は何が失敗したのかログに残す
             print(f"FF Data Error for dataset '{dataset_name}': {e}")
