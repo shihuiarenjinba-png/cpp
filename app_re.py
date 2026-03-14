@@ -1,7 +1,7 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v7): 引数の明示的指定（エラー解消）、データ欠損ガード、およびリバランスUIの追加。
+※ 修正版(v8): 第2タブのTE専用化、アクティブリターングラフ追加、目標TE比較、及びデータ欠損ガードの徹底。
 """
 
 import streamlit as st
@@ -24,11 +24,37 @@ from simulation import RegimeAnalyzer, HistoryTimeMachine, ProjectionCore, Dynam
 class AuditEngine:
     
     @staticmethod
+    def plot_active_return(port_returns, bm_returns):
+        """💡 新設: アクティブ・リターン（ベンチマークとの乖離）の推移を可視化"""
+        if port_returns.empty or bm_returns.empty:
+            st.info("💡 データ不足のため表示できません（ベンチマークデータがありません）。")
+            return
+            
+        aligned = pd.concat([port_returns.rename("Portfolio"), bm_returns.rename("Benchmark")], axis=1).dropna()
+        if len(aligned) < 2:
+            st.info("💡 期間データが不足しているため表示できません。")
+            return
+            
+        # アクティブ・リターンの計算（ポートフォリオ - ベンチマーク）
+        active_returns = aligned["Portfolio"] - aligned["Benchmark"]
+        cum_active_returns = active_returns.cumsum() * 100  # パーセント表記
+        
+        fig = px.area(
+            x=cum_active_returns.index, y=cum_active_returns.values,
+            labels={'x': 'Date', 'y': 'Cumulative Active Return (%)'},
+            title="Cumulative Active Return Spread (vs Benchmark)",
+            color_discrete_sequence=["#17becf"]
+        )
+        fig.add_hline(y=0, line_dash="dash", line_color="red", annotation_text="Benchmark Level")
+        fig.update_layout(height=350, margin=dict(l=20, r=20, t=50, b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+    @staticmethod
     def plot_factor_correlation(region="US"):
         """ファクター同士の相関関係をヒートマップで可視化"""
         factor_corr = FactorAnalyzer.get_factor_correlation(region=region)
         if not factor_corr:
-            st.info("💡 ファクター相関データが取得できませんでした（データ期間が短い、またはAPI制限の可能性があります）。")
+            st.info("💡 データ不足のため表示できません（ファクター相関データが取得できませんでした）。")
             return
             
         corr_df = pd.DataFrame(factor_corr)
@@ -46,11 +72,12 @@ class AuditEngine:
     def plot_rolling_correlation(port_returns, bm_returns, window=60):
         """市場との連動性（ローリング相関）の推移を可視化"""
         if port_returns.empty or bm_returns.empty:
+            st.info("💡 データ不足のため表示できません（ベンチマークデータがありません）。")
             return
             
         aligned = pd.concat([port_returns.rename("Portfolio"), bm_returns], axis=1).dropna()
         if len(aligned) < window:
-            st.info(f"💡 ローリング相関を描画するための期間データ（{window}日分）が不足していますが、全体の分析には影響しません。")
+            st.info(f"💡 データ不足のため表示できません（{window}日分のデータが必要です）。")
             return
             
         rolling_corr = aligned.iloc[:, 0].rolling(window=window).corr(aligned.iloc[:, 1]).dropna()
@@ -67,6 +94,7 @@ class AuditEngine:
     @staticmethod
     def plot_underwater_drawdown(portfolio_prices):
         """アンダーウォーター・プロット（Plotly面積グラフ）"""
+        if portfolio_prices.empty: return
         peak = portfolio_prices.cummax()
         drawdown = (portfolio_prices - peak) / peak * 100
         
@@ -82,13 +110,11 @@ class AuditEngine:
     @staticmethod
     def plot_crisis_replays(crisis_results):
         """過去の危機における最大下落幅の表示"""
-        names = list(crisis_results.keys())
-        n_crises = len(names)
-        
-        if n_crises == 0:
-            st.info("💡 このポートフォリオを構成する銘柄は、指定された過去の危機期間にデータが存在しないため、シミュレーションをスキップしました。")
+        if not crisis_results:
+            st.info("💡 データ不足のため表示できません（指定された過去の危機期間に該当銘柄のデータが存在しません）。")
             return
             
+        names = list(crisis_results.keys())
         for i, name in enumerate(names):
             data = crisis_results[name]
             st.markdown(f"**{name}**")
@@ -99,7 +125,9 @@ class AuditEngine:
     @staticmethod
     def plot_rolling_exposure(rolling_df):
         """ローリング回帰による動的エクスポージャーの推移を可視化"""
-        if rolling_df is None or rolling_df.empty: return
+        if rolling_df is None or rolling_df.empty: 
+            st.info("💡 データ不足のため表示できません（ローリング回帰のためのデータが足りません）。")
+            return
         
         factors = ["Market_Beta", "Size_Beta", "Value_Beta", "Quality_Beta", "Invest_Beta"]
         valid_factors = [col for col in factors if col in rolling_df.columns and not rolling_df[col].isna().all()]
@@ -212,10 +240,12 @@ def main():
     region = st.sidebar.selectbox("Market Region", ["US", "Japan"], help="対象市場を選択してください。バックエンドの参照ファイルや無リスク金利が切り替わります。")
     config = MarketConfig.get_config(region)
     
-    # 💡 修正ポイント: リバランス設定のUI追加
+    # 💡 リバランス設定と目標TEのUI追加
     rebalance_options = {"Monthly (月次)": "M", "Annually (年次)": "Y", "Daily (日次)": "D", "Buy & Hold (放置)": None}
     rebalance_choice = st.sidebar.selectbox("Rebalance Frequency", list(rebalance_options.keys()), help="ポートフォリオの比率を元に戻す頻度。放置すると強い銘柄の比率が勝手に増えます(ドリフト)。")
     rebalance_freq = rebalance_options[rebalance_choice]
+
+    target_te = st.sidebar.slider("Target Tracking Error (%)", min_value=0.5, max_value=15.0, value=3.0, step=0.5, help="運用目標とするトラッキングエラー（乖離リスク）の目安。")
 
     st.sidebar.caption(f"📌 **設定情報:**\n- データセット: `{config['ff_dataset']}`\n- ベンチマーク: `{config['benchmark_ticker']}`")
     
@@ -266,7 +296,6 @@ def main():
             st.error("有効なティッカーとウェイトを入力してください。")
             return
             
-        # 💡 入力バリデーション（地域設定と銘柄の矛盾チェック）
         mismatch = False
         for ticker in weights_dict.keys():
             if region == "Japan" and not ticker.endswith('.T'):
@@ -286,7 +315,6 @@ def main():
             raw_input_data = DataFetcher.fetch_market_data(list(norm_weights.keys()))
             valid_ticker_count = len(raw_input_data.columns) if not raw_input_data.empty else 0
             
-            # リバランス頻度を渡して合成ポートフォリオを作成
             synthetic_portfolio = DataFetcher.create_synthetic_portfolio(norm_weights, region=region, rebalance_freq=rebalance_freq)
             
             if synthetic_portfolio is None or synthetic_portfolio.empty:
@@ -300,7 +328,6 @@ def main():
 
             returns = synthetic_portfolio.pct_change().dropna()
             
-            # 💡 修正ポイント: ベンチマーク取得時のエラーガード
             bm_prices = DataFetcher.fetch_market_data([config["benchmark_ticker"]])
             if not bm_prices.empty:
                 bm_returns = bm_prices.pct_change().iloc[:, 0].rename("Benchmark")
@@ -321,7 +348,6 @@ def main():
                 res = HistoryTimeMachine.replay_crisis(norm_weights, crisis, region)
                 if res: crisis_results[crisis] = res
                 
-            # 💡 修正ポイント: 引数をキーワード指定（名前付き）にし、順番ミスマッチエラーを根絶。
             projection = ProjectionCore.run_projection(
                 returns=returns, 
                 bm_returns=bm_returns if not bm_returns.empty else None, 
@@ -334,8 +360,8 @@ def main():
             # ==========================================
             tab1, tab2, tab3, tab4 = st.tabs([
                 "📊 概要＆AI診断", 
-                "⚠️ リスク＆連動性", 
-                "🔮 将来シミュレーション", 
+                "🎯 TE・乖離リスク分析",  # 💡 タブ名変更
+                "🔮 将来予測 & ストレステスト", # 💡 タブ名変更
                 "🔬 ファクター解析 (FF5)"
             ])
 
@@ -361,7 +387,6 @@ def main():
                     
                 st.divider()
                 
-                # 💡 1ページ目には全体のドローダウンを直接計算して表示（健全性チェックの一本化）
                 peak = synthetic_portfolio.cummax()
                 calc_dd = ((synthetic_portfolio - peak) / peak).min() * 100
                 
@@ -380,35 +405,41 @@ def main():
                     
                 AuditEngine.plot_underwater_drawdown(synthetic_portfolio)
 
-            # --- タブ2: リスクと連動性 ---
+            # --- タブ2: リスクと連動性 (TE特化) ---
             with tab2:
-                st.header("2. Risk Diversification & Tracking")
+                st.header("2. Tracking Error & Active Risk Analysis")
                 
-                # 💡 新設: トラッキングエラーとIRの表示
-                te_col1, te_col2, _ = st.columns(3)
-                te_col1.metric("Tracking Error (対市場乖離リスク)", f"{metrics.get('tracking_error', 0) * 100:.2f}%", help="この数値が高いほど、市場平均から外れた独自の値動きをしています。")
-                te_col2.metric("Information Ratio (情報レシオ)", f"{metrics.get('info_ratio', 0):.2f}", help="取った乖離リスク(TE)に対して、どれだけ超過リターンを稼げたかを示す「アクティブ運用のコスパ」です。")
-                
-                st.divider()
-                
-                c_col1, c_col2 = st.columns(2)
-                with c_col1:
-                    st.subheader(f"Factor Correlation Matrix ({region})")
-                    AuditEngine.plot_factor_correlation(region=region)
+                if bm_returns.empty:
+                    st.info("💡 データ不足のため表示できません（ベンチマークデータの取得に失敗しました）。")
+                else:
+                    te_actual = metrics.get('tracking_error', 0) * 100
                     
-                with c_col2:
-                    st.subheader("Market Correlation (Rolling 60-Day)")
-                    if not bm_returns.empty:
+                    st.subheader("🎯 Tracking Error Overview")
+                    te_col1, te_col2, te_col3 = st.columns(3)
+                    
+                    te_col1.metric("Tracking Error (実績TE)", f"{te_actual:.2f}%", help="この数値が高いほど、市場平均から外れた独自の値動きをしています。")
+                    te_col2.metric(f"Target TE (目標)", f"{target_te:.1f}%", delta=f"{te_actual - target_te:.2f}% (目標との差)", delta_color="inverse", help="目標とするトラッキングエラー（目安）。")
+                    te_col3.metric("Information Ratio (情報レシオ)", f"{metrics.get('info_ratio', 0):.2f}", help="取った乖離リスク(TE)に対して、どれだけ超過リターンを稼げたかを示す「アクティブ運用のコスパ」です。")
+                    
+                    st.divider()
+                    
+                    st.subheader("📈 Active Return Spread")
+                    AuditEngine.plot_active_return(returns, bm_returns)
+                    
+                    st.divider()
+                    
+                    c_col1, c_col2 = st.columns(2)
+                    with c_col1:
+                        st.subheader(f"Factor Correlation Matrix ({region})")
+                        AuditEngine.plot_factor_correlation(region=region)
+                        
+                    with c_col2:
+                        st.subheader("Market Correlation (Rolling 60-Day)")
                         AuditEngine.plot_rolling_correlation(returns, bm_returns)
                 
-                st.divider()
-                st.subheader("History Time Machine (Crash Recovery Paths)")
-                st.markdown("過去の主要な金融危機の際、当ポートフォリオがどのように下落し、**どの程度の期間で回復したか**を追体験します。")
-                AuditEngine.plot_crisis_replays(crisis_results)
-
-            # --- タブ3: 将来シミュレーション ---
+            # --- タブ3: 将来シミュレーション & ストレステスト ---
             with tab3:
-                st.header("3. Stochastic Projection (GARCH & Student's t)")
+                st.header("3. Stochastic Projection & Stress Tests")
                 if projection:
                     AuditEngine.plot_monte_carlo_fanchart(projection["paths"])
                     
@@ -430,6 +461,12 @@ def main():
                     
                     recovery_rate = AuditEngine.analyze_recovery(projection["paths"])
                     st.info(f"📉 **回復力監査:** ドローダウン発生後、1年以内に元本を回復する確率: **{recovery_rate:.1f}%**")
+                
+                # 💡 HistoryTimeMachine (ドローダウン表示) は第3タブの下部に移動
+                st.divider()
+                st.subheader("History Time Machine (Crash Recovery Paths)")
+                st.markdown("過去の主要な金融危機の際、当ポートフォリオがどのように下落し、**どの程度の期間で回復したか**を追体験します。")
+                AuditEngine.plot_crisis_replays(crisis_results)
 
             # --- タブ4: ファクター解析 (FF5 プロフェッショナル・ダッシュボード化) ---
             with tab4:
