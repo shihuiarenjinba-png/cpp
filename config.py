@@ -1,7 +1,7 @@
 """
 config.py
 市場環境、ベンチマーク、およびシステム全体の静的設定を管理するモジュール
-※ 修正版(v5): FF5ファクターデータセットを「純粋な5ファクター（Daily）」に厳格指定
+※ 修正版(v6): TE計算の精度向上のため、米国ベンチマークを配当込みのETF(SPY)に変更
 """
 
 # =========================================================
@@ -16,16 +16,17 @@ class MarketConfig:
     REGIONS = {
         "US": {
             "name": "United States",
-            # 💡修正ポイント: 2x3ポートフォリオ(従属変数)などを排除し、純粋な5ファクター独立変数(Daily)を厳格指定
+            # 2x3ポートフォリオ(従属変数)などを排除し、純粋な5ファクター独立変数(Daily)を厳格指定
             "ff_dataset": "North_America_5_Factors_Daily",
-            "benchmark_ticker": "^GSPC",   # S&P 500 (米国市場全体のベンチマーク)
+            # 💡修正ポイント: 配当込みの正確なTEを算出するため、単なる指数(^GSPC)ではなくETF(SPY)を指定
+            "benchmark_ticker": "SPY",     # SPDR S&P 500 ETF (米国市場全体のベンチマーク)
             "risk_free_ticker": "^TNX",    # 米国10年国債利回り (無リスク資産)
             "vix_ticker": "^VIX",          # 米国VIX (恐怖指数)
             "fallback_rf_rate": 0.02       # データ取得失敗時の固定利回り (年利2%)
         },
         "Japan": {
             "name": "Japan",
-            # 💡修正ポイント: 旧来のJapan_3_Factorsを廃止し、日本の純粋な5ファクター独立変数(Daily)を厳格指定
+            # 旧来のJapan_3_Factorsを廃止し、日本の純粋な5ファクター独立変数(Daily)を厳格指定
             "ff_dataset": "Japan_5_Factors_Daily",
             "benchmark_ticker": "^N225",   # 日経225 (日本市場全体のベンチマーク)
             "risk_free_ticker": "^JGBS",   # 日本の10年国債利回り
