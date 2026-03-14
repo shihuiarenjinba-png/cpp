@@ -1,10 +1,12 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v10): 役割の完全分離
-  - Page 1: 現在のポートフォリオの診断（ファクター要因分解、実績vs予測、市場相対評価）
-  - Page 2: 未来に向けたウェイトの最適化提案（効率的フロンティア、将来予測）
-  - ドローダウン関連コンポーネントを完全削除
+※ 修正版(v11): 5ページ構成（タブ分割）によるUIの完全整理とストーリー立て
+  - Page 1: 総合診断 (Current Diagnosis)
+  - Page 2: 要因分析 (Factor Attribution)
+  - Page 3: リスク・相関分析 (Risk & Tracking)
+  - Page 4: 将来シミュレーション (Stress Test & Projection)
+  - Page 5: 最適化提案 (Portfolio Optimization)
 """
 
 import streamlit as st
@@ -45,7 +47,7 @@ class AuditEngine:
 
     @staticmethod
     def plot_residuals(residuals):
-        """[1ページ目用]: モデルで説明できない残差（アルファ＋誤差）の推移"""
+        """[2ページ目用]: モデルで説明できない残差（アルファ＋誤差）の推移"""
         if residuals is None or residuals.empty: return
         
         cum_residuals = residuals.cumsum() * 100 # %表記
@@ -63,7 +65,7 @@ class AuditEngine:
 
     @staticmethod
     def plot_active_return(port_returns, bm_returns):
-        """[1ページ目用]: アクティブ・リターン（ベンチマークとの乖離）の推移を可視化"""
+        """[3ページ目用]: アクティブ・リターン（ベンチマークとの乖離）の推移を可視化"""
         if port_returns.empty or bm_returns.empty:
             st.info("💡 データ不足のため表示できません（ベンチマークデータがありません）。")
             return
@@ -86,7 +88,7 @@ class AuditEngine:
 
     @staticmethod
     def plot_factor_correlation(region="US"):
-        """ファクター同士の相関関係をヒートマップで可視化"""
+        """[3ページ目用]: ファクター同士の相関関係をヒートマップで可視化"""
         factor_corr = FactorAnalyzer.get_factor_correlation(region=region)
         if not factor_corr: return
             
@@ -100,7 +102,7 @@ class AuditEngine:
 
     @staticmethod
     def plot_rolling_correlation(port_returns, bm_returns, window=60):
-        """市場との連動性（ローリング相関）の推移を可視化"""
+        """[3ページ目用]: 市場との連動性（ローリング相関）の推移を可視化"""
         if port_returns.empty or bm_returns.empty: return
             
         aligned = pd.concat([port_returns.rename("Portfolio"), bm_returns], axis=1).dropna()
@@ -119,7 +121,7 @@ class AuditEngine:
 
     @staticmethod
     def plot_crisis_replays(crisis_results):
-        """過去の危機における最大下落幅の表示"""
+        """[4ページ目用]: 過去の危機における最大下落幅の表示"""
         if not crisis_results:
             st.info("💡 指定された過去の危機期間に該当銘柄のデータが存在しません。")
             return
@@ -132,7 +134,7 @@ class AuditEngine:
 
     @staticmethod
     def plot_rolling_exposure(rolling_df):
-        """ローリング回帰による動的エクスポージャーの推移を可視化"""
+        """[2ページ目用]: ローリング回帰による動的エクスポージャーの推移を可視化"""
         if rolling_df is None or rolling_df.empty: return
         
         factors = ["Market_Beta", "Size_Beta", "Value_Beta", "Quality_Beta", "Invest_Beta"]
@@ -160,7 +162,7 @@ class AuditEngine:
 
     @staticmethod
     def optimize_and_plot_frontier(asset_returns, current_weights_dict):
-        """💡 新設 [2ページ目用]: 効率的フロンティアと最適ウェイトの算出"""
+        """[5ページ目用]: 効率的フロンティアと最適ウェイトの算出"""
         if asset_returns is None or asset_returns.empty or len(current_weights_dict) < 2:
             st.info("💡 最適化には2銘柄以上のデータが必要です。")
             return
@@ -249,7 +251,7 @@ class AuditEngine:
 
     @staticmethod
     def plot_monte_carlo_fanchart(paths):
-        """1万回のシミュレーション推移を扇状で可視化"""
+        """[4ページ目用]: 1万回のシミュレーション推移を扇状で可視化"""
         percentiles = np.percentile(paths, [5, 25, 50, 75, 95], axis=1)
         days = np.arange(paths.shape[0])
         
@@ -265,7 +267,7 @@ class AuditEngine:
 
     @staticmethod
     def plot_monte_carlo_histogram(final_values):
-        """最終資産分布の正確なヒストグラム"""
+        """[4ページ目用]: 最終資産分布の正確なヒストグラム"""
         fig = px.histogram(final_values, nbins=50, title="Final Value Distribution", labels={'value': 'Final Portfolio Value', 'count': 'Frequency'}, color_discrete_sequence=["steelblue"])
         median_val = np.median(final_values)
         fig.add_vline(x=1.0, line_dash="dash", line_color="red", annotation_text="Break-even")
@@ -400,18 +402,21 @@ def main():
             )
 
             # ==========================================
-            # 🗂️ 描画レイヤー (2つのタブ構成へ完全分離)
+            # 🗂️ 描画レイヤー (5つのタブ構成へ完全分離)
             # ==========================================
-            tab1, tab2 = st.tabs([
-                "📊 Page 1: ポートフォリオ診断 (要因分解・モデル適合度)", 
-                "🎯 Page 2: 未来への最適化提案 (フロンティア・予測)"
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                "1️⃣ 総合診断", 
+                "2️⃣ 要因分析", 
+                "3️⃣ リスク・相関", 
+                "4️⃣ 将来シミュレーション", 
+                "5️⃣ 最適化提案"
             ])
 
             # ---------------------------------------------------------
-            # --- Page 1: 診断 (現状分析, ファクター要因分解, 市場相対) ---
+            # --- Page 1: 総合診断 (Current Diagnosis) ---
             # ---------------------------------------------------------
             with tab1:
-                st.header(f"1. Current Portfolio Diagnosis ({region} Market)")
+                st.header(f"1. Current Diagnosis ({region} Market)")
                 st.subheader("🤖 クオンツマネージャーの辛口診断")
                 
                 ai_prompt = AIPromptBuilder.generate_quant_prompt(metrics, style, target_name="現在のポートフォリオ")
@@ -432,25 +437,43 @@ def main():
                 
                 r2_score = style.get('r_squared', 0.0) * 100
                 
-                # ドローダウン関連を削除し、3つの指標のみ表示
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Expected Annual Return", f"{returns.mean() * 252 * 100:.2f}%")
                 col2.metric("Portfolio Volatility", f"{metrics.get('volatility', 0) * 100:.2f}%")
                 col3.metric("Model Fit (Adjusted R²)", f"{r2_score:.1f}%", help="自身のファクター戦略でどれだけ動きを説明できているか")
                 
                 st.divider()
-                
                 st.subheader("📈 Model Fit: Actual vs Predicted")
                 if style and style.get('status') == 'success':
                     AuditEngine.plot_actual_vs_predicted(style.get("actual_cumulative"), style.get("predicted_cumulative"))
-                    AuditEngine.plot_residuals(style.get("residuals"))
                 else:
                     st.info("💡 ファクターモデルによる予測データが不足しているため、実績値のみを表示します。")
                     st.line_chart(synthetic_portfolio)
                 
                 st.divider()
+                st.subheader("📊 Market Relative Performance (Actual vs Benchmark)")
+                if bm_returns.empty:
+                    st.info("💡 データ不足のため表示できません（ベンチマークデータの取得に失敗しました）。")
+                else:
+                    aligned_growth = pd.concat([synthetic_portfolio.rename("Portfolio"), (1+bm_returns).cumprod()*100], axis=1).dropna()
+                    fig_rel = px.line(aligned_growth, labels={'value': 'Cumulative Return (Base=100)', 'index': 'Date'}, title="Portfolio vs Benchmark Growth")
+                    fig_rel.update_layout(height=400, margin=dict(l=20, r=20, t=50, b=20))
+                    st.plotly_chart(fig_rel, use_container_width=True)
 
-                # --- ファクター要因分解 (旧Page 4を統合) ---
+            # ---------------------------------------------------------
+            # --- Page 2: 要因分析 (Factor Attribution) ---
+            # ---------------------------------------------------------
+            with tab2:
+                st.header("2. Factor Attribution")
+                
+                st.subheader("📉 Cumulative Residuals (Alpha)")
+                if style and style.get('status') == 'success':
+                    AuditEngine.plot_residuals(style.get("residuals"))
+                else:
+                    st.info("💡 残差データを表示できません。")
+
+                st.divider()
+
                 st.subheader(f"🔬 Causal Factor Analysis ({region} Fama-French 5-Factor)")
                 st.markdown("ポートフォリオの背後にある「リスクの源泉」を統計的に分解し、その因果的妥当性と安定性を評価します。")
                 
@@ -490,57 +513,47 @@ def main():
                 else:
                     st.info("💡 ファクター分析を行うためのデータが不足しています（最低36ヶ月分のデータが推奨されます）。")
 
-                st.divider()
-
-                # --- 市場相対リスク (旧Page 2を統合) ---
-                st.subheader("🎯 Market Relative Performance & Tracking Error")
+            # ---------------------------------------------------------
+            # --- Page 3: リスク・相関分析 (Risk & Tracking) ---
+            # ---------------------------------------------------------
+            with tab3:
+                st.header("3. Risk & Tracking Analysis")
                 if bm_returns.empty:
                     st.info("💡 データ不足のため表示できません（ベンチマークデータの取得に失敗しました）。")
                 else:
                     te_actual = metrics.get('tracking_error', 0) * 100
+                    
+                    st.subheader("🎯 Tracking Error Overview")
                     te_col1, te_col2, te_col3 = st.columns(3)
                     te_col1.metric("Tracking Error (実績TE)", f"{te_actual:.2f}%")
                     te_col2.metric(f"Target TE (目標)", f"{target_te:.1f}%", delta=f"{te_actual - target_te:.2f}% (目標との差)", delta_color="inverse")
                     te_col3.metric("Information Ratio (情報レシオ)", f"{metrics.get('info_ratio', 0):.2f}")
                     
-                    aligned_growth = pd.concat([synthetic_portfolio.rename("Portfolio"), (1+bm_returns).cumprod()*100], axis=1).dropna()
-                    fig_rel = px.line(aligned_growth, labels={'value': 'Cumulative Return (Base=100)', 'index': 'Date'}, title="Portfolio vs Benchmark Growth")
-                    fig_rel.update_layout(height=400, margin=dict(l=20, r=20, t=50, b=20))
-                    st.plotly_chart(fig_rel, use_container_width=True)
-                    
+                    st.divider()
+                    st.subheader("📈 Active Return Spread")
                     AuditEngine.plot_active_return(returns, bm_returns)
                     
+                    st.divider()
                     c_col1, c_col2 = st.columns(2)
                     with c_col1:
+                        st.subheader(f"Factor Correlation Matrix ({region})")
                         AuditEngine.plot_factor_correlation(region=region)
                     with c_col2:
+                        st.subheader("Market Correlation (Rolling 60-Day)")
                         AuditEngine.plot_rolling_correlation(returns, bm_returns)
 
                 if cycle_days:
+                    st.divider()
                     st.caption(f"⏳ ボラティリティ周期 (ウェルチ法): 約 {cycle_days} 日")
 
-
             # ---------------------------------------------------------
-            # --- Page 2: 最適化提案 (ウェイト最適化, 予測, ストレス) ---
+            # --- Page 4: 将来シミュレーション (Stress Test & Projection) ---
             # ---------------------------------------------------------
-            with tab2:
-                st.header("2. Future Portfolio Optimization & Projections")
+            with tab4:
+                st.header("4. Stress Test & Projection")
                 
-                # --- 新機能: ウェイト最適化と効率的フロンティア ---
-                st.subheader("⚖️ Efficient Frontier & Weight Optimization")
-                st.markdown("現在のポートフォリオから、**シャープレシオ（リスク・リターン比）を最大化**する未来の最適ウェイトを提案します。")
-                
-                # 個別銘柄の収益率データを算出
-                asset_returns = raw_input_data.pct_change().dropna()
-                AuditEngine.optimize_and_plot_frontier(asset_returns, norm_weights)
-                
-                st.divider()
-
-                # --- 将来シミュレーション ---
                 st.subheader("🔮 Stochastic Projection (Monte Carlo Simulation)")
                 if projection:
-                    AuditEngine.plot_monte_carlo_fanchart(projection["paths"])
-                    
                     final_values = projection["paths"][-1, :]
                     worst_5th = projection['worst_5th']
                     cvar = final_values[final_values <= worst_5th].mean()
@@ -551,14 +564,25 @@ def main():
                     p_col3.metric("CVaR (下位5%の平均)", f"{cvar * 100:.1f}%", help="テールリスク")
                     p_col4.metric("Prob of Loss (元本割れ確率)", f"{projection['prob_loss']:.1f}%")
                     
+                    AuditEngine.plot_monte_carlo_fanchart(projection["paths"])
                     AuditEngine.plot_monte_carlo_histogram(final_values)
                 
                 st.divider()
-
-                # --- ストレステスト ---
                 st.subheader("⚡ Stress Tests (Crash Replays)")
                 st.markdown("過去の主要な金融危機の際、現在のポートフォリオ構成がどの程度の下落を経験したかを追体験します。")
                 AuditEngine.plot_crisis_replays(crisis_results)
+
+            # ---------------------------------------------------------
+            # --- Page 5: 最適化提案 (Portfolio Optimization) ---
+            # ---------------------------------------------------------
+            with tab5:
+                st.header("5. Portfolio Optimization")
+                
+                st.subheader("⚖️ Efficient Frontier & Weight Optimization")
+                st.markdown("現在のポートフォリオから、**シャープレシオ（リスク・リターン比）を最大化**する未来の最適ウェイトを提案します。")
+                
+                asset_returns = raw_input_data.pct_change().dropna()
+                AuditEngine.optimize_and_plot_frontier(asset_returns, norm_weights)
 
 if __name__ == "__main__":
     main()
