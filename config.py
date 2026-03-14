@@ -1,7 +1,7 @@
 """
 config.py
 市場環境、ベンチマーク、およびシステム全体の静的設定を管理するモジュール
-※ 修正版(v6): TE計算の精度向上のため、米国ベンチマークを配当込みのETF(SPY)に変更
+※ 修正版(v7): 「予測」「実績」「市場」のUI表示用ラベル定義を追加し、システム全体の用語を統一
 """
 
 # =========================================================
@@ -18,7 +18,7 @@ class MarketConfig:
             "name": "United States",
             # 2x3ポートフォリオ(従属変数)などを排除し、純粋な5ファクター独立変数(Daily)を厳格指定
             "ff_dataset": "North_America_5_Factors_Daily",
-            # 💡修正ポイント: 配当込みの正確なTEを算出するため、単なる指数(^GSPC)ではなくETF(SPY)を指定
+            # 💡修正ポイント: 配当込みの正確なTEを算出するため、単なる指数(^GSPC)ではなくETF(SPY)を固定指定
             "benchmark_ticker": "SPY",     # SPDR S&P 500 ETF (米国市場全体のベンチマーク)
             "risk_free_ticker": "^TNX",    # 米国10年国債利回り (無リスク資産)
             "vix_ticker": "^VIX",          # 米国VIX (恐怖指数)
@@ -28,6 +28,7 @@ class MarketConfig:
             "name": "Japan",
             # 旧来のJapan_3_Factorsを廃止し、日本の純粋な5ファクター独立変数(Daily)を厳格指定
             "ff_dataset": "Japan_5_Factors_Daily",
+            # 💡修正ポイント: 日本市場の固定ベンチマーク
             "benchmark_ticker": "^N225",   # 日経225 (日本市場全体のベンチマーク)
             "risk_free_ticker": "^JGBS",   # 日本の10年国債利回り
             "vix_ticker": "^JNIV",         # 日経VI (日本の恐怖指数)
@@ -53,6 +54,15 @@ class MarketConfig:
 # =========================================================
 # 📝 用語マッピング・システム定数
 # =========================================================
+
+# 💡 新規追加: UI・グラフ表示用の標準ラベル定義
+# システム全体で「予測」「実績」「市場」の表記揺れを防ぐための辞書
+DISPLAY_LABELS = {
+    "actual": "実績 (Actual/Portfolio)",
+    "predicted": "予測 (Predicted/Model)",
+    "benchmark": "市場 (Benchmark/Market)"
+}
+
 # カラム名の揺れ（米国 Mkt-RF vs 日本 Mkt 等）を吸収するためのエイリアスマッピング。
 # UIと分析エンジンの両方で、どの名称が来ても統一した日本語表示ができるようにする。
 FACTOR_TRANSLATION = {
