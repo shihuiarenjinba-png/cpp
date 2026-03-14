@@ -1,7 +1,7 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
-※ 修正版(v8): yfinanceのRate Limit対策（リトライ・指数バックオフ）と特殊ティッカー(BRK-B等)の完全対応
+※ 修正版(v8): yfinanceのRate Limit対策（リトライ・指数バックオフ）と特殊ティッカー(BRK-B等)の完全対応、データアライメント強化
 """
 
 import pandas as pd
@@ -164,11 +164,16 @@ class DataFetcher:
         returns = raw_prices.pct_change(fill_method=None)
         bm_returns = bm_prices.pct_change(fill_method=None).iloc[:, 0].rename("Benchmark")
         
-        # 結合前に日付フォーマット(YYYY-MM-DD)を強制的に揃える
-        returns.index = pd.to_datetime(returns.index).normalize().tz_localize(None)
-        bm_returns.index = pd.to_datetime(bm_returns.index).normalize().tz_localize(None)
+        # 💡 修正ポイント: 結合前に日付フォーマット(YYYY-MM-DD)とタイムゾーン(None)を強制的に揃える（データアライメント強化）
+        if returns.index.tz is not None:
+            returns.index = returns.index.tz_localize(None)
+        returns.index = pd.to_datetime(returns.index).normalize()
         
-        # 日付同期（インデックス・アライメント）の強化
+        if bm_returns.index.tz is not None:
+            bm_returns.index = bm_returns.index.tz_localize(None)
+        bm_returns.index = pd.to_datetime(bm_returns.index).normalize()
+        
+        # 日付同期（インデックス・アライメント）の強化: TE計算のズレをなくすため inner結合
         aligned_df = pd.merge(returns, bm_returns, left_index=True, right_index=True, how='inner')
         
         # 結合後にデータがごっそり消えていないか監査
