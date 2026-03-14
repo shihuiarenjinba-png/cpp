@@ -1,7 +1,7 @@
 """
 analytics.py
 ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
-※修正版(v6): ページ間の重複(max_dd)を削除、Tracking Error(TE)を新設、IR計算の整合性向上。
+※修正版(v9): トラッキングエラー(TE)の算出ロジック確定と、IR(インフォメーションレシオ)計算の統合。
 """
 
 import pandas as pd
@@ -75,9 +75,9 @@ class AdvancedStats:
     @staticmethod
     def calculate_metrics(returns, benchmark_returns=None, weights_dict=None, region="US"):
         """
-        日次リターン系列から各種リスク指標を計算する。
+        日次リターン系列から各種リスク指標とトラッキングエラー(TE)を計算する。
         """
-        # 💡【修正】"max_dd" を削除し、"tracking_error" を追加
+        # 💡【修正】"max_dd" を外し、"tracking_error" と "info_ratio" をデフォルトに設定
         default_metrics = {
             "sharpe": 0.0, "sortino": 0.0, "calmar": 0.0, "omega": 0.0, "cvar_95": 0.0,
             "ulcer_index": 0.0, "kelly_criterion": 0.0, "tracking_error": 0.0, "info_ratio": 0.0,
@@ -148,7 +148,7 @@ class AdvancedStats:
             arithmetic_mu = log_returns.mean() * TRADING_DAYS_PER_YEAR
             mu = arithmetic_mu - 0.5 * (sigma ** 2) 
             
-            # 💡【修正】max_ddは出力しないが、他指標の計算用に内部変数として保持
+            # 最大ドローダウン計算 (内部計算用・外には出さない)
             cumulative = (1 + returns).cumprod()
             peak = cumulative.cummax()
             drawdown = (cumulative - peak) / peak
@@ -175,12 +175,13 @@ class AdvancedStats:
             
             kelly = mu / (sigma ** 2) if sigma > 0 else 0
             
-            # 💡【修正】TEの初期化
+            # --- 💡【新規追加】トラッキングエラー(TE)算出ロジック ---
             info_ratio = 0.0
             tracking_error = 0.0
             systematic_risk, idiosyncratic_risk, portfolio_beta = 0.0, 0.0, 1.0
             
             try:
+                # ベンチマークが渡されていない場合は取得を試みる
                 if benchmark_returns is None:
                     config = MarketConfig.get_config(region)
                     bm_prices = DataFetcher.fetch_market_data([config["benchmark_ticker"]])
@@ -192,14 +193,17 @@ class AdvancedStats:
                     log_ret_df = log_returns.to_frame(name="Port")
                     log_bm_df = np.log1p(benchmark_returns.dropna()).to_frame(name="BM")
                     
+                    # 日付・タイムゾーンの厳密な同期
                     if log_ret_df.index.tz is not None: log_ret_df.index = log_ret_df.index.tz_localize(None)
                     if log_bm_df.index.tz is not None: log_bm_df.index = log_bm_df.index.tz_localize(None)
                     log_ret_df.index = log_ret_df.index.normalize()
                     log_bm_df.index = log_bm_df.index.normalize()
                     
+                    # インナー結合による日付完全一致データの抽出
                     aligned = pd.merge(log_ret_df, log_bm_df, left_index=True, right_index=True, how='inner')
                     
                     if len(aligned) > 30:
+                        # 共分散とベータの計算
                         cov_bm = np.cov(aligned["Port"], aligned["BM"])
                         if cov_bm[1, 1] > 0:
                             portfolio_beta = cov_bm[0, 1] / cov_bm[1, 1]
@@ -208,9 +212,11 @@ class AdvancedStats:
                             systematic_risk = np.sqrt(sys_var) * ann_factor
                             idiosyncratic_risk = np.sqrt(idio_var) * ann_factor
                             
-                            # 💡【修正】トラッキングエラーとインフォメーション・レシオの算出
+                            # 💡【重要】アクティブ・リターンとTEの計算
                             active_ret = aligned["Port"] - aligned["BM"]
                             tracking_error = active_ret.std() * ann_factor
+                            
+                            # 💡 インフォメーション・レシオ (IR) の計算
                             if tracking_error > 0:
                                 info_ratio = (active_ret.mean() * TRADING_DAYS_PER_YEAR) / tracking_error
             except Exception as e:
@@ -218,7 +224,7 @@ class AdvancedStats:
 
             clean_returns = log_returns.dropna()
             
-            # 💡【修正】戻り値から "max_dd" を外し、"tracking_error" を追加
+            # 結果の返却（TEとIRを確実に含める）
             return {
                 "sharpe": sharpe, "sortino": sortino, "calmar": calmar,
                 "omega": omega, "cvar_95": cvar_95, "ulcer_index": ulcer_index,
