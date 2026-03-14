@@ -1,7 +1,7 @@
 """
 analytics.py
 ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
-※修正版(v10): 1ページ目の「実績 vs 予測」表示に向け、予測リターン(Predicted Return)と残差の算出ロジックを追加。
+※修正版(v11): 1ページ目と2ページ目の役割分離に合わせ、不要な外部出力（ドローダウン時系列など）を整理。
 """
 
 import pandas as pd
@@ -147,7 +147,7 @@ class AdvancedStats:
             arithmetic_mu = log_returns.mean() * TRADING_DAYS_PER_YEAR
             mu = arithmetic_mu - 0.5 * (sigma ** 2) 
             
-            # 最大ドローダウン計算 (内部計算用・外には出さない)
+            # 最大ドローダウン計算 (内部のリスク指標計算用であり、外部へ時系列データとしては出力しない)
             cumulative = (1 + returns).cumprod()
             peak = cumulative.cummax()
             drawdown = (cumulative - peak) / peak
@@ -248,7 +248,7 @@ class FactorAnalyzer:
     def analyze_style(target_series, region="US"):
         """
         Fama-French 5ファクターモデルを用いた重回帰分析。
-        💡【修正】予測リターンと残差の算出、および実績vs予測の累積リターン計算(100スタート)を追加。
+        💡 予測リターンと残差の算出、および実績vs予測の累積リターン計算(100スタート)。
         """
         fallback_result = {
             "beta_market": 1.0, "beta_size": 0.0, "beta_value": 0.0,
@@ -262,7 +262,7 @@ class FactorAnalyzer:
         if target_series.empty: return fallback_result
         
         try:
-            # 💡 予測精度の解像度を上げるため、月次ではなく日次ベースでの回帰へ変更
+            # 💡 予測精度の解像度を上げるため、月次ではなく日次ベースでの回帰
             target_daily = target_series.pct_change().dropna()
             if len(target_daily) < 30: return fallback_result
             
@@ -308,7 +308,7 @@ class FactorAnalyzer:
             annualized_alpha = model.params.get("const", 0.0) * TRADING_DAYS_PER_YEAR
             pvalues = model.pvalues
             
-            # 💡【新規追加】予測リターンと残差の算出
+            # 予測リターンと残差の算出
             # predicted_excess = β * ファクター + α
             predicted_excess = model.predict(X)
             # 予測リターン（絶対） = 予測超過リターン + 無リスク金利
@@ -318,7 +318,7 @@ class FactorAnalyzer:
             # 残差（実際の動きから、モデルで説明できる動きを引いたもの）
             residuals = actual_returns - predicted_returns
 
-            # 💡【新規追加】累積リターン推移の100スタート共通化
+            # 累積リターン推移の100スタート共通化
             actual_cum = (1 + actual_returns).cumprod() * 100
             pred_cum = (1 + predicted_returns).cumprod() * 100
             
@@ -353,7 +353,7 @@ class FactorAnalyzer:
                 "p_value_invest": pvalues.get(cma, 1.0),
                 "region": region,
                 "status": "success",
-                # 💡 UI描画用に追加された時系列データ
+                # UI描画用に追加された時系列データ
                 "actual_cumulative": actual_cum,
                 "predicted_cumulative": pred_cum,
                 "residuals": residuals
