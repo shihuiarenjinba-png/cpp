@@ -1,7 +1,7 @@
 """
 analytics.py
 ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
-※修正版(v9): トラッキングエラー(TE)の算出ロジック確定と、IR(インフォメーションレシオ)計算の統合。
+※修正版(v10): 1ページ目の「実績 vs 予測」表示に向け、予測リターン(Predicted Return)と残差の算出ロジックを追加。
 """
 
 import pandas as pd
@@ -77,7 +77,6 @@ class AdvancedStats:
         """
         日次リターン系列から各種リスク指標とトラッキングエラー(TE)を計算する。
         """
-        # 💡【修正】"max_dd" を外し、"tracking_error" と "info_ratio" をデフォルトに設定
         default_metrics = {
             "sharpe": 0.0, "sortino": 0.0, "calmar": 0.0, "omega": 0.0, "cvar_95": 0.0,
             "ulcer_index": 0.0, "kelly_criterion": 0.0, "tracking_error": 0.0, "info_ratio": 0.0,
@@ -175,7 +174,7 @@ class AdvancedStats:
             
             kelly = mu / (sigma ** 2) if sigma > 0 else 0
             
-            # --- 💡【新規追加】トラッキングエラー(TE)算出ロジック ---
+            # --- トラッキングエラー(TE)算出ロジック ---
             info_ratio = 0.0
             tracking_error = 0.0
             systematic_risk, idiosyncratic_risk, portfolio_beta = 0.0, 0.0, 1.0
@@ -212,11 +211,11 @@ class AdvancedStats:
                             systematic_risk = np.sqrt(sys_var) * ann_factor
                             idiosyncratic_risk = np.sqrt(idio_var) * ann_factor
                             
-                            # 💡【重要】アクティブ・リターンとTEの計算
+                            # アクティブ・リターンとTEの計算
                             active_ret = aligned["Port"] - aligned["BM"]
                             tracking_error = active_ret.std() * ann_factor
                             
-                            # 💡 インフォメーション・レシオ (IR) の計算
+                            # インフォメーション・レシオ (IR) の計算
                             if tracking_error > 0:
                                 info_ratio = (active_ret.mean() * TRADING_DAYS_PER_YEAR) / tracking_error
             except Exception as e:
@@ -224,7 +223,6 @@ class AdvancedStats:
 
             clean_returns = log_returns.dropna()
             
-            # 結果の返却（TEとIRを確実に含める）
             return {
                 "sharpe": sharpe, "sortino": sortino, "calmar": calmar,
                 "omega": omega, "cvar_95": cvar_95, "ulcer_index": ulcer_index,
@@ -250,37 +248,40 @@ class FactorAnalyzer:
     def analyze_style(target_series, region="US"):
         """
         Fama-French 5ファクターモデルを用いた重回帰分析。
+        💡【修正】予測リターンと残差の算出、および実績vs予測の累積リターン計算(100スタート)を追加。
         """
         fallback_result = {
             "beta_market": 1.0, "beta_size": 0.0, "beta_value": 0.0,
             "beta_quality": 0.0, "beta_invest": 0.0,
             "alpha": 0.0, "r_squared": 0.0, "vif": {},
             "p_value_market": 1.0, "p_value_size": 1.0, "p_value_value": 1.0,
-            "region": region, "status": "insufficient_data"
+            "region": region, "status": "insufficient_data",
+            "actual_cumulative": None, "predicted_cumulative": None, "residuals": None
         }
 
         if target_series.empty: return fallback_result
         
         try:
-            target_monthly = target_series.resample('ME').last().pct_change().dropna()
-            if len(target_monthly) < 6: return fallback_result
+            # 💡 予測精度の解像度を上げるため、月次ではなく日次ベースでの回帰へ変更
+            target_daily = target_series.pct_change().dropna()
+            if len(target_daily) < 30: return fallback_result
             
-            start_date = target_monthly.index[0].strftime('%Y-%m-%d')
+            start_date = target_daily.index[0].strftime('%Y-%m-%d')
             config = MarketConfig.get_config(region)
             
             ff_data = DataFetcher.fetch_fama_french_factors(start_date, dataset_name=config["ff_dataset"])
             if ff_data.empty: return fallback_result
             
-            ff_monthly = ff_data.resample('ME').apply(lambda x: (1 + x).prod() - 1)
+            # 日付のアライメント（タイムゾーンと時刻の除去）
+            target_daily.index = pd.to_datetime(target_daily.index).normalize()
+            if target_daily.index.tz is not None:
+                target_daily.index = target_daily.index.tz_localize(None)
             
-            target_monthly.index = target_monthly.index.to_period('M')
-            ff_monthly.index = ff_monthly.index.to_period('M')
-            
-            combined = pd.merge(target_monthly.to_frame(name="Target"), ff_monthly, left_index=True, right_index=True, how='inner')
-            
+            # 日次でインナー結合
+            combined = pd.merge(target_daily.to_frame(name="Target"), ff_data, left_index=True, right_index=True, how='inner')
             combined = combined.dropna()
 
-            if len(combined) < 10: return fallback_result
+            if len(combined) < 30: return fallback_result
             
             cols_upper = {c: c.strip().upper() for c in combined.columns}
             
@@ -296,13 +297,35 @@ class FactorAnalyzer:
                 fallback_result["status"] = "missing_factors"
                 return fallback_result
 
+            # 従属変数：超過リターン
             y = combined["Target"] - combined[rf]
+            # 独立変数：FF5ファクター
             X = combined[[mkt, smb, hml, rmw, cma]]
             X = sm.add_constant(X)
             
+            # 回帰モデルの構築と当てはめ
             model = sm.OLS(y, X).fit()
-            annualized_alpha = model.params.get("const", 0.0) * 12
+            annualized_alpha = model.params.get("const", 0.0) * TRADING_DAYS_PER_YEAR
             pvalues = model.pvalues
+            
+            # 💡【新規追加】予測リターンと残差の算出
+            # predicted_excess = β * ファクター + α
+            predicted_excess = model.predict(X)
+            # 予測リターン（絶対） = 予測超過リターン + 無リスク金利
+            predicted_returns = predicted_excess + combined[rf]
+            actual_returns = combined["Target"]
+            
+            # 残差（実際の動きから、モデルで説明できる動きを引いたもの）
+            residuals = actual_returns - predicted_returns
+
+            # 💡【新規追加】累積リターン推移の100スタート共通化
+            actual_cum = (1 + actual_returns).cumprod() * 100
+            pred_cum = (1 + predicted_returns).cumprod() * 100
+            
+            # グラフ描画用に初期日(t=0)を100として先頭に挿入
+            base_date = actual_cum.index[0] - pd.Timedelta(days=1)
+            actual_cum = pd.concat([pd.Series([100.0], index=[base_date]), actual_cum])
+            pred_cum = pd.concat([pd.Series([100.0], index=[base_date]), pred_cum])
             
             vifs = {}
             for i, col in enumerate(X.columns):
@@ -329,7 +352,11 @@ class FactorAnalyzer:
                 "p_value_quality": pvalues.get(rmw, 1.0),
                 "p_value_invest": pvalues.get(cma, 1.0),
                 "region": region,
-                "status": "success"
+                "status": "success",
+                # 💡 UI描画用に追加された時系列データ
+                "actual_cumulative": actual_cum,
+                "predicted_cumulative": pred_cum,
+                "residuals": residuals
             }
         except Exception as e:
             print(f"Factor Analyzer Fallback Triggered: {e}")
@@ -370,11 +397,8 @@ class AIPromptBuilder:
 
         r_squared = factor_data.get("r_squared", 0) * 100 if factor_data else 0.0
         alpha = factor_data.get("alpha", 0) * 100 if factor_data else 0.0
-        
-        # 💡【修正】max_dd を外し、TE を取得
         te = stats_data.get("tracking_error", 0) * 100
 
-        # 💡【修正】プロンプト内容をTEベースに刷新
         prompt = f"""
 あなたはウォール街で長年活躍する、非常に優秀だが少し辛口なクオンツ・ポートフォリオマネージャーです。
 以下の計算結果データに基づいて、個人投資家向けに「プロの小言（診断レポート）」を作成してください。
@@ -382,8 +406,8 @@ class AIPromptBuilder:
 【ポートフォリオの客観的データ】
 - 分析対象: {target_name}
 - リスクの支配者（最大リスク寄与銘柄）: {top_risk_asset} ({top_risk_value:.1f}%)
-- 市場との連動性 (Adjusted R2): {r_squared:.1f}% (※この数値が高いほど、ただのインデックスファンドと同じ動きをしています)
-- 年率トラッキングエラー (TE): {te:.2f}% (※これが低いほど市場のコピー、高いほど独自路線です)
+- モデル適合度 (Adjusted R2): {r_squared:.1f}% (※この数値が高いほど、自身のファクター戦略通りに動いています)
+- 年率トラッキングエラー (TE): {te:.2f}% (※対ベンチマークのズレ。低いほど市場のコピー、高いほど独自路線です)
 - 年率アルファ (超過収益): {alpha:.2f}%
 - ボラティリティ: {stats_data.get("volatility", 0) * 100:.1f}%
 
@@ -391,7 +415,7 @@ class AIPromptBuilder:
 1. 専門的なクオンツの視点から、厳しいが的確で愛のあるアドバイスをしてください。
 2. もし「リスクの支配者」が50%を超えている場合、「分散投資になっているつもりか？実質的に{top_risk_asset}と心中しているだけだぞ」と厳しく指摘してください。
 3. トラッキングエラー(TE)が非常に低い(例: 2%未満)のにアルファがマイナスまたはゼロ付近の場合は、「高い手数料（または手間）を払ってインデックス以下の成果を出す、典型的な『隠れインデックスファンド』だ」と警告してください。
-4. TEが高い(例: 10%超)場合は、その独自リスクに見合うだけのアルファ（リターン）が出ているかを厳しく評価してください。
+4. モデル適合度(R2)にも触れ、戦略通りに運用できているかを評価してください。
 5. 最後に、改善のための具体的なネクストアクションを1つ提示してください。
 6. 出力はMarkdown形式で、見出しを使って読みやすくしてください。ですます調で構いませんが、プロとしての威厳を保ってください。
 """
