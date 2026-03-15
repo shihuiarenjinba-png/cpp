@@ -1,7 +1,8 @@
 """
 analytics.py
 ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
-※修正版(v11): 1ページ目と2ページ目の役割分離に合わせ、不要な外部出力（ドローダウン時系列など）を整理。
+※修正版(v12): 1ページ目と2ページ目の役割分離に合わせ、不要な外部出力（ドローダウン時系列など）を整理。
+　さらに時価総額加重の基準日適正化ロジック、およびPlotlyによるモンテカルロ描画の改善（透過度・垂直線）を追加。
 """
 
 import pandas as pd
@@ -10,6 +11,7 @@ import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor  # 💡 VIF計算用
 from scipy.stats import skew, kurtosis
 import warnings
+import plotly.graph_objects as go  # 💡 モンテカルロ可視化用に追加
 
 # 分割した他のモジュールからのインポート
 from config import MarketConfig, DEFAULT_RISK_FREE_RATE, TRADING_DAYS_PER_YEAR
@@ -420,3 +422,93 @@ class AIPromptBuilder:
 6. 出力はMarkdown形式で、見出しを使って読みやすくしてください。ですます調で構いませんが、プロとしての威厳を保ってください。
 """
         return prompt
+
+
+# =========================================================
+# ⚖️ ポートフォリオウェイト算出
+# =========================================================
+class PortfolioBuilder:
+    @staticmethod
+    def calculate_market_cap_weights(market_caps_dict, backtest_start_date=None):
+        """
+        💡 修正内容: 現在の時価総額に基づくウェイトを算出する。
+        
+        【基準日適正化に関する注釈】
+        厳密なバックテストを行う場合、単一の「現在の時価総額」を用いると生存バイアスや
+        未来情報のリーク（Look-ahead bias）が生じる可能性があります。
+        本来はバックテスト開始時 (backtest_start_date) の時価総額を基準とするか、
+        リバランス時点ごとの時価総額推移を時系列で取得して動的に計算するべきです。
+        ※ 現在は最新の時価総額ベースでの近似計算として実装しています（将来の拡張余地）。
+        """
+        if not market_caps_dict:
+            return {}
+        
+        total_cap = sum(market_caps_dict.values())
+        if total_cap <= 0:
+            # 時価総額が不正な場合は均等ウェイトにフォールバック
+            return {k: 100.0 / len(market_caps_dict) for k in market_caps_dict}
+        
+        # 各銘柄の時価総額比率（%）を計算
+        weights = {k: (v / total_cap) * 100.0 for k, v in market_caps_dict.items()}
+        return weights
+
+
+# =========================================================
+# 🎲 モンテカルロ・シミュレーション可視化
+# =========================================================
+class MonteCarloVisualizer:
+    @staticmethod
+    def plot_histogram(final_values, title="モンテカルロ・シミュレーション結果 (最終評価額の分布)"):
+        """
+        💡 修正内容: モンテカルロシミュレーションの最終結果分布をPlotlyのヒストグラムとして描画。
+        バーの透過度を調整し、下位10%（悲観シナリオ）と期待値（Mean）を垂直線で明示して視認性を高める。
+        """
+        if not final_values or len(final_values) == 0:
+            return go.Figure()
+
+        mean_val = np.mean(final_values)
+        # 下位10% (P90: 90%の確率でこれ以上になるライン、あるいは悲観シナリオ)
+        p10_val = np.percentile(final_values, 10)
+
+        fig = go.Figure()
+        
+        # バーの透過度設定 (opacity=0.6) で色が濃すぎる問題を解消
+        fig.add_trace(go.Histogram(
+            x=final_values,
+            nbinsx=50,
+            marker=dict(color='royalblue', opacity=0.6),
+            name='最終評価額'
+        ))
+
+        # 期待値（Mean）の垂直線とラベル
+        fig.add_vline(
+            x=mean_val, 
+            line_dash="dash", 
+            line_color="green", 
+            line_width=2,
+            annotation_text=f"期待値(Mean): {mean_val:,.0f}", 
+            annotation_position="top right",
+            annotation_font=dict(color="green", size=12)
+        )
+        
+        # 下位10%（悲観シナリオ）の垂直線とラベル
+        fig.add_vline(
+            x=p10_val, 
+            line_dash="dash", 
+            line_color="red", 
+            line_width=2,
+            annotation_text=f"下位10%(悲観): {p10_val:,.0f}", 
+            annotation_position="top left",
+            annotation_font=dict(color="red", size=12)
+        )
+
+        fig.update_layout(
+            title=title,
+            xaxis_title="最終評価額",
+            yaxis_title="頻度 (シミュレーション回数)",
+            showlegend=False,
+            template="plotly_white",
+            margin=dict(l=40, r=40, t=40, b=40)
+        )
+        
+        return fig
