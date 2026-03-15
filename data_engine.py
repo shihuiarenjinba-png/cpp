@@ -1,7 +1,7 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
-※ 修正版(v10): 予測モデル連携に向けたインデックスの厳密な同期と、市場平均ウェイト算出のための時価総額取得機能の追加
+※ 修正版(v11): 時価総額取得の堅牢化（DBキャッシュ & FMP APIフォールバックの実装）、引数エラーの解消
 """
 
 import pandas as pd
@@ -11,6 +11,9 @@ import pandas_datareader.data as web
 import warnings
 import streamlit as st
 import time  # リトライ待機用に新規追加
+import sqlite3 # DBキャッシュ用
+import requests # FMP API通信用
+import os
 
 # 先ほど作成したconfigからMarketConfigを読み込む
 from config import MarketConfig
@@ -18,6 +21,33 @@ from config import MarketConfig
 # 📌 ログを埋め尽くすPandasの仕様変更警告をミュート
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+
+# =========================================================
+# 🛠️ データベース初期化・APIキー設定
+# =========================================================
+DB_PATH = "market_data.db"
+
+def get_fmp_api_key():
+    try:
+        if hasattr(st, "secrets") and "FMP_API_KEY" in st.secrets:
+            return st.secrets["FMP_API_KEY"]
+    except Exception:
+        pass
+    return os.environ.get("FMP_API_KEY")
+
+FMP_API_KEY = get_fmp_api_key()
+
+def init_db():
+    """SQLiteデータベースとテーブルの初期化"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS market_caps
+                     (ticker TEXT PRIMARY KEY, market_cap REAL, last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Database Init Error: {e}")
 
 # =========================================================
 # 🛠️ データ取得 & ポートフォリオ合成クラス
@@ -115,30 +145,69 @@ class DataFetcher:
 
     @staticmethod
     @st.cache_data(ttl=86400)  # 時価総額は日次キャッシュ(24時間)で十分
-    def fetch_market_caps(tickers):
+    def fetch_market_caps(tickers, region="US", **kwargs):
         """
-        【追加】指定されたティッカーの時価総額(Market Cap)を取得する。
-        取得できなかった銘柄はエラーで止めずスキップし、残りの銘柄だけで計算できるよう欠損処理を行う。
+        指定されたティッカーの時価総額(Market Cap)を取得する。
+        DBキャッシュ -> yfinance -> FMP API の多層フォールバックで堅牢に取得。
         """
         if not tickers: return {}
         if isinstance(tickers, str): tickers = [tickers]
         
+        init_db()
         market_caps = {}
+        
         for ticker in tickers:
+            mcap = None
+            
+            # 1. まずローカルDBキャッシュを確認（API呼び出しの節約と安定化）
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT market_cap FROM market_caps WHERE ticker=?", (ticker,))
+                row = c.fetchone()
+                conn.close()
+                if row and row[0] is not None and row[0] > 0:
+                    market_caps[ticker] = row[0]
+                    continue # DBにあれば次へ
+            except Exception as e:
+                print(f"DB Read Error for {ticker}: {e}")
+
+            # 2. キャッシュがなければ yfinance を試す（基本ルート）
             try:
                 tick = yf.Ticker(ticker)
-                # .infoから時価総額を取得（取得できない場合はNoneが返る）
                 mcap = tick.info.get('marketCap')
-                
-                # 時価総額が有効な数値として取得できた場合のみ辞書に追加
-                if mcap is not None and isinstance(mcap, (int, float)) and mcap > 0:
-                    market_caps[ticker] = mcap
-                else:
-                    print(f"Warning: Market Cap data missing or invalid for {ticker}.")
+                if mcap is None or not isinstance(mcap, (int, float)) or mcap <= 0:
+                    mcap = None
             except Exception as e:
-                # 取得エラーが発生しても止めずにスキップする
-                print(f"Error fetching Market Cap for {ticker}: {e}")
-                continue
+                print(f"yfinance Market Cap Error for {ticker}: {e}")
+                mcap = None
+
+            # 3. yfinance がダメなら FMP API でフォールバック
+            if mcap is None and FMP_API_KEY:
+                try:
+                    url = f"https://financialmodelingprep.com/api/v3/market-capitalization/{ticker}?apikey={FMP_API_KEY}"
+                    response = requests.get(url, timeout=5)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data and len(data) > 0 and 'marketCap' in data[0]:
+                            mcap = data[0]['marketCap']
+                except Exception as e:
+                    print(f"FMP API Error for {ticker}: {e}")
+
+            # 4. 取得できた場合は結果を辞書に格納し、次回のためにDBへ保存
+            if mcap is not None and isinstance(mcap, (int, float)) and mcap > 0:
+                market_caps[ticker] = mcap
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    # 既に存在する場合は上書き更新 (INSERT OR REPLACE)
+                    c.execute("INSERT OR REPLACE INTO market_caps (ticker, market_cap, last_updated) VALUES (?, ?, CURRENT_TIMESTAMP)", (ticker, float(mcap)))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    print(f"DB Write Error for {ticker}: {e}")
+            else:
+                print(f"Warning: Market Cap data missing or invalid for {ticker} across all sources.")
                 
         return market_caps
 
@@ -270,7 +339,7 @@ class DataFetcher:
             weighted_returns = (clean_returns * actual_weights.fillna(0)).sum(axis=1)
             
             # 全滅している日はNaNにする
-            weighted_returns.loc[is_alive.sum(axis=1) == 0] = np.nan
+            weighted_returns.loc[is_alive.sum(axis=1) == np.nan]
         
         weighted_returns = weighted_returns.dropna()
         if weighted_returns.empty: return None
