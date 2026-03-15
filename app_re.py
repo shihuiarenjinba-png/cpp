@@ -1,9 +1,10 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v13): 致命的な時価総額計算バグの修正と、UI/グラフ視認性(重なり・潰れ)の大幅改善版
+※ 修正版(v14): FMP_API_KEY の集中管理とローカル/クラウド両対応のシークレット読み込み処理を追加。
 """
 
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,6 +13,35 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import re
 import random # その他のランダム処理用
+from dotenv import load_dotenv
+
+# =========================================================
+# 🔑 APIキーと環境変数の集中管理 (修正箇所)
+# =========================================================
+# 1. ローカル環境の .env ファイルを読み込む（Streamlit Cloud環境では無視されます）
+load_dotenv()
+
+def setup_api_keys():
+    """Streamlit Secrets または 環境変数 からAPIキーを安全に取得・設定する"""
+    fmp_key = None
+    
+    # パターンA: Streamlit Cloud の secrets.toml から取得を試みる
+    try:
+        if "FMP_API_KEY" in st.secrets:
+            fmp_key = st.secrets["FMP_API_KEY"]
+    except Exception:
+        pass
+
+    # パターンB: 取得できなければ、ローカルの環境変数 (.env等) から取得
+    if not fmp_key:
+        fmp_key = os.environ.get("FMP_API_KEY")
+
+    # 取得したキーを環境変数に再セットし、DataFetcher等の裏側モジュールで os.getenv できるようにする
+    if fmp_key:
+        os.environ["FMP_API_KEY"] = fmp_key
+
+# モジュール読み込みの前にAPIキーのセットアップを実行
+setup_api_keys()
 
 # これまでに作成したモジュールのインポート
 from config import MarketConfig, FACTOR_TRANSLATION
@@ -350,6 +380,11 @@ def main():
     
     st.sidebar.markdown("**🤖 AI診断用 API設定**")
     ai_api_key = st.sidebar.text_input("API Key (現在プレースホルダー)", type="password", help="ここにOpenAI等のAPIキーを入れると本物のAIが動くようになります")
+    
+    # ⚠️ FMP_API_KEYが未設定の場合の警告を表示
+    if not os.environ.get("FMP_API_KEY"):
+        st.sidebar.warning("⚠️ FMP_API_KEY が設定されていません。時価総額データの取得に失敗する可能性があります。")
+        
     st.sidebar.divider()
     
     region = st.sidebar.selectbox("Market Region", ["US", "Japan"], help="対象市場を選択してください。バックエンドの参照ファイルや無リスク金利が切り替わります。")
