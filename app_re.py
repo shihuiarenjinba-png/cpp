@@ -1,7 +1,7 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v14): FMP_API_KEY の集中管理とローカル/クラウド両対応のシークレット読み込み処理を追加。
+※ 修正版(v15): dotenvインポートエラーの回避と、最適化計算時のNumPy型エラー(UFuncTypeError)を修正。
 """
 
 import os
@@ -13,13 +13,16 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import re
 import random # その他のランダム処理用
-from dotenv import load_dotenv
 
 # =========================================================
 # 🔑 APIキーと環境変数の集中管理 (修正箇所)
 # =========================================================
 # 1. ローカル環境の .env ファイルを読み込む（Streamlit Cloud環境では無視されます）
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass # dotenvがインストールされていない環境(Streamlit Cloud等)ではスキップする
 
 def setup_api_keys():
     """Streamlit Secrets または 環境変数 からAPIキーを安全に取得・設定する"""
@@ -27,7 +30,7 @@ def setup_api_keys():
     
     # パターンA: Streamlit Cloud の secrets.toml から取得を試みる
     try:
-        if "FMP_API_KEY" in st.secrets:
+        if hasattr(st, "secrets") and "FMP_API_KEY" in st.secrets:
             fmp_key = st.secrets["FMP_API_KEY"]
     except Exception:
         pass
@@ -229,7 +232,8 @@ class AuditEngine:
         opt_weights = np.array(weights_record[max_sharpe_idx])
         
         # ② あなた (Self)
-        curr_weights = np.array([current_weights_dict.get(t, 0) for t in available_tickers])
+        # 【修正】dtype=float を指定して UFuncTypeError を防止
+        curr_weights = np.array([current_weights_dict.get(t, 0.0) for t in available_tickers], dtype=float)
         if np.sum(curr_weights) > 0:
             curr_weights /= np.sum(curr_weights)
             
@@ -238,9 +242,10 @@ class AuditEngine:
 
         # ③ 経済 (Economy) : 時価総額加重
         if market_caps is not None and isinstance(market_caps, dict):
-            econ_weights = np.array([market_caps.get(t, 1.0) for t in available_tickers])
+            # 【修正】dtype=float を指定して UFuncTypeError を防止
+            econ_weights = np.array([market_caps.get(t, 1.0) for t in available_tickers], dtype=float)
         else:
-            econ_weights = np.ones(len(available_tickers))
+            econ_weights = np.ones(len(available_tickers), dtype=float)
             
         if np.sum(econ_weights) > 0:
             econ_weights /= np.sum(econ_weights)
@@ -257,7 +262,7 @@ class AuditEngine:
         # --- 効率的フロンティアの描画 ---
         fig = go.Figure()
         
-        # 【修正2】透明度 (opacity=0.3) を設定し、グラフがベタ塗りで潰れるのを解消
+        # 透明度 (opacity=0.3) を設定し、グラフがベタ塗りで潰れるのを解消
         fig.add_trace(go.Scatter(
             x=results[0], y=results[1], mode='markers',
             marker=dict(color=results[2], colorscale='Viridis', showscale=True, size=4, opacity=0.3, colorbar=dict(title="Sharpe Ratio")),
@@ -346,7 +351,7 @@ class AuditEngine:
         pct_10 = np.percentile(final_values, 10)
         pct_90 = np.percentile(final_values, 90)
 
-        # 【修正3】文字が重ならないよう、半透明の背景色(bgcolor)を設定し、上下左右に散らして描画
+        # 文字が重ならないよう、半透明の背景色(bgcolor)を設定し、上下左右に散らして描画
         bg_style = dict(bgcolor="rgba(255, 255, 255, 0.8)", bordercolor="gray", borderwidth=1, font_size=11)
 
         fig.add_vline(x=1.0, line_dash="dash", line_color="red", 
