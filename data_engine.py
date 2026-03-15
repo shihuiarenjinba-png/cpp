@@ -1,7 +1,7 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
-※ 修正版(v9): 予測モデル連携に向けた、インデックス（日付・タイムゾーン）の厳密な同期と欠損値処理の強化
+※ 修正版(v10): 予測モデル連携に向けたインデックスの厳密な同期と、市場平均ウェイト算出のための時価総額取得機能の追加
 """
 
 import pandas as pd
@@ -112,6 +112,35 @@ class DataFetcher:
                 
         # 全リトライ失敗時は空のDataFrameを返す
         return pd.DataFrame()
+
+    @staticmethod
+    @st.cache_data(ttl=86400)  # 時価総額は日次キャッシュ(24時間)で十分
+    def fetch_market_caps(tickers):
+        """
+        【追加】指定されたティッカーの時価総額(Market Cap)を取得する。
+        取得できなかった銘柄はエラーで止めずスキップし、残りの銘柄だけで計算できるよう欠損処理を行う。
+        """
+        if not tickers: return {}
+        if isinstance(tickers, str): tickers = [tickers]
+        
+        market_caps = {}
+        for ticker in tickers:
+            try:
+                tick = yf.Ticker(ticker)
+                # .infoから時価総額を取得（取得できない場合はNoneが返る）
+                mcap = tick.info.get('marketCap')
+                
+                # 時価総額が有効な数値として取得できた場合のみ辞書に追加
+                if mcap is not None and isinstance(mcap, (int, float)) and mcap > 0:
+                    market_caps[ticker] = mcap
+                else:
+                    print(f"Warning: Market Cap data missing or invalid for {ticker}.")
+            except Exception as e:
+                # 取得エラーが発生しても止めずにスキップする
+                print(f"Error fetching Market Cap for {ticker}: {e}")
+                continue
+                
+        return market_caps
 
     @staticmethod
     def validate_tickers(input_dict):
