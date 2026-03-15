@@ -9,12 +9,12 @@ import numpy as np
 import pandas as pd
 from scipy import signal
 from scipy.stats import t
-import statsmodels.api as sm  
+import statsmodels.api as sm
 import warnings
 
 # データ取得エンジン等のインポート
 from data_engine import DataFetcher
-from config import TRADING_DAYS_PER_YEAR, MarketConfig  
+from config import TRADING_DAYS_PER_YEAR, MarketConfig
 
 # 📌 GARCHモデルによる動的ボラティリティ予測用
 try:
@@ -22,7 +22,7 @@ try:
     HAS_ARCH = True
 except ImportError:
     HAS_ARCH = False
-    
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # =========================================================
@@ -145,6 +145,7 @@ class RegimeAnalyzer:
         cycle_days = int(1 / dominant_freq) if dominant_freq > 0 else 0
         return cycle_days
 
+
 # =========================================================
 # ⏳ 過去の危機リプレイクラス
 # =========================================================
@@ -220,6 +221,7 @@ class HistoryTimeMachine:
             "end_value": cumulative.iloc[-1]
         }
 
+
 # =========================================================
 # 🎲 確率的シナリオ生成クラス
 # =========================================================
@@ -244,10 +246,12 @@ class StochasticScenarioGenerator:
                 # 💡 修正ポイント4: GARCHモデルの収束失敗（Iteration limit等）を防ぐため rescale=False 等の安全パラメータを追加
                 am = arch_model(returns * 100, vol='Garch', p=1, q=1, dist='t', rescale=False)
                 res = am.fit(disp='off', show_warning=False)
-                forecasts = res.forecast(horizon=1)
                 
-                # 直近の予測ボラティリティ
-                current_vol = np.sqrt(forecasts.variance.values[-1, :][0]) / 100.0
+                # 💡 追加修正: archのバージョンによる警告を防ぐため reindex=False を追加
+                forecasts = res.forecast(horizon=1, reindex=False)
+                
+                # 直近の予測ボラティリティ (ilocを使用して安全にアクセス)
+                current_vol = np.sqrt(forecasts.variance.iloc[-1, 0]) / 100.0
                 
                 # 最尤推定されたt分布の自由度(nu)を取得 (ファットテールの厚み)
                 if 'nu' in res.params:
@@ -286,6 +290,7 @@ class StochasticScenarioGenerator:
         
         return paths
 
+
 # =========================================================
 # 🔮 プロジェクション統合クラス
 # =========================================================
@@ -295,7 +300,7 @@ class ProjectionCore:
         """
         シナリオジェネレータを呼び出し、TEを加味した上で最終的なパーセンタイル値などを算出する。
         💡 エラー解消：app_re.pyからの引数順序(returns, bm_returns, n_scenarios, n_years)に合わせ、
-           かつ bm_returns を受け取るように修正しました。
+            かつ bm_returns を受け取るように修正しました。
         """
         n_days = int(n_years * TRADING_DAYS_PER_YEAR)
         tracking_error_annual = 0.0
