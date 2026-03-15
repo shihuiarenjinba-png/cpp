@@ -16,6 +16,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import re 
+import random # ダミーデータ生成用に追加
 
 # これまでに作成したモジュールのインポート
 from config import MarketConfig, FACTOR_TRANSLATION
@@ -162,7 +163,7 @@ class AuditEngine:
 
     @staticmethod
     def optimize_and_plot_frontier(asset_returns, current_weights_dict, market_caps=None):
-        """[5ページ目用]: 効率的フロンティアと最適ウェイトの算出 (時価総額データの受け渡し対応)"""
+        """[5ページ目用]: 効率的フロンティアと最適ウェイトの算出 (三点比較・距離計算対応)"""
         if asset_returns is None or asset_returns.empty or len(current_weights_dict) < 2:
             st.info("💡 最適化には2銘柄以上のデータが必要です。")
             return
@@ -198,14 +199,38 @@ class AuditEngine:
         max_sharpe_idx = np.argmax(results[2])
         opt_ret = results[1, max_sharpe_idx]
         opt_std = results[0, max_sharpe_idx]
-        opt_weights = weights_record[max_sharpe_idx]
         
+        # -----------------------------------------------------
+        # 1. 【追加計算】3つのウェイトの算出
+        # -----------------------------------------------------
+        # ① 理論 (Finance) : Max Sharpe
+        opt_weights = np.array(weights_record[max_sharpe_idx])
+        
+        # ② あなた (Self)
         curr_weights = np.array([current_weights_dict.get(t, 0) for t in available_tickers])
         if np.sum(curr_weights) > 0:
             curr_weights /= np.sum(curr_weights)
+            
         curr_ret = np.sum(mean_returns * curr_weights)
         curr_std = np.sqrt(np.dot(curr_weights.T, np.dot(cov_matrix, curr_weights)))
-        
+
+        # ③ 経済 (Economy) : 時価総額加重
+        if market_caps is not None and isinstance(market_caps, dict):
+            econ_weights = np.array([market_caps.get(t, 1.0) for t in available_tickers])
+        else:
+            # 時価総額データがない場合のフォールバック（全て等分）
+            econ_weights = np.ones(len(available_tickers))
+            
+        if np.sum(econ_weights) > 0:
+            econ_weights /= np.sum(econ_weights)
+
+        # -----------------------------------------------------
+        # 2. 【追加計算】2つの距離（Active Share）の算出
+        # -----------------------------------------------------
+        distance_economy = 0.5 * np.sum(np.abs(curr_weights - econ_weights)) * 100
+        distance_finance = 0.5 * np.sum(np.abs(curr_weights - opt_weights)) * 100
+
+        # --- 効率的フロンティアの描画 ---
         fig = go.Figure()
         # Random Portfolios
         fig.add_trace(go.Scatter(
@@ -235,19 +260,32 @@ class AuditEngine:
         )
         st.plotly_chart(fig, use_container_width=True)
         
-        st.markdown("#### ⚖️ Proposed Optimal Weights (Max Sharpe Ratio)")
+        # -----------------------------------------------------
+        # 3. 【UI追加】ポジショニング表示と新しい比較テーブル
+        # -----------------------------------------------------
+        st.markdown("#### 📏 Positioning & Active Share")
+        st.markdown("現在のあなたのポートフォリオが、「市場全体（経済）」と「最適解（理論）」からどの程度乖離しているか（アクティブ・シェア）を示します。")
+        
+        m_col1, m_col2 = st.columns(2)
+        m_col1.metric("Distance vs Economy (経済からの乖離)", f"{distance_economy:.1f}%")
+        m_col2.metric("Distance vs Finance (理論からの乖離)", f"{distance_finance:.1f}%")
+
+        st.markdown("#### ⚖️ Proposed Optimal Weights")
         comp_df = pd.DataFrame({
             "Ticker": available_tickers,
-            "Current Weight (%)": curr_weights * 100,
-            "Optimal Weight (%)": opt_weights * 100,
-            "Difference (%)": (opt_weights - curr_weights) * 100
+            "🏢 経済 (時価総額)": econ_weights * 100,
+            "👤 あなた (現在)": curr_weights * 100,
+            "⚖️ 理論 (Max Sharpe)": opt_weights * 100
         })
         
-        st.dataframe(comp_df.style.format({
-            "Current Weight (%)": "{:.1f}%",
-            "Optimal Weight (%)": "{:.1f}%",
-            "Difference (%)": "{:+.1f}%"
-        }).background_gradient(subset=["Difference (%)"], cmap="RdYlGn"), use_container_width=True)
+        # 「あなた」の列を目立たせるスタイル設定
+        styled_df = comp_df.style.format({
+            "🏢 経済 (時価総額)": "{:.1f}%",
+            "👤 あなた (現在)": "{:.1f}%",
+            "⚖️ 理論 (Max Sharpe)": "{:.1f}%"
+        }).background_gradient(subset=["👤 あなた (現在)"], cmap="Wistia") # オレンジ〜黄色系でハイライト
+        
+        st.dataframe(styled_df, use_container_width=True)
 
     @staticmethod
     def plot_monte_carlo_fanchart(paths):
@@ -384,7 +422,9 @@ def main():
 
             # ダミーの時価総額データ取得（必要に応じてデータ取得処理を実装してください）
             # market_caps = DataFetcher.fetch_market_caps(list(norm_weights.keys()))
-            market_caps = None
+            # TODO: 動作テスト用に乱数でダミーデータを生成しています。本番時には正しいデータ取得に差し替えてください。
+            random.seed(42)
+            market_caps = {ticker: random.uniform(100, 1000) for ticker in norm_weights.keys()}
 
             # 解析実行
             metrics = AdvancedStats.calculate_metrics(returns, benchmark_returns=bm_returns if not bm_returns.empty else None, weights_dict=norm_weights, region=region)
