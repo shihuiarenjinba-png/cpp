@@ -1,8 +1,7 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v12): 5ページ構成（タブ分割）によるUIの完全整理とストーリー立て
-  - 1〜5のUI改善・グラフ追加・10年投影対応版
+※ 修正版(v13): 致命的な時価総額計算バグの修正と、UI/グラフ視認性(重なり・潰れ)の大幅改善版
 """
 
 import streamlit as st
@@ -12,7 +11,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import re
-import random # ダミーデータ生成用に追加
+import random # その他のランダム処理用
 
 # これまでに作成したモジュールのインポート
 from config import MarketConfig, FACTOR_TRANSLATION
@@ -160,7 +159,6 @@ class AuditEngine:
     @staticmethod
     def optimize_and_plot_frontier(asset_returns, current_weights_dict, market_caps=None):
         """[5ページ目用]: 効率的フロンティアと最適ウェイトの算出 (三点比較・距離計算対応)"""
-        # 【修正1】銘柄数チェックを「3銘柄以上」に変更
         tickers = list(current_weights_dict.keys())
         available_tickers = [t for t in tickers if t in asset_returns.columns]
         
@@ -195,7 +193,7 @@ class AuditEngine:
         opt_std = results[0, max_sharpe_idx]
         
         # -----------------------------------------------------
-        # 1. 【追加計算】3つのウェイトの算出
+        # 1. 3つのウェイトの算出
         # -----------------------------------------------------
         # ① 理論 (Finance) : Max Sharpe
         opt_weights = np.array(weights_record[max_sharpe_idx])
@@ -217,24 +215,25 @@ class AuditEngine:
         if np.sum(econ_weights) > 0:
             econ_weights /= np.sum(econ_weights)
             
-        # 【修正1】Economy（市場平均）のリスク・リターンを計算
         econ_ret = np.sum(mean_returns * econ_weights)
         econ_std = np.sqrt(np.dot(econ_weights.T, np.dot(cov_matrix, econ_weights)))
 
         # -----------------------------------------------------
-        # 2. 【追加計算】2つの距離（Active Share）の算出
+        # 2. 2つの距離（Active Share）の算出
         # -----------------------------------------------------
         distance_economy = 0.5 * np.sum(np.abs(curr_weights - econ_weights)) * 100
         distance_finance = 0.5 * np.sum(np.abs(curr_weights - opt_weights)) * 100
 
         # --- 効率的フロンティアの描画 ---
         fig = go.Figure()
-        # Random Portfolios
+        
+        # 【修正2】透明度 (opacity=0.3) を設定し、グラフがベタ塗りで潰れるのを解消
         fig.add_trace(go.Scatter(
             x=results[0], y=results[1], mode='markers',
-            marker=dict(color=results[2], colorscale='Viridis', showscale=True, size=4, colorbar=dict(title="Sharpe Ratio")),
+            marker=dict(color=results[2], colorscale='Viridis', showscale=True, size=4, opacity=0.3, colorbar=dict(title="Sharpe Ratio")),
             name='Simulated Portfolios'
         ))
+        
         # Max Sharpe
         fig.add_trace(go.Scatter(
             x=[opt_std], y=[opt_ret], mode='markers',
@@ -247,14 +246,13 @@ class AuditEngine:
             marker=dict(color='orange', size=14, symbol='x', line=dict(color='black', width=1)),
             name='Current Portfolio'
         ))
-        # 【修正1】市場ドット（Economy）の追加: 青い四角
+        # Economy (Market Cap)
         fig.add_trace(go.Scatter(
             x=[econ_std], y=[econ_ret], mode='markers',
             marker=dict(color='blue', size=14, symbol='square', line=dict(color='black', width=1)),
             name='Economy (Market Cap)'
         ))
         
-        # 【修正1】ラベル変更: Y軸タイトルなどを「Expected Annual Return（予測・期待値）」に明示
         fig.update_layout(
             title="Efficient Frontier (Risk-Return Tradeoff)",
             xaxis_title="Expected Annual Volatility (Risk)",
@@ -282,12 +280,11 @@ class AuditEngine:
             "⚖️ 理論 (Max Sharpe)": opt_weights * 100
         })
         
-        # 「あなた」の列を目立たせるスタイル設定
         styled_df = comp_df.style.format({
             "🏢 経済 (時価総額)": "{:.1f}%",
             "👤 あなた (現在)": "{:.1f}%",
             "⚖️ 理論 (Max Sharpe)": "{:.1f}%"
-        }).background_gradient(subset=["👤 あなた (現在)"], cmap="Wistia") # オレンジ〜黄色系でハイライト
+        }).background_gradient(subset=["👤 あなた (現在)"], cmap="Wistia") 
         
         st.dataframe(styled_df, use_container_width=True)
 
@@ -295,7 +292,6 @@ class AuditEngine:
     def plot_monte_carlo_fanchart(paths):
         """[4ページ目用]: 1万回のシミュレーション推移を扇状で可視化"""
         percentiles = np.percentile(paths, [5, 25, 50, 75, 95], axis=1)
-        # 【修正2】X軸の単位変更: 252で割ってYearsスケールに変更
         days = np.arange(paths.shape[0])
         years = days / 252.0 
         
@@ -307,7 +303,6 @@ class AuditEngine:
         fig.add_trace(go.Scatter(x=years, y=percentiles[2], mode='lines', line=dict(color='darkblue', width=2), name='Median (50th)'))
         fig.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="Break-even")
         
-        # 【修正2】投影期間の反映（タイトルとX軸ラベル）
         fig.update_layout(title="Monte Carlo Projection (10-Year Fan Chart)", xaxis_title="Years", yaxis_title="Portfolio Value", height=450)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -316,18 +311,26 @@ class AuditEngine:
         """[4ページ目用]: 最終資産分布の正確なヒストグラム"""
         fig = px.histogram(final_values, nbins=50, title="Final Value Distribution (10 Years)", labels={'value': 'Final Portfolio Value', 'count': 'Frequency'}, color_discrete_sequence=["steelblue"])
         
-        # 【修正3】各種統計値の計算とラインの追加
         median_val = np.median(final_values)
         mean_val = np.mean(final_values)
         pct_10 = np.percentile(final_values, 10)
         pct_90 = np.percentile(final_values, 90)
 
-        # 【修正3】ラベルの高さ調整: 文字が重ならないように annotation_position を散らす
-        fig.add_vline(x=1.0, line_dash="dash", line_color="red", annotation_text="Break-even", annotation_position="top left")
-        fig.add_vline(x=pct_10, line_dash="dash", line_color="orange", annotation_text=f"10th: {pct_10*100:.0f}%", annotation_position="bottom right")
-        fig.add_vline(x=median_val, line_dash="solid", line_color="green", annotation_text=f"Median: {median_val*100:.0f}%", annotation_position="top right")
-        fig.add_vline(x=mean_val, line_dash="dot", line_color="black", annotation_text=f"Mean: {mean_val*100:.0f}%", annotation_position="bottom left")
-        fig.add_vline(x=pct_90, line_dash="dash", line_color="purple", annotation_text=f"90th: {pct_90*100:.0f}%", annotation_position="top left")
+        # 【修正3】文字が重ならないよう、半透明の背景色(bgcolor)を設定し、上下左右に散らして描画
+        bg_style = dict(bgcolor="rgba(255, 255, 255, 0.8)", bordercolor="gray", borderwidth=1, font_size=11)
+
+        fig.add_vline(x=1.0, line_dash="dash", line_color="red", 
+                      annotation_text="Break-even", annotation_position="top left", annotation=bg_style)
+        fig.add_vline(x=pct_10, line_dash="dash", line_color="orange", 
+                      annotation_text=f"10th: {pct_10*100:.0f}%", annotation_position="bottom right", annotation=bg_style)
+        fig.add_vline(x=median_val, line_dash="solid", line_color="green", 
+                      annotation_text=f"Median: {median_val*100:.0f}%", annotation_position="top right", annotation=bg_style)
+        fig.add_vline(x=mean_val, line_dash="dot", line_color="black", 
+                      annotation_text=f"Mean: {mean_val*100:.0f}%", annotation_position="bottom left", annotation=bg_style)
+        # 90thはMedianやMeanと重なりやすいため、yshiftで強制的に高さを変える
+        fig.add_vline(x=pct_90, line_dash="dash", line_color="purple", 
+                      annotation_text=f"90th: {pct_90*100:.0f}%", annotation_position="top right", 
+                      annotation=dict(bgcolor="rgba(255, 255, 255, 0.8)", bordercolor="gray", borderwidth=1, font_size=11, yshift=25))
         
         fig.update_layout(height=350, margin=dict(l=20, r=20, t=50, b=20))
         st.plotly_chart(fig, use_container_width=True)
@@ -439,9 +442,18 @@ def main():
                 st.warning("⚠️ ベンチマークデータの取得に失敗しました（API制限等）。市場比較やTEの計算はスキップされます。")
                 bm_returns = pd.Series(dtype=float)
 
-            # ダミーの時価総額データ取得
-            random.seed(42)
-            market_caps = {ticker: random.uniform(100, 1000) for ticker in norm_weights.keys()}
+            # ==========================================
+            # 【修正1】ダミーデータを廃止し、実際の時価総額データを取得する処理に変更
+            # ==========================================
+            try:
+                # ※ data_engine.py に DataFetcher.fetch_market_caps が実装されている必要があります。
+                market_caps = DataFetcher.fetch_market_caps(list(norm_weights.keys()), region=region)
+            except AttributeError:
+                st.warning("⚠️ DataFetcherモジュールに fetch_market_caps が未実装です。一時的に各銘柄を均等の時価総額(1.0)として計算します。")
+                market_caps = {ticker: 1.0 for ticker in norm_weights.keys()}
+            except Exception as e:
+                st.warning(f"⚠️ 時価総額データの取得に失敗しました。一時的に各銘柄を均等として扱います。({e})")
+                market_caps = {ticker: 1.0 for ticker in norm_weights.keys()}
 
             # 解析実行
             metrics = AdvancedStats.calculate_metrics(returns, benchmark_returns=bm_returns if not bm_returns.empty else None, weights_dict=norm_weights, region=region)
@@ -455,7 +467,6 @@ def main():
                 res = HistoryTimeMachine.replay_crisis(norm_weights, crisis, region)
                 if res: crisis_results[crisis] = res
                 
-            # 【修正5】n_years=10に変更し、10年分のモンテカルロ投影を実行
             projection = ProjectionCore.run_projection(
                 returns=returns, bm_returns=bm_returns if not bm_returns.empty else None, 
                 n_scenarios=10000, n_years=10
@@ -498,7 +509,6 @@ def main():
                 r2_score = style.get('r_squared', 0.0) * 100
                 
                 col1, col2, col3 = st.columns(3)
-                # 【修正4】ラベルを「Past Annual Return（過去の実測値）」に変更
                 col1.metric("Past Annual Return (過去の実測値)", f"{returns.mean() * 252 * 100:.2f}%")
                 col2.metric("Portfolio Volatility", f"{metrics.get('volatility', 0) * 100:.2f}%")
                 col3.metric("Model Fit (Adjusted R²)", f"{r2_score:.1f}%", help="自身のファクター戦略でどれだけ動きを説明できているか")
