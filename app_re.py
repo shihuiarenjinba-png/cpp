@@ -15,7 +15,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import re 
+import re
 import random # ダミーデータ生成用に追加
 
 # これまでに作成したモジュールのインポート
