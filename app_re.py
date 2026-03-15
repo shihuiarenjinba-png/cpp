@@ -161,8 +161,8 @@ class AuditEngine:
         st.plotly_chart(fig, use_container_width=True)
 
     @staticmethod
-    def optimize_and_plot_frontier(asset_returns, current_weights_dict):
-        """[5ページ目用]: 効率的フロンティアと最適ウェイトの算出"""
+    def optimize_and_plot_frontier(asset_returns, current_weights_dict, market_caps=None):
+        """[5ページ目用]: 効率的フロンティアと最適ウェイトの算出 (時価総額データの受け渡し対応)"""
         if asset_returns is None or asset_returns.empty or len(current_weights_dict) < 2:
             st.info("💡 最適化には2銘柄以上のデータが必要です。")
             return
@@ -299,8 +299,6 @@ def main():
     rebalance_choice = st.sidebar.selectbox("Rebalance Frequency", list(rebalance_options.keys()), help="ポートフォリオの比率を元に戻す頻度。放置すると強い銘柄の比率が勝手に増えます(ドリフト)。")
     rebalance_freq = rebalance_options[rebalance_choice]
 
-    target_te = st.sidebar.slider("Target Tracking Error (%)", min_value=0.5, max_value=15.0, value=3.0, step=0.5, help="運用目標とするトラッキングエラー（乖離リスク）の目安。")
-
     st.sidebar.caption(f"📌 **設定情報:**\n- データセット: `{config['ff_dataset']}`\n- ベンチマーク: `{config['benchmark_ticker']}`")
     
     st.sidebar.markdown("**📤 1. ポートフォリオ一括読込 (オプション)**")
@@ -383,6 +381,10 @@ def main():
             else:
                 st.warning("⚠️ ベンチマークデータの取得に失敗しました（API制限等）。市場比較やTEの計算はスキップされます。")
                 bm_returns = pd.Series(dtype=float)
+
+            # ダミーの時価総額データ取得（必要に応じてデータ取得処理を実装してください）
+            # market_caps = DataFetcher.fetch_market_caps(list(norm_weights.keys()))
+            market_caps = None
 
             # 解析実行
             metrics = AdvancedStats.calculate_metrics(returns, benchmark_returns=bm_returns if not bm_returns.empty else None, weights_dict=norm_weights, region=region)
@@ -524,10 +526,9 @@ def main():
                     te_actual = metrics.get('tracking_error', 0) * 100
                     
                     st.subheader("🎯 Tracking Error Overview")
-                    te_col1, te_col2, te_col3 = st.columns(3)
+                    te_col1, te_col2 = st.columns(2)
                     te_col1.metric("Tracking Error (実績TE)", f"{te_actual:.2f}%")
-                    te_col2.metric(f"Target TE (目標)", f"{target_te:.1f}%", delta=f"{te_actual - target_te:.2f}% (目標との差)", delta_color="inverse")
-                    te_col3.metric("Information Ratio (情報レシオ)", f"{metrics.get('info_ratio', 0):.2f}")
+                    te_col2.metric("Information Ratio (情報レシオ)", f"{metrics.get('info_ratio', 0):.2f}")
                     
                     st.divider()
                     st.subheader("📈 Active Return Spread")
@@ -582,7 +583,8 @@ def main():
                 st.markdown("現在のポートフォリオから、**シャープレシオ（リスク・リターン比）を最大化**する未来の最適ウェイトを提案します。")
                 
                 asset_returns = raw_input_data.pct_change().dropna()
-                AuditEngine.optimize_and_plot_frontier(asset_returns, norm_weights)
+                # 取得した時価総額データ（market_caps）を引数として渡す
+                AuditEngine.optimize_and_plot_frontier(asset_returns, norm_weights, market_caps=market_caps)
 
 if __name__ == "__main__":
     main()
