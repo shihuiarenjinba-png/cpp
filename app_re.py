@@ -1,7 +1,7 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v15): dotenvインポートエラーの回避と、最適化計算時のNumPy型エラー(UFuncTypeError)を修正。
+※ 修正版(v16): 期待リターンの幾何平均(CAGR)化、比較グラフの対数スケール化、ヒストグラムのUI/注釈改善。
 """
 
 import os
@@ -15,7 +15,7 @@ import re
 import random # その他のランダム処理用
 
 # =========================================================
-# 🔑 APIキーと環境変数の集中管理 (修正箇所)
+# 🔑 APIキーと環境変数の集中管理
 # =========================================================
 # 1. ローカル環境の .env ファイルを読み込む（Streamlit Cloud環境では無視されます）
 try:
@@ -200,8 +200,13 @@ class AuditEngine:
             return
             
         returns_df = asset_returns[available_tickers]
-        mean_returns = returns_df.mean() * 252
-        cov_matrix = returns_df.cov() * 252
+        
+        # 【修正①】異常値防止のため、期待リターンを「算術平均」から「幾何平均(CAGR)」へ変更
+        # mean_returns = returns_df.mean() * 252 ではなく、複利を考慮した年率成長率を使用
+        trading_days = 252
+        mean_returns = (1 + returns_df).prod() ** (trading_days / len(returns_df)) - 1
+        
+        cov_matrix = returns_df.cov() * trading_days
         
         # モンテカルロ近似による最適ポートフォリオ探索
         num_portfolios = 5000
@@ -232,7 +237,6 @@ class AuditEngine:
         opt_weights = np.array(weights_record[max_sharpe_idx])
         
         # ② あなた (Self)
-        # 【修正】dtype=float を指定して UFuncTypeError を防止
         curr_weights = np.array([current_weights_dict.get(t, 0.0) for t in available_tickers], dtype=float)
         if np.sum(curr_weights) > 0:
             curr_weights /= np.sum(curr_weights)
@@ -242,7 +246,6 @@ class AuditEngine:
 
         # ③ 経済 (Economy) : 時価総額加重
         if market_caps is not None and isinstance(market_caps, dict):
-            # 【修正】dtype=float を指定して UFuncTypeError を防止
             econ_weights = np.array([market_caps.get(t, 1.0) for t in available_tickers], dtype=float)
         else:
             econ_weights = np.ones(len(available_tickers), dtype=float)
@@ -289,9 +292,9 @@ class AuditEngine:
         ))
         
         fig.update_layout(
-            title="Efficient Frontier (Risk-Return Tradeoff)",
+            title="Efficient Frontier (Risk-Return Tradeoff) - CAGR Based",
             xaxis_title="Expected Annual Volatility (Risk)",
-            yaxis_title="Expected Annual Return",
+            yaxis_title="Expected Annual Return (CAGR)",
             height=450, margin=dict(l=20, r=20, t=50, b=20),
             legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
         )
@@ -344,31 +347,39 @@ class AuditEngine:
     @staticmethod
     def plot_monte_carlo_histogram(final_values):
         """[4ページ目用]: 最終資産分布の正確なヒストグラム"""
-        fig = px.histogram(final_values, nbins=50, title="Final Value Distribution (10 Years)", labels={'value': 'Final Portfolio Value', 'count': 'Frequency'}, color_discrete_sequence=["steelblue"])
+        
+        # 【修正③】ヒストグラムの色を単調な青からモンテカルロと同じ薄い青色に変更
+        fig = px.histogram(
+            final_values, nbins=50, title="Final Value Distribution (10 Years)", 
+            labels={'value': 'Final Portfolio Value', 'count': 'Frequency'}, 
+            color_discrete_sequence=["rgba(70, 130, 180, 0.4)"]
+        )
         
         median_val = np.median(final_values)
         mean_val = np.mean(final_values)
         pct_10 = np.percentile(final_values, 10)
         pct_90 = np.percentile(final_values, 90)
 
-        # 文字が重ならないよう、半透明の背景色(bgcolor)を設定し、上下左右に散らして描画
+        # 文字が重ならないよう、半透明の背景色(bgcolor)を設定
         bg_style = dict(bgcolor="rgba(255, 255, 255, 0.8)", bordercolor="gray", borderwidth=1, font_size=11)
 
+        # 【修正③】平均値や中央値の定義をつけ、重ならないようにyshiftで上下に散らして描画
         fig.add_vline(x=1.0, line_dash="dash", line_color="red", 
                       annotation_text="Break-even", annotation_position="top left", annotation=bg_style)
         fig.add_vline(x=pct_10, line_dash="dash", line_color="orange", 
-                      annotation_text=f"10th: {pct_10*100:.0f}%", annotation_position="bottom right", annotation=bg_style)
+                      annotation_text=f"10th: {pct_10*100:.0f}%", annotation_position="top right", annotation=dict(**bg_style, yshift=0))
         fig.add_vline(x=median_val, line_dash="solid", line_color="green", 
-                      annotation_text=f"Median: {median_val*100:.0f}%", annotation_position="top right", annotation=bg_style)
+                      annotation_text=f"Median(中央値): {median_val*100:.0f}%", annotation_position="top right", annotation=dict(**bg_style, yshift=25))
         fig.add_vline(x=mean_val, line_dash="dot", line_color="black", 
-                      annotation_text=f"Mean: {mean_val*100:.0f}%", annotation_position="bottom left", annotation=bg_style)
-        # 90thはMedianやMeanと重なりやすいため、yshiftで強制的に高さを変える
+                      annotation_text=f"Mean(平均値): {mean_val*100:.0f}%", annotation_position="top right", annotation=dict(**bg_style, yshift=50))
         fig.add_vline(x=pct_90, line_dash="dash", line_color="purple", 
-                      annotation_text=f"90th: {pct_90*100:.0f}%", annotation_position="top right", 
-                      annotation=dict(bgcolor="rgba(255, 255, 255, 0.8)", bordercolor="gray", borderwidth=1, font_size=11, yshift=25))
+                      annotation_text=f"90th: {pct_90*100:.0f}%", annotation_position="top right", annotation=dict(**bg_style, yshift=75))
         
         fig.update_layout(height=350, margin=dict(l=20, r=20, t=50, b=20))
         st.plotly_chart(fig, use_container_width=True)
+        
+        # 【修正③】プロ向けの注釈テキストを追加
+        st.caption("💡 **プロの視点:** 平均値(Mean)が中央値(Median)より右に大きくズレている場合、一部の大当たりシナリオに引っ張られた「一発逆転狙い」のリスキーなポートフォリオ特性を示唆します。")
 
 
 # =========================================================
@@ -483,7 +494,7 @@ def main():
                 bm_returns = pd.Series(dtype=float)
 
             # ==========================================
-            # 【修正1】ダミーデータを廃止し、実際の時価総額データを取得する処理に変更
+            # 実際の時価総額データを取得する処理
             # ==========================================
             try:
                 # ※ data_engine.py に DataFetcher.fetch_market_caps が実装されている必要があります。
@@ -568,6 +579,10 @@ def main():
                 else:
                     aligned_growth = pd.concat([synthetic_portfolio.rename("Portfolio"), (1+bm_returns).cumprod()*100], axis=1).dropna()
                     fig_rel = px.line(aligned_growth, labels={'value': 'Cumulative Return (Base=100)', 'index': 'Date'}, title="Portfolio vs Benchmark Growth")
+                    
+                    # 【修正②】成長率の錯覚を防ぐため、比較グラフを「対数スケール」に設定
+                    fig_rel.update_yaxes(type="log")
+                    
                     fig_rel.update_layout(height=400, margin=dict(l=20, r=20, t=50, b=20))
                     st.plotly_chart(fig_rel, use_container_width=True)
 
