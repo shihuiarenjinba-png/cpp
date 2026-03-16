@@ -1,7 +1,7 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v18): 期待リターンの対数平均化によるクラッシュ防止、比較グラフのシンプル化、ヒストグラムUI改善。
+※ 修正版(v21): 【ステップ3】最適化タブでの現在ウェイト計算漏れ（空白・大文字小文字の不一致）を修正。
 """
 
 import os
@@ -188,7 +188,11 @@ class AuditEngine:
     @staticmethod
     def optimize_and_plot_frontier(asset_returns, current_weights_dict, market_caps=None):
         """[5ページ目用]: 効率的フロンティアと最適ウェイトの算出 (対数リターンベースで堅牢化)"""
-        tickers = list(current_weights_dict.keys())
+        
+        # 【ステップ 3】 辞書のキーを確実にクリーニングする（空白削除と大文字化）
+        clean_weights_dict = {str(k).strip().upper(): float(v) for k, v in current_weights_dict.items()}
+        
+        tickers = list(clean_weights_dict.keys())
         available_tickers = [t for t in tickers if t in asset_returns.columns]
         
         if len(available_tickers) < 3:
@@ -197,12 +201,12 @@ class AuditEngine:
             
         returns_df = asset_returns[available_tickers]
         
-        # 【修正】データ不足(ゼロ除算)によるクラッシュを防ぐガード節
+        # データ不足(ゼロ除算)によるクラッシュを防ぐガード節
         if returns_df.empty or len(returns_df) < 10:
             st.warning("⚠️ 最適化に必要なデータが不足しています。")
             return
         
-        # 【修正】べき乗によるクラッシュを排除し、対数リターン(幾何平均)の算術計算に統一
+        # べき乗によるクラッシュを排除し、対数リターン(幾何平均)の算術計算に統一
         trading_days = 252
         log_returns = np.log(1 + returns_df)
         mean_returns = np.exp(log_returns.mean() * trading_days) - 1
@@ -238,7 +242,8 @@ class AuditEngine:
         opt_weights = np.array(weights_record[max_sharpe_idx])
         
         # ② あなた (Self)
-        curr_weights = np.array([current_weights_dict.get(t, 0.0) for t in available_tickers], dtype=np.float64)
+        # クリーニング済みの辞書から安全に取得する
+        curr_weights = np.array([clean_weights_dict.get(t, 0.0) for t in available_tickers], dtype=np.float64)
         if np.sum(curr_weights) > 0:
             curr_weights /= np.sum(curr_weights)
             
@@ -248,10 +253,12 @@ class AuditEngine:
         # ③ 経済 (Economy) : 時価総額加重
         # 時価総額加重計算の float64 固定化と異常値ガード
         if market_caps is not None and isinstance(market_caps, dict):
-            valid_caps = [v for v in market_caps.values() if isinstance(v, (int, float)) and v > 0]
+            # market_caps のキーも念のためクリーニングして照合する
+            clean_caps = {str(k).strip().upper(): v for k, v in market_caps.items()}
+            valid_caps = [v for v in clean_caps.values() if isinstance(v, (int, float)) and v > 0]
             default_cap = np.median(valid_caps) if valid_caps else 1.0
             
-            econ_weights = np.array([market_caps.get(t, default_cap) for t in available_tickers], dtype=np.float64)
+            econ_weights = np.array([clean_caps.get(t, default_cap) for t in available_tickers], dtype=np.float64)
         else:
             econ_weights = np.ones(len(available_tickers), dtype=np.float64)
             
@@ -351,7 +358,7 @@ class AuditEngine:
 
     @staticmethod
     def plot_monte_carlo_histogram(final_values):
-        """[4ページ目用]: 最終資産分布の正確なヒストグラム"""
+        """[4ページ目用]: 最終資産分布の正確なヒストグラム（視認性改善版）"""
         
         fig = px.histogram(
             final_values, nbins=50, title="Final Value Distribution (10 Years)", 
@@ -364,23 +371,25 @@ class AuditEngine:
         pct_10 = np.percentile(final_values, 10)
         pct_90 = np.percentile(final_values, 90)
 
-        # 【修正】ヒストグラムの注釈表示の改善 (倍率表記と背景色の追加、重なり防止)
-        bg_style = dict(bgcolor="rgba(255, 255, 255, 0.9)", bordercolor="gray", borderwidth=1, font_size=11)
-
-        fig.add_vline(x=1.0, line_dash="dash", line_color="red", 
-                      annotation_text="Break-even(1.0倍)", annotation_position="top left", annotation=bg_style)
-        fig.add_vline(x=pct_10, line_dash="dash", line_color="orange", 
-                      annotation_text=f"10th: {pct_10*100:.0f}% ({pct_10:.1f}倍)", annotation_position="top right", annotation=dict(**bg_style, yshift=0))
-        fig.add_vline(x=median_val, line_dash="solid", line_color="green", 
-                      annotation_text=f"Median(中央値): {median_val*100:.0f}% ({median_val:.1f}倍)", annotation_position="top right", annotation=dict(**bg_style, yshift=25))
-        fig.add_vline(x=mean_val, line_dash="dot", line_color="black", 
-                      annotation_text=f"Mean(平均値): {mean_val*100:.0f}% ({mean_val:.1f}倍)", annotation_position="top right", annotation=dict(**bg_style, yshift=50))
-        fig.add_vline(x=pct_90, line_dash="dash", line_color="purple", 
-                      annotation_text=f"90th: {pct_90*100:.0f}% ({pct_90:.1f}倍)", annotation_position="top right", annotation=dict(**bg_style, yshift=75))
+        # グラフ内は「縦線」のみを描画し、テキストは入れない（重なり防止）
+        fig.add_vline(x=1.0, line_dash="dash", line_color="red")
+        fig.add_vline(x=pct_10, line_dash="dash", line_color="orange")
+        fig.add_vline(x=median_val, line_dash="solid", line_color="green")
+        fig.add_vline(x=mean_val, line_dash="dot", line_color="black")
+        fig.add_vline(x=pct_90, line_dash="dash", line_color="purple")
         
         fig.update_layout(height=350, margin=dict(l=20, r=20, t=50, b=20))
         st.plotly_chart(fig, use_container_width=True)
         
+        # グラフの下に、重ならない綺麗な凡例（サマリー）を配置
+        st.markdown("##### 📊 分布のサマリー（投資元本 = 1.0倍）")
+        l_col1, l_col2, l_col3, l_col4, l_col5 = st.columns(5)
+        l_col1.markdown(f"**🔴 元本ライン**<br>1.00倍", unsafe_allow_html=True)
+        l_col2.markdown(f"**🟠 下位10%**<br>{pct_10:.2f}倍 ({pct_10*100:.0f}%)", unsafe_allow_html=True)
+        l_col3.markdown(f"**🟢 中央値**<br>{median_val:.2f}倍 ({median_val*100:.0f}%)", unsafe_allow_html=True)
+        l_col4.markdown(f"**⚫ 平均値**<br>{mean_val:.2f}倍 ({mean_val*100:.0f}%)", unsafe_allow_html=True)
+        l_col5.markdown(f"**🟣 上位10%**<br>{pct_90:.2f}倍 ({pct_90*100:.0f}%)", unsafe_allow_html=True)
+
         st.caption("💡 **プロの視点:** 平均値(Mean)が中央値(Median)より右に大きくズレている場合、一部の大当たりシナリオに引っ張られた「一発逆転狙い」のリスキーなポートフォリオ特性を示唆します。")
 
 
@@ -578,23 +587,31 @@ def main():
                 if bm_returns.empty:
                     st.info("💡 データ不足のため表示できません（ベンチマークデータの取得に失敗しました）。")
                 else:
-                    # 【修正】超シンプル化: 過去の実績リターンから100スタートの推移を個別に作成
+                    # 【ステップ 1】 グラフの同化解消とシンプル化
+                    # 無理にDataFrameを結合せず、独立した系列として描画する
                     port_growth = (1 + returns).cumprod() * 100
                     bm_growth = (1 + bm_returns).cumprod() * 100
                     
-                    # 欠損値を前詰め(ffill)することで、期間ズレによるグラフの形が同一化するのを防ぐ
-                    aligned_growth = pd.concat([port_growth.rename("Portfolio"), bm_growth.rename("Benchmark")], axis=1).ffill().dropna()
+                    fig_rel = go.Figure()
                     
-                    if not aligned_growth.empty:
-                        # プロット直前にもう一度起点を100に厳密に合わせる
-                        aligned_growth = aligned_growth.div(aligned_growth.iloc[0]) * 100
+                    # ポートフォリオの線を追加
+                    if not port_growth.empty:
+                        fig_rel.add_trace(go.Scatter(x=port_growth.index, y=port_growth.values, mode='lines', name='Portfolio', line=dict(color='#1f77b4', width=2)))
                         
-                        fig_rel = px.line(aligned_growth, labels={'value': 'Cumulative Return (Base=100)', 'index': 'Date'}, title="Portfolio vs Benchmark Growth")
-                        fig_rel.update_yaxes(type="log") # 成長率の錯覚を防ぐため対数スケールに設定
-                        fig_rel.update_layout(height=400, margin=dict(l=20, r=20, t=50, b=20))
-                        st.plotly_chart(fig_rel, use_container_width=True)
-                    else:
-                        st.warning("⚠️ グラフを描画するための共通期間データがありません。")
+                    # ベンチマークの線を追加
+                    if not bm_growth.empty:
+                        fig_rel.add_trace(go.Scatter(x=bm_growth.index, y=bm_growth.values, mode='lines', name='Benchmark', line=dict(color='#ff7f0e', dash='dash', width=2)))
+                    
+                    fig_rel.update_layout(
+                        title="Portfolio vs Benchmark Growth (Base=100)",
+                        xaxis_title="Date",
+                        yaxis_title="Cumulative Return (Log Scale)",
+                        yaxis_type="log", # 成長率の錯覚を防ぐため対数スケールに設定
+                        height=400, 
+                        margin=dict(l=20, r=20, t=50, b=20),
+                        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+                    )
+                    st.plotly_chart(fig_rel, use_container_width=True)
 
             # ---------------------------------------------------------
             # --- Page 2: 要因分析 (Factor Attribution) ---
