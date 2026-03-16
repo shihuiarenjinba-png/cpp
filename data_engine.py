@@ -1,7 +1,7 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
-※ 修正版(v11): 時価総額取得の堅牢化（DBキャッシュ & FMP APIフォールバックの実装）、引数エラーの解消
+※ 修正版(v12): 時価総額の欠損値に対する中央値補完、Fama-Frenchファクターの単位(100倍)統一処理を強化
 """
 
 import pandas as pd
@@ -149,12 +149,13 @@ class DataFetcher:
         """
         指定されたティッカーの時価総額(Market Cap)を取得する。
         DBキャッシュ -> yfinance -> FMP API の多層フォールバックで堅牢に取得。
+        【修正 F】取得エラー時の安全な中央値補完と float 化
         """
         if not tickers: return {}
         if isinstance(tickers, str): tickers = [tickers]
         
         init_db()
-        market_caps = {}
+        fetched_caps = {}
         
         for ticker in tickers:
             mcap = None
@@ -167,7 +168,7 @@ class DataFetcher:
                 row = c.fetchone()
                 conn.close()
                 if row and row[0] is not None and row[0] > 0:
-                    market_caps[ticker] = row[0]
+                    fetched_caps[ticker] = row[0]
                     continue # DBにあれば次へ
             except Exception as e:
                 print(f"DB Read Error for {ticker}: {e}")
@@ -196,7 +197,7 @@ class DataFetcher:
 
             # 4. 取得できた場合は結果を辞書に格納し、次回のためにDBへ保存
             if mcap is not None and isinstance(mcap, (int, float)) and mcap > 0:
-                market_caps[ticker] = mcap
+                fetched_caps[ticker] = mcap
                 try:
                     conn = sqlite3.connect(DB_PATH)
                     c = conn.cursor()
@@ -209,7 +210,19 @@ class DataFetcher:
             else:
                 print(f"Warning: Market Cap data missing or invalid for {ticker} across all sources.")
                 
-        return market_caps
+        # 【修正 F】補完ロジック: 取得できた有効な時価総額の中央値を算出
+        valid_caps = [float(v) for v in fetched_caps.values() if v > 0]
+        fallback_cap = float(np.median(valid_caps)) if valid_caps else 1e10  # 全滅時は安全な中立値(10B)を代入
+        
+        # 最終的に全ての要求ティッカーに対して確実な float 値を返す
+        final_market_caps = {}
+        for ticker in tickers:
+            if ticker in fetched_caps and fetched_caps[ticker] > 0:
+                final_market_caps[ticker] = float(fetched_caps[ticker])
+            else:
+                final_market_caps[ticker] = fallback_cap
+                
+        return final_market_caps
 
     @staticmethod
     def validate_tickers(input_dict):
@@ -353,6 +366,7 @@ class DataFetcher:
         """
         Fama-Frenchの純粋な5ファクターデータ（Mkt-RF, SMB, HML, RMW, CMA）と
         無リスク金利（RF）をKenneth Frenchのライブラリから取得する。
+        【修正 E】 単位の自動変換(100倍問題の解消)
         """
         try:
             # 5ファクターデータセットの取得を試行
@@ -375,10 +389,10 @@ class DataFetcher:
             if not has_mkt or not all(any(req in c.upper() for c in ff_data.columns) for req in required_cols):
                 print(f"Warning: Dataset {dataset_name} does not contain all required 5 factors and RF.")
             
-            # スケール統一の厳格化
+            # 【修正 E】スケール統一の厳格化
             # Ken Frenchのデータは原則パーセント（1.0 = 1%）。
-            # yfinanceのpct_change()は小数（0.01 = 1%）なので、確実に100で割る。
-            if ff_data.abs().max().max() > 1.0 or ff_data.abs().mean().mean() > 0.05:
+            # 最大値が0.5を超える場合、パーセント表記とみなして100で割り小数(0.01 = 1%)に統一する
+            if ff_data.max().max() > 0.5:
                 ff_data = ff_data / 100.0
             
             # 💡【重要】インデックスの厳密な正規化 (予測モデルとの完全同期のため)
@@ -396,8 +410,9 @@ class DataFetcher:
             if not any('RF' in c.upper() for c in ff_data.columns):
                 ff_data['RF'] = 0.0
             
-            # 💡 エラーハンドリング: ファクターデータの欠損を直前の値で埋める
-            return ff_data.ffill()
+            # エラーハンドリング: ファクターデータの欠損を前後の値で線形補間して埋める
+            return ff_data.interpolate(method='linear').ffill().bfill()
+            
         except Exception as e:
             # エラー時は何が失敗したのかログに残す
             print(f"FF Data Error for dataset '{dataset_name}': {e}")
