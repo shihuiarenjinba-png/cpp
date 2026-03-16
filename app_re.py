@@ -1,7 +1,7 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 【全ステップ完了版】ベンチマーク独立化、モンテカルロ損益率化、最適化エンジン高度化(ディリクレ分布＋強制エントリー)を実装。
+※ 【UI同期・最適化修正版】ファンチャートの損益率化、ヒストグラムとの視覚的同期、および最適化タブの距離計算バイパスロジックを追加。
 """
 
 import os
@@ -244,10 +244,8 @@ class AuditEngine:
         num_portfolios = 5000
         np.random.seed(42)
         
-        # 【ステップ 3】ディリクレ分布を使用して、端（極端なウェイト）まで広がるように生成
         random_weights = np.random.dirichlet(np.ones(len(available_tickers)), num_portfolios)
         
-        # 【ステップ 3】ランダムウェイトのリストに「現在」と「経済」を強制追加する（逆転防止）
         weights_list = list(random_weights)
         weights_list.append(curr_weights)
         weights_list.append(econ_weights)
@@ -271,10 +269,16 @@ class AuditEngine:
         opt_weights = np.array(weights_list[max_sharpe_idx])
 
         # -----------------------------------------------------
-        # 3. 2つの距離（Active Share）の算出
+        # 3. 2つの距離（Active Share）の算出とバイパスロジック
         # -----------------------------------------------------
         distance_economy = 0.5 * np.sum(np.abs(curr_weights - econ_weights)) * 100
         distance_finance = 0.5 * np.sum(np.abs(curr_weights - opt_weights)) * 100
+
+        # 【修正項目 3】バイパスロジック: 銘柄が1つだけの場合や、浮動小数点レベルの極微小な差異(0.1%未満)は完全に0.0%とする
+        if len(available_tickers) <= 1 or distance_economy < 0.1:
+            distance_economy = 0.0
+        if len(available_tickers) <= 1 or distance_finance < 0.1:
+            distance_finance = 0.0
 
         # --- 効率的フロンティアの描画 ---
         fig = go.Figure()
@@ -343,8 +347,12 @@ class AuditEngine:
     @staticmethod
     def plot_monte_carlo_fanchart(paths):
         """[4ページ目用]: 1万回のシミュレーション推移を扇状で可視化"""
-        percentiles = np.percentile(paths, [5, 25, 50, 75, 95], axis=1)
-        days = np.arange(paths.shape[0])
+        
+        # 【修正項目 1】パス全体を資産倍率(1.0基準)から、損益率(%基準)に変換
+        profit_paths = (paths - 1.0) * 100
+        
+        percentiles = np.percentile(profit_paths, [5, 25, 50, 75, 95], axis=1)
+        days = np.arange(profit_paths.shape[0])
         years = days / 252.0 
         
         fig = go.Figure()
@@ -353,9 +361,11 @@ class AuditEngine:
         fig.add_trace(go.Scatter(x=years, y=percentiles[3], line=dict(width=0), showlegend=False))
         fig.add_trace(go.Scatter(x=years, y=percentiles[1], fill='tonexty', fillcolor='rgba(70, 130, 180, 0.4)', line=dict(width=0), name='25th-75th Percentile'))
         fig.add_trace(go.Scatter(x=years, y=percentiles[2], mode='lines', line=dict(color='darkblue', width=2), name='Median (50th)'))
-        fig.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="Break-even")
         
-        fig.update_layout(title="Monte Carlo Projection (10-Year Fan Chart)", xaxis_title="Years", yaxis_title="Portfolio Value", height=450)
+        # 【修正項目 1】Y=0.0に赤色破線を設定し、ブレークイーブンを明示
+        fig.add_hline(y=0.0, line_dash="dash", line_color="red", annotation_text="Break-even (0%)")
+        
+        fig.update_layout(title="Monte Carlo Projection (10-Year Fan Chart)", xaxis_title="Years", yaxis_title="Total Return (%)", height=450)
         st.plotly_chart(fig, use_container_width=True)
 
     @staticmethod
@@ -376,7 +386,7 @@ class AuditEngine:
         pct_10 = np.percentile(profit_pct, 10)
         pct_90 = np.percentile(profit_pct, 90)
 
-        # グラフ内は縦線のみを描画し、テキストは入れない（重なり防止）
+        # 【修正項目 2】グラフ内は縦線のみを描画し、元本ライン(0%)は赤色破線で統一
         fig.add_vline(x=0.0, line_dash="dash", line_color="red")
         fig.add_vline(x=pct_10, line_dash="dash", line_color="orange")
         fig.add_vline(x=median_val, line_dash="solid", line_color="green")
