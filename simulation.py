@@ -3,6 +3,7 @@ simulation.py
 GARCHモデル、t分布を用いたモンテカルロ・シミュレーション、および過去の危機のタイムマシンテストを行うモジュール
 【アップデート】過去危機のSurvivor Weighting（動的再配分）、GARCH最尤法（MLE）、ローリング回帰（動的エクスポージャー）、
 および トラッキングエラー（TE）を反映した確率的シナリオ生成を実装。
+※ 修正版(v13): モンテカルロのドリフト項を幾何平均(対数リターン)ベースに修正し、長期シミュレーションの異常発散を防止。
 """
 
 import numpy as np
@@ -49,7 +50,7 @@ class DynamicFactorAnalyzer:
             
             if ff_data is None or ff_data.empty: return None
             
-            # 💡 修正ポイント1: インデックスの型を明示的にDatetimeに変換してからPeriodにすることで、マージの空振りを防ぐ
+            # インデックスの型を明示的にDatetimeに変換してからPeriodにすることで、マージの空振りを防ぐ
             target_monthly.index = pd.to_datetime(target_monthly.index).to_period('M')
             ff_data.index = pd.to_datetime(ff_data.index).to_period('M')
             
@@ -58,7 +59,7 @@ class DynamicFactorAnalyzer:
             
             if len(combined) < window_months + 1: return None
             
-            # 💡 修正ポイント2: カラム取得を安全な関数に切り出し、[0]での IndexError (即死) を回避
+            # カラム取得を安全な関数に切り出し、[0]での IndexError (即死) を回避
             def _get_col(search_terms):
                 cols = [c for c in combined.columns if any(term in c.upper() for term in search_terms)]
                 return cols[0] if cols else None
@@ -198,7 +199,7 @@ class HistoryTimeMachine:
         is_alive = crisis_returns.notna()
         active_weights = is_alive.multiply(w_series, axis=1)
         
-        # 💡 修正ポイント3: ウェイト合計が0になる日（全銘柄データなし）のゼロ除算を防ぐガード処理
+        # ウェイト合計が0になる日（全銘柄データなし）のゼロ除算を防ぐガード処理
         weight_sums = active_weights.sum(axis=1).replace(0, np.nan)
         normalized_active_weights = active_weights.div(weight_sums, axis=0)
         
@@ -231,10 +232,13 @@ class StochasticScenarioGenerator:
         """
         GARCH(1,1)とt分布を組み合わせたモンテカルロ・シミュレーション。
         ポートフォリオ固有のトラッキングエラー（TE）を分散に加味する。
+        【修正 G】期待リターンを算術平均から幾何平均(対数リターン)ベースに変更。
         """
         if returns is None or len(returns) < 30: return None
         
-        mu_daily = returns.mean()
+        # 💡 修正 G: 異常な発散を防ぐため、算術平均ではなく対数リターンの平均(幾何平均ベース)を使用
+        log_returns = np.log(1 + returns)
+        base_drift = log_returns.mean()
         
         # デフォルトのパラメータ
         current_vol = returns.std()
@@ -243,11 +247,11 @@ class StochasticScenarioGenerator:
         # 1. 現在のボラティリティ・レジームと分布の厚みをGARCHモデルから取得
         if HAS_ARCH and len(returns) > 252:
             try:
-                # 💡 修正ポイント4: GARCHモデルの収束失敗（Iteration limit等）を防ぐため rescale=False 等の安全パラメータを追加
+                # GARCHモデルの収束失敗（Iteration limit等）を防ぐため rescale=False 等の安全パラメータを追加
                 am = arch_model(returns * 100, vol='Garch', p=1, q=1, dist='t', rescale=False)
                 res = am.fit(disp='off', show_warning=False)
                 
-                # 💡 追加修正: archのバージョンによる警告を防ぐため reindex=False を追加
+                # archのバージョンによる警告を防ぐため reindex=False を追加
                 forecasts = res.forecast(horizon=1, reindex=False)
                 
                 # 直近の予測ボラティリティ (ilocを使用して安全にアクセス)
@@ -261,7 +265,7 @@ class StochasticScenarioGenerator:
                 print(f"GARCH fallback triggered: {e}")
                 pass
         
-        # 💡 追加実装: トラッキングエラー（アクティブリスク）を分散に加算
+        # トラッキングエラー（アクティブリスク）を分散に加算
         # TE(年率)を日次化し、市場ボラティリティと合成 (σ_total^2 = σ_market^2 + σ_TE^2)
         te_daily = tracking_error_annual / np.sqrt(TRADING_DAYS_PER_YEAR)
         adjusted_vol = np.sqrt(current_vol**2 + te_daily**2)
@@ -277,8 +281,12 @@ class StochasticScenarioGenerator:
         random_shocks = t.rvs(df, loc=0, scale=scale_factor, size=(n_days, n_scenarios))
         
         # 3. シナリオパスの生成 (ベクトル化演算で高速化)
-        # S_t = S_{t-1} * exp((mu - sigma^2/2) + shock)
-        drift = mu_daily - (0.5 * adjusted_vol**2)
+        # S_t = S_{t-1} * exp(drift + shock)
+        # 💡 修正 G: すでに対数リターン平均(base_drift)に元のボラティリティ減価が含まれているため、
+        # 追加で加味したTE分のペナルティ(- 0.5 * te_daily^2)のみを差し引く
+        te_penalty = 0.5 * (te_daily**2)
+        drift = base_drift - te_penalty
+        
         daily_log_returns = drift + random_shocks
         
         # 累積リターンを計算 (初期値 1.0 = 100%)
@@ -299,13 +307,11 @@ class ProjectionCore:
     def run_projection(returns, bm_returns=None, n_scenarios=10000, n_years=1):
         """
         シナリオジェネレータを呼び出し、TEを加味した上で最終的なパーセンタイル値などを算出する。
-        💡 エラー解消：app_re.pyからの引数順序(returns, bm_returns, n_scenarios, n_years)に合わせ、
-            かつ bm_returns を受け取るように修正しました。
         """
         n_days = int(n_years * TRADING_DAYS_PER_YEAR)
         tracking_error_annual = 0.0
 
-        # 💡 TEの自動計算ロジック
+        # TEの自動計算ロジック
         if bm_returns is not None:
             # ポートフォリオとベンチマークの日付を同期して差分を計算
             aligned = pd.concat([returns.rename("Port"), bm_returns.rename("BM")], axis=1).dropna()
