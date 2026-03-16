@@ -1,7 +1,7 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v21): 【ステップ3】最適化タブでの現在ウェイト計算漏れ（空白・大文字小文字の不一致）を修正。
+※ 【全ステップ完了版】ベンチマーク独立化、モンテカルロ損益率化、最適化エンジン高度化(ディリクレ分布＋強制エントリー)を実装。
 """
 
 import os
@@ -187,9 +187,8 @@ class AuditEngine:
 
     @staticmethod
     def optimize_and_plot_frontier(asset_returns, current_weights_dict, market_caps=None):
-        """[5ページ目用]: 効率的フロンティアと最適ウェイトの算出 (対数リターンベースで堅牢化)"""
+        """[5ページ目用]: 効率的フロンティアと最適ウェイトの算出"""
         
-        # 【ステップ 3】 辞書のキーを確実にクリーニングする（空白削除と大文字化）
         clean_weights_dict = {str(k).strip().upper(): float(v) for k, v in current_weights_dict.items()}
         
         tickers = list(clean_weights_dict.keys())
@@ -206,43 +205,17 @@ class AuditEngine:
             st.warning("⚠️ 最適化に必要なデータが不足しています。")
             return
         
-        # べき乗によるクラッシュを排除し、対数リターン(幾何平均)の算術計算に統一
+        # 対数リターン(幾何平均)の算術計算に統一
         trading_days = 252
         log_returns = np.log(1 + returns_df)
         mean_returns = np.exp(log_returns.mean() * trading_days) - 1
         
         cov_matrix = returns_df.cov() * trading_days
         
-        # モンテカルロ近似による最適ポートフォリオ探索
-        num_portfolios = 5000
-        results = np.zeros((3, num_portfolios))
-        weights_record = []
-        
-        np.random.seed(42)
-        for i in range(num_portfolios):
-            weights = np.random.random(len(available_tickers))
-            weights /= np.sum(weights)
-            weights_record.append(weights)
-            
-            p_ret = np.sum(mean_returns * weights)
-            p_std = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-            
-            results[0,i] = p_std
-            results[1,i] = p_ret
-            results[2,i] = p_ret / p_std if p_std > 0 else 0
-            
-        max_sharpe_idx = np.argmax(results[2])
-        opt_ret = results[1, max_sharpe_idx]
-        opt_std = results[0, max_sharpe_idx]
-        
         # -----------------------------------------------------
-        # 1. 3つのウェイトの算出
+        # 1. 基準となるウェイト（あなた ＆ 経済）を先に算出
         # -----------------------------------------------------
-        # ① 理論 (Finance) : Max Sharpe
-        opt_weights = np.array(weights_record[max_sharpe_idx])
-        
         # ② あなた (Self)
-        # クリーニング済みの辞書から安全に取得する
         curr_weights = np.array([clean_weights_dict.get(t, 0.0) for t in available_tickers], dtype=np.float64)
         if np.sum(curr_weights) > 0:
             curr_weights /= np.sum(curr_weights)
@@ -251,13 +224,10 @@ class AuditEngine:
         curr_std = np.sqrt(np.dot(curr_weights.T, np.dot(cov_matrix, curr_weights)))
 
         # ③ 経済 (Economy) : 時価総額加重
-        # 時価総額加重計算の float64 固定化と異常値ガード
         if market_caps is not None and isinstance(market_caps, dict):
-            # market_caps のキーも念のためクリーニングして照合する
             clean_caps = {str(k).strip().upper(): v for k, v in market_caps.items()}
             valid_caps = [v for v in clean_caps.values() if isinstance(v, (int, float)) and v > 0]
             default_cap = np.median(valid_caps) if valid_caps else 1.0
-            
             econ_weights = np.array([clean_caps.get(t, default_cap) for t in available_tickers], dtype=np.float64)
         else:
             econ_weights = np.ones(len(available_tickers), dtype=np.float64)
@@ -269,7 +239,39 @@ class AuditEngine:
         econ_std = np.sqrt(np.dot(econ_weights.T, np.dot(cov_matrix, econ_weights)))
 
         # -----------------------------------------------------
-        # 2. 2つの距離（Active Share）の算出
+        # 2. モンテカルロ近似による最適ポートフォリオ探索（ディリクレ分布＋強制エントリー）
+        # -----------------------------------------------------
+        num_portfolios = 5000
+        np.random.seed(42)
+        
+        # 【ステップ 3】ディリクレ分布を使用して、端（極端なウェイト）まで広がるように生成
+        random_weights = np.random.dirichlet(np.ones(len(available_tickers)), num_portfolios)
+        
+        # 【ステップ 3】ランダムウェイトのリストに「現在」と「経済」を強制追加する（逆転防止）
+        weights_list = list(random_weights)
+        weights_list.append(curr_weights)
+        weights_list.append(econ_weights)
+        
+        total_portfolios = len(weights_list)
+        results = np.zeros((3, total_portfolios))
+        
+        for i, weights in enumerate(weights_list):
+            p_ret = np.sum(mean_returns * weights)
+            p_std = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+            
+            results[0,i] = p_std
+            results[1,i] = p_ret
+            results[2,i] = p_ret / p_std if p_std > 0 else 0
+            
+        max_sharpe_idx = np.argmax(results[2])
+        opt_ret = results[1, max_sharpe_idx]
+        opt_std = results[0, max_sharpe_idx]
+        
+        # ① 理論 (Finance) : Max Sharpe
+        opt_weights = np.array(weights_list[max_sharpe_idx])
+
+        # -----------------------------------------------------
+        # 3. 2つの距離（Active Share）の算出
         # -----------------------------------------------------
         distance_economy = 0.5 * np.sum(np.abs(curr_weights - econ_weights)) * 100
         distance_finance = 0.5 * np.sum(np.abs(curr_weights - opt_weights)) * 100
@@ -313,7 +315,7 @@ class AuditEngine:
         st.plotly_chart(fig, use_container_width=True)
         
         # -----------------------------------------------------
-        # 3. ポジショニング表示と新しい比較テーブル
+        # 4. ポジショニング表示と新しい比較テーブル
         # -----------------------------------------------------
         st.markdown("#### 📏 Positioning & Active Share")
         st.markdown("現在のあなたのポートフォリオが、「市場全体（経済）」と「最適解（理論）」からどの程度乖離しているか（アクティブ・シェア）を示します。")
@@ -358,21 +360,24 @@ class AuditEngine:
 
     @staticmethod
     def plot_monte_carlo_histogram(final_values):
-        """[4ページ目用]: 最終資産分布の正確なヒストグラム（視認性改善版）"""
+        """[4ページ目用]: 最終資産分布の正確なヒストグラム（視認性改善・損益率ベース版）"""
+        
+        # 1.0を基準とする倍率から、0%をプラマイゼロとする損益率(%)に変換
+        profit_pct = (final_values - 1.0) * 100
         
         fig = px.histogram(
-            final_values, nbins=50, title="Final Value Distribution (10 Years)", 
-            labels={'value': 'Final Portfolio Value', 'count': 'Frequency'}, 
+            profit_pct, nbins=50, title="Final Value Distribution (10 Years)", 
+            labels={'value': 'Total Return (%)', 'count': 'Frequency'}, 
             color_discrete_sequence=["rgba(70, 130, 180, 0.6)"]
         )
         
-        median_val = np.median(final_values)
-        mean_val = np.mean(final_values)
-        pct_10 = np.percentile(final_values, 10)
-        pct_90 = np.percentile(final_values, 90)
+        median_val = np.median(profit_pct)
+        mean_val = np.mean(profit_pct)
+        pct_10 = np.percentile(profit_pct, 10)
+        pct_90 = np.percentile(profit_pct, 90)
 
-        # グラフ内は「縦線」のみを描画し、テキストは入れない（重なり防止）
-        fig.add_vline(x=1.0, line_dash="dash", line_color="red")
+        # グラフ内は縦線のみを描画し、テキストは入れない（重なり防止）
+        fig.add_vline(x=0.0, line_dash="dash", line_color="red")
         fig.add_vline(x=pct_10, line_dash="dash", line_color="orange")
         fig.add_vline(x=median_val, line_dash="solid", line_color="green")
         fig.add_vline(x=mean_val, line_dash="dot", line_color="black")
@@ -382,13 +387,13 @@ class AuditEngine:
         st.plotly_chart(fig, use_container_width=True)
         
         # グラフの下に、重ならない綺麗な凡例（サマリー）を配置
-        st.markdown("##### 📊 分布のサマリー（投資元本 = 1.0倍）")
+        st.markdown("##### 📊 10年後の予想損益サマリー（投資元本 = 0%）")
         l_col1, l_col2, l_col3, l_col4, l_col5 = st.columns(5)
-        l_col1.markdown(f"**🔴 元本ライン**<br>1.00倍", unsafe_allow_html=True)
-        l_col2.markdown(f"**🟠 下位10%**<br>{pct_10:.2f}倍 ({pct_10*100:.0f}%)", unsafe_allow_html=True)
-        l_col3.markdown(f"**🟢 中央値**<br>{median_val:.2f}倍 ({median_val*100:.0f}%)", unsafe_allow_html=True)
-        l_col4.markdown(f"**⚫ 平均値**<br>{mean_val:.2f}倍 ({mean_val*100:.0f}%)", unsafe_allow_html=True)
-        l_col5.markdown(f"**🟣 上位10%**<br>{pct_90:.2f}倍 ({pct_90*100:.0f}%)", unsafe_allow_html=True)
+        l_col1.markdown(f"**🔴 元本割れライン**<br>0.0%", unsafe_allow_html=True)
+        l_col2.markdown(f"**🟠 下位10%**<br>{pct_10:.1f}%", unsafe_allow_html=True)
+        l_col3.markdown(f"**🟢 中央値**<br>{median_val:.1f}%", unsafe_allow_html=True)
+        l_col4.markdown(f"**⚫ 平均値**<br>{mean_val:.1f}%", unsafe_allow_html=True)
+        l_col5.markdown(f"**🟣 上位10%**<br>{pct_90:.1f}%", unsafe_allow_html=True)
 
         st.caption("💡 **プロの視点:** 平均値(Mean)が中央値(Median)より右に大きくズレている場合、一部の大当たりシナリオに引っ張られた「一発逆転狙い」のリスキーなポートフォリオ特性を示唆します。")
 
@@ -587,7 +592,6 @@ def main():
                 if bm_returns.empty:
                     st.info("💡 データ不足のため表示できません（ベンチマークデータの取得に失敗しました）。")
                 else:
-                    # 【ステップ 1】 グラフの同化解消とシンプル化
                     # 無理にDataFrameを結合せず、独立した系列として描画する
                     port_growth = (1 + returns).cumprod() * 100
                     bm_growth = (1 + bm_returns).cumprod() * 100
@@ -734,7 +738,6 @@ def main():
                 st.markdown("現在のポートフォリオから、**シャープレシオ（リスク・リターン比）を最大化**する未来の最適ウェイトを提案します。")
                 
                 asset_returns = raw_input_data.pct_change().dropna()
-                # 取得した時価総額データ（market_caps）を引数として渡す
                 AuditEngine.optimize_and_plot_frontier(asset_returns, norm_weights, market_caps=market_caps)
 
 if __name__ == "__main__":
