@@ -3,7 +3,7 @@ simulation.py
 GARCHモデル、t分布を用いたモンテカルロ・シミュレーション、および過去の危機のタイムマシンテストを行うモジュール
 【アップデート】過去危機のSurvivor Weighting（動的再配分）、GARCH最尤法（MLE）、ローリング回帰（動的エクスポージャー）、
 および トラッキングエラー（TE）を反映した確率的シナリオ生成を実装。
-※ 修正版(v14): モンテカルロのドリフト項を「幾何近似（算術平均 - 0.5 × 分散）」ベースに再修正し、長期シミュレーションの過剰な上振れを抑制。
+※ 修正版(v15): 期待リターンにシュリンケージ(長期平均への回帰)と上限キャップを導入し、異常な上振れを抑制。
 """
 
 import numpy as np
@@ -232,11 +232,28 @@ class StochasticScenarioGenerator:
         """
         GARCH(1,1)とt分布を組み合わせたモンテカルロ・シミュレーション。
         ポートフォリオ固有のトラッキングエラー（TE）を分散に加味する。
+        【修正】期待収益率にShrinkage（平均回帰）とキャップを導入し、異常な上振れを防ぐ。
         """
         if returns is None or len(returns) < 30: return None
         
-        # 【修正】ボラティリティ・ドラッグ方式（幾何近似）のための算術平均を取得
-        arithmetic_mean = returns.mean()
+        # --- 期待収益率の現実化（Shrinkage & Cap） ---
+        # 1. 過去の実績を年率化
+        historical_annual_mean = returns.mean() * TRADING_DAYS_PER_YEAR
+        
+        # 2. 長期的な市場の均衡リターン (例: 株式の歴史的平均である年率7%)
+        long_term_market_return = 0.07
+        
+        # 3. シュリンケージ (Bayesian Shrinkage): 過去の実績と市場平均をブレンド
+        # 実績が極端に高い場合でも、長期平均に半分引き寄せることで過剰な上振れを防ぐ
+        shrunk_annual_mean = (historical_annual_mean * 0.5) + (long_term_market_return * 0.5)
+        
+        # 4. ハードキャップ (上限設定): どんなに過去成績が良くても、年率15%を将来予測の期待値の上限とする
+        # （これにより、10年間で天文学的な倍率になることを防ぐ）
+        MAX_EXPECTED_RETURN = 0.15
+        final_annual_mean = min(shrunk_annual_mean, MAX_EXPECTED_RETURN)
+        
+        # 日次ベースの期待リターンに再変換
+        daily_drift_base = final_annual_mean / TRADING_DAYS_PER_YEAR
         
         # デフォルトのパラメータ
         current_vol = returns.std()
@@ -280,8 +297,8 @@ class StochasticScenarioGenerator:
         
         # 3. シナリオパスの生成 (ベクトル化演算で高速化)
         # S_t = S_{t-1} * exp(drift + shock)
-        # 【修正】ドリフト項は「算術平均 - 0.5 * 全ボラティリティの2乗（ボラティリティ・ドラッグ）」
-        drift = arithmetic_mean - 0.5 * (adjusted_vol**2)
+        # 【修正】ドリフト項は「シュリンケージ済み平均 - 0.5 * 全ボラティリティの2乗（ボラティリティ・ドラッグ）」
+        drift = daily_drift_base - 0.5 * (adjusted_vol**2)
         
         daily_log_returns = drift + random_shocks
         
