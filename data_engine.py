@@ -1,7 +1,7 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
-※ 修正版(v12): 時価総額の欠損値に対する中央値補完、Fama-Frenchファクターの単位(100倍)統一処理を強化
+※ 修正版(v13): 銘柄名正規化の徹底、インナージョインによる期間同期の強制、時価総額取得エラーの明示化を追加。
 """
 
 import pandas as pd
@@ -58,20 +58,23 @@ class DataFetcher:
     def normalize_weights(weights_dict):
         """
         ティッカー名の正規化と、ウェイトの自動リスケール（合計100%化）を行う。
-        一律のドット変換を廃止し、yfinance特有の記法(BRK-Bなど)を保護する。
+        空白除去、大文字化、ドットのハイフン変換(BRK.B -> BRK-B)を統合して徹底する。
         """
         if not weights_dict: return {}
         normalized = {}
         total = 0.0
         
         for k, v in weights_dict.items():
+            # 空白削除と大文字化
             new_k = str(k).strip().upper()
             
-            # yfinanceではクラス株をハイフンで繋ぐのが正解 (BRK.B -> BRK-B)
-            if new_k == "BRK.B" or new_k == "BRK_B":
-                new_k = "BRK-B"
-            elif new_k == "BF.B" or new_k == "BF_B":
-                new_k = "BF-B"
+            # yfinance特有のクラス株表記(BRK.B -> BRK-B)への一律置換
+            new_k = new_k.replace('.', '-')
+            new_k = new_k.replace('_', '-')
+            
+            # ただし、日本株のサフィックス(-T)になってしまった場合は(.T)に修復する
+            if new_k.endswith('-T'):
+                new_k = new_k[:-2] + '.T'
                 
             normalized[new_k] = float(v)
             total += float(v)
@@ -125,7 +128,7 @@ class DataFetcher:
                     data.columns = [tickers[0]]
                     
                 # 列名を確実に文字列化
-                data.columns = [str(c).strip() for c in data.columns]
+                data.columns = [str(c).strip().upper() for c in data.columns]
                 
                 # 💡【重要】タイムゾーンの完全剥奪と日付の正規化
                 if data.index.tz is not None: 
@@ -149,7 +152,6 @@ class DataFetcher:
         """
         指定されたティッカーの時価総額(Market Cap)を取得する。
         DBキャッシュ -> yfinance -> FMP API の多層フォールバックで堅牢に取得。
-        【修正 F】取得エラー時の安全な中央値補完と float 化
         """
         if not tickers: return {}
         if isinstance(tickers, str): tickers = [tickers]
@@ -210,9 +212,18 @@ class DataFetcher:
             else:
                 print(f"Warning: Market Cap data missing or invalid for {ticker} across all sources.")
                 
-        # 【修正 F】補完ロジック: 取得できた有効な時価総額の中央値を算出
+        # --- 取得結果の検証とエラー明示化 ---
         valid_caps = [float(v) for v in fetched_caps.values() if v > 0]
-        fallback_cap = float(np.median(valid_caps)) if valid_caps else 1e10  # 全滅時は安全な中立値(10B)を代入
+        
+        if not valid_caps:
+            # 全滅した場合は明確なエラーメッセージを画面に出す
+            st.error("🚨 【エラー】全銘柄の時価総額データの取得に失敗しました。経済（時価総額加重）ポートフォリオは正確に計算されません。")
+            fallback_cap = 1.0  # 計算クラッシュを防ぐため最低限の均等配分値を入れる
+        else:
+            fallback_cap = float(np.median(valid_caps))
+            # 一部だけ取得できなかった場合は警告を出す
+            if len(valid_caps) < len(tickers):
+                st.warning(f"⚠️ 一部銘柄の時価総額が取得できなかったため、中央値による補完を行いました。")
         
         # 最終的に全ての要求ティッカーに対して確実な float 値を返す
         final_market_caps = {}
@@ -283,7 +294,7 @@ class DataFetcher:
             bm_returns.index = bm_returns.index.tz_localize(None)
         bm_returns.index = pd.to_datetime(bm_returns.index).normalize()
         
-        # 日付同期（インデックス・アライメント）の強化: TE計算や予測モデル連携のズレをなくすため inner結合
+        # 💡【重要】日付同期の強制化: ベンチマークとポートフォリオの共通期間のみを抽出 (Inner Join)
         aligned_df = pd.merge(returns, bm_returns, left_index=True, right_index=True, how='inner')
         
         # 結合後にデータがごっそり消えていないか監査
@@ -291,6 +302,7 @@ class DataFetcher:
             st.error(f"⚠️ データ結合後の有効日数が {len(aligned_df)} 日しかありません。期間設定やティッカーの地域設定が合っているか確認してください。")
             return None
 
+        # 完全に日付が揃った状態でポートフォリオ側の列だけを抽出して計算に進む
         aligned_returns = aligned_df[tickers]
         
         # --- リバランス・ドリフト計算ロジック ---
@@ -352,7 +364,7 @@ class DataFetcher:
             weighted_returns = (clean_returns * actual_weights.fillna(0)).sum(axis=1)
             
             # 全滅している日はNaNにする
-            weighted_returns.loc[is_alive.sum(axis=1) == np.nan]
+            weighted_returns.loc[is_alive.sum(axis=1) == 0] = np.nan
         
         weighted_returns = weighted_returns.dropna()
         if weighted_returns.empty: return None
@@ -366,7 +378,6 @@ class DataFetcher:
         """
         Fama-Frenchの純粋な5ファクターデータ（Mkt-RF, SMB, HML, RMW, CMA）と
         無リスク金利（RF）をKenneth Frenchのライブラリから取得する。
-        【修正 E】 単位の自動変換(100倍問題の解消)
         """
         try:
             # 5ファクターデータセットの取得を試行
@@ -389,7 +400,7 @@ class DataFetcher:
             if not has_mkt or not all(any(req in c.upper() for c in ff_data.columns) for req in required_cols):
                 print(f"Warning: Dataset {dataset_name} does not contain all required 5 factors and RF.")
             
-            # 【修正 E】スケール統一の厳格化
+            # スケール統一の厳格化
             # Ken Frenchのデータは原則パーセント（1.0 = 1%）。
             # 最大値が0.5を超える場合、パーセント表記とみなして100で割り小数(0.01 = 1%)に統一する
             if ff_data.max().max() > 0.5:
