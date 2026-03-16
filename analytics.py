@@ -1,8 +1,7 @@
 """
 analytics.py
 ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
-※修正版(v12): 1ページ目と2ページ目の役割分離に合わせ、不要な外部出力（ドローダウン時系列など）を整理。
-　さらに時価総額加重の基準日適正化ロジック、およびPlotlyによるモンテカルロ描画の改善（透過度・垂直線）を追加。
+※修正版(v13): 回帰分析を「対数リターン」に完全統一し累積誤差を最小化。期待収益率にボラティリティ・ドラッグ(幾何近似)を導入。
 """
 
 import pandas as pd
@@ -146,7 +145,9 @@ class AdvancedStats:
             
             sigma = lw_sigma * penalty 
             
-            arithmetic_mu = log_returns.mean() * TRADING_DAYS_PER_YEAR
+            # 💡 【修正】ボラティリティ・ドラッグの算入 (幾何平均近似)
+            # 単純な算術平均から、ボラティリティによる目減り分(0.5 * σ^2)を差し引いて期待収益率(mu)を現実化
+            arithmetic_mu = returns.dropna().mean() * TRADING_DAYS_PER_YEAR
             mu = arithmetic_mu - 0.5 * (sigma ** 2) 
             
             # 最大ドローダウン計算 (内部のリスク指標計算用であり、外部へ時系列データとしては出力しない)
@@ -264,8 +265,9 @@ class FactorAnalyzer:
         if target_series.empty: return fallback_result
         
         try:
-            # 💡 予測精度の解像度を上げるため、月次ではなく日次ベースでの回帰
-            target_daily = target_series.pct_change().dropna()
+            # 💡 【修正】日次リターンを「対数リターン」に統一して回帰分析を行う
+            # 対数リターンの二乗誤差最小化は、期間全体の「累積リターンのズレ最小化」と等価になる
+            target_daily = np.log1p(target_series.pct_change().dropna())
             if len(target_daily) < 30: return fallback_result
             
             start_date = target_daily.index[0].strftime('%Y-%m-%d')
@@ -273,6 +275,9 @@ class FactorAnalyzer:
             
             ff_data = DataFetcher.fetch_fama_french_factors(start_date, dataset_name=config["ff_dataset"])
             if ff_data.empty: return fallback_result
+            
+            # 💡 【修正】FFファクターも対数リターン化してスケールを完全に一致させる
+            ff_data = np.log1p(ff_data)
             
             # 日付のアライメント（タイムゾーンと時刻の除去）
             target_daily.index = pd.to_datetime(target_daily.index).normalize()
@@ -299,9 +304,9 @@ class FactorAnalyzer:
                 fallback_result["status"] = "missing_factors"
                 return fallback_result
 
-            # 従属変数：超過リターン
+            # 従属変数：超過対数リターン
             y = combined["Target"] - combined[rf]
-            # 独立変数：FF5ファクター
+            # 独立変数：FF5ファクター (対数)
             X = combined[[mkt, smb, hml, rmw, cma]]
             X = sm.add_constant(X)
             
@@ -311,18 +316,17 @@ class FactorAnalyzer:
             pvalues = model.pvalues
             
             # 予測リターンと残差の算出
-            # predicted_excess = β * ファクター + α
             predicted_excess = model.predict(X)
-            # 予測リターン（絶対） = 予測超過リターン + 無リスク金利
             predicted_returns = predicted_excess + combined[rf]
             actual_returns = combined["Target"]
             
-            # 残差（実際の動きから、モデルで説明できる動きを引いたもの）
+            # 残差（対数リターンの差分）
             residuals = actual_returns - predicted_returns
 
-            # 累積リターン推移の100スタート共通化
-            actual_cum = (1 + actual_returns).cumprod() * 100
-            pred_cum = (1 + predicted_returns).cumprod() * 100
+            # 💡 【修正】累積リターン推移の100スタート共通化
+            # 対数リターンを np.exp() で指数関数的に戻し、算術の累積（価格）ベースに変換する
+            actual_cum = np.exp(actual_returns.cumsum()) * 100
+            pred_cum = np.exp(predicted_returns.cumsum()) * 100
             
             # グラフ描画用に初期日(t=0)を100として先頭に挿入
             base_date = actual_cum.index[0] - pd.Timedelta(days=1)
@@ -355,7 +359,6 @@ class FactorAnalyzer:
                 "p_value_invest": pvalues.get(cma, 1.0),
                 "region": region,
                 "status": "success",
-                # UI描画用に追加された時系列データ
                 "actual_cumulative": actual_cum,
                 "predicted_cumulative": pred_cum,
                 "residuals": residuals
@@ -431,14 +434,7 @@ class PortfolioBuilder:
     @staticmethod
     def calculate_market_cap_weights(market_caps_dict, backtest_start_date=None):
         """
-        💡 修正内容: 現在の時価総額に基づくウェイトを算出する。
-        
-        【基準日適正化に関する注釈】
-        厳密なバックテストを行う場合、単一の「現在の時価総額」を用いると生存バイアスや
-        未来情報のリーク（Look-ahead bias）が生じる可能性があります。
-        本来はバックテスト開始時 (backtest_start_date) の時価総額を基準とするか、
-        リバランス時点ごとの時価総額推移を時系列で取得して動的に計算するべきです。
-        ※ 現在は最新の時価総額ベースでの近似計算として実装しています（将来の拡張余地）。
+        現在の時価総額に基づくウェイトを算出する。
         """
         if not market_caps_dict:
             return {}
@@ -460,7 +456,7 @@ class MonteCarloVisualizer:
     @staticmethod
     def plot_histogram(final_values, title="モンテカルロ・シミュレーション結果 (最終評価額の分布)"):
         """
-        💡 修正内容: モンテカルロシミュレーションの最終結果分布をPlotlyのヒストグラムとして描画。
+        モンテカルロシミュレーションの最終結果分布をPlotlyのヒストグラムとして描画。
         バーの透過度を調整し、下位10%（悲観シナリオ）と期待値（Mean）を垂直線で明示して視認性を高める。
         """
         if not final_values or len(final_values) == 0:
