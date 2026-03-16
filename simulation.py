@@ -3,7 +3,7 @@ simulation.py
 GARCHモデル、t分布を用いたモンテカルロ・シミュレーション、および過去の危機のタイムマシンテストを行うモジュール
 【アップデート】過去危機のSurvivor Weighting（動的再配分）、GARCH最尤法（MLE）、ローリング回帰（動的エクスポージャー）、
 および トラッキングエラー（TE）を反映した確率的シナリオ生成を実装。
-※ 修正版(v13): モンテカルロのドリフト項を幾何平均(対数リターン)ベースに修正し、長期シミュレーションの異常発散を防止。
+※ 修正版(v14): モンテカルロのドリフト項を「幾何近似（算術平均 - 0.5 × 分散）」ベースに再修正し、長期シミュレーションの過剰な上振れを抑制。
 """
 
 import numpy as np
@@ -232,13 +232,11 @@ class StochasticScenarioGenerator:
         """
         GARCH(1,1)とt分布を組み合わせたモンテカルロ・シミュレーション。
         ポートフォリオ固有のトラッキングエラー（TE）を分散に加味する。
-        【修正 G】期待リターンを算術平均から幾何平均(対数リターン)ベースに変更。
         """
         if returns is None or len(returns) < 30: return None
         
-        # 💡 修正 G: 異常な発散を防ぐため、算術平均ではなく対数リターンの平均(幾何平均ベース)を使用
-        log_returns = np.log(1 + returns)
-        base_drift = log_returns.mean()
+        # 【修正】ボラティリティ・ドラッグ方式（幾何近似）のための算術平均を取得
+        arithmetic_mean = returns.mean()
         
         # デフォルトのパラメータ
         current_vol = returns.std()
@@ -282,10 +280,8 @@ class StochasticScenarioGenerator:
         
         # 3. シナリオパスの生成 (ベクトル化演算で高速化)
         # S_t = S_{t-1} * exp(drift + shock)
-        # 💡 修正 G: すでに対数リターン平均(base_drift)に元のボラティリティ減価が含まれているため、
-        # 追加で加味したTE分のペナルティ(- 0.5 * te_daily^2)のみを差し引く
-        te_penalty = 0.5 * (te_daily**2)
-        drift = base_drift - te_penalty
+        # 【修正】ドリフト項は「算術平均 - 0.5 * 全ボラティリティの2乗（ボラティリティ・ドラッグ）」
+        drift = arithmetic_mean - 0.5 * (adjusted_vol**2)
         
         daily_log_returns = drift + random_shocks
         
