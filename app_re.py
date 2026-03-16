@@ -1,7 +1,7 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 修正版(v17): dotenvガード、グラフ独立化、ヒストグラム改善、時価総額float64固定化を追加。
+※ 修正版(v18): 期待リターンの対数平均化によるクラッシュ防止、比較グラフのシンプル化、ヒストグラムUI改善。
 """
 
 import os
@@ -17,8 +17,6 @@ import random # その他のランダム処理用
 # =========================================================
 # 🔑 APIキーと環境変数の集中管理
 # =========================================================
-# 【修正 A】 dotenv 読み込みの堅牢化
-# ローカル環境の .env ファイルを読み込む（Streamlit Cloud環境では無視されます）
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -29,18 +27,15 @@ def setup_api_keys():
     """Streamlit Secrets または 環境変数 からAPIキーを安全に取得・設定する"""
     fmp_key = None
     
-    # パターンA: Streamlit Cloud の secrets.toml から取得を試みる
     try:
         if hasattr(st, "secrets") and "FMP_API_KEY" in st.secrets:
             fmp_key = st.secrets["FMP_API_KEY"]
     except Exception:
         pass
 
-    # パターンB: 取得できなければ、ローカルの環境変数 (.env等) から取得
     if not fmp_key:
         fmp_key = os.environ.get("FMP_API_KEY")
 
-    # 取得したキーを環境変数に再セットし、DataFetcher等の裏側モジュールで os.getenv できるようにする
     if fmp_key:
         os.environ["FMP_API_KEY"] = fmp_key
 
@@ -192,7 +187,7 @@ class AuditEngine:
 
     @staticmethod
     def optimize_and_plot_frontier(asset_returns, current_weights_dict, market_caps=None):
-        """[5ページ目用]: 効率的フロンティアと最適ウェイトの算出 (三点比較・距離計算対応)"""
+        """[5ページ目用]: 効率的フロンティアと最適ウェイトの算出 (対数リターンベースで堅牢化)"""
         tickers = list(current_weights_dict.keys())
         available_tickers = [t for t in tickers if t in asset_returns.columns]
         
@@ -202,9 +197,15 @@ class AuditEngine:
             
         returns_df = asset_returns[available_tickers]
         
-        # 異常値防止のため、期待リターンを「算術平均」から「幾何平均(CAGR)」へ変更
+        # 【修正】データ不足(ゼロ除算)によるクラッシュを防ぐガード節
+        if returns_df.empty or len(returns_df) < 10:
+            st.warning("⚠️ 最適化に必要なデータが不足しています。")
+            return
+        
+        # 【修正】べき乗によるクラッシュを排除し、対数リターン(幾何平均)の算術計算に統一
         trading_days = 252
-        mean_returns = (1 + returns_df).prod() ** (trading_days / len(returns_df)) - 1
+        log_returns = np.log(1 + returns_df)
+        mean_returns = np.exp(log_returns.mean() * trading_days) - 1
         
         cov_matrix = returns_df.cov() * trading_days
         
@@ -245,9 +246,8 @@ class AuditEngine:
         curr_std = np.sqrt(np.dot(curr_weights.T, np.dot(cov_matrix, curr_weights)))
 
         # ③ 経済 (Economy) : 時価総額加重
-        # 【修正 D】時価総額加重計算の float64 固定化と異常値ガード
+        # 時価総額加重計算の float64 固定化と異常値ガード
         if market_caps is not None and isinstance(market_caps, dict):
-            # 極端に小さい値(1.0など)が入り比率が崩壊するのを防ぐため、有効な値の中央値をデフォルトとする
             valid_caps = [v for v in market_caps.values() if isinstance(v, (int, float)) and v > 0]
             default_cap = np.median(valid_caps) if valid_caps else 1.0
             
@@ -297,7 +297,7 @@ class AuditEngine:
         ))
         
         fig.update_layout(
-            title="Efficient Frontier (Risk-Return Tradeoff) - CAGR Based",
+            title="Efficient Frontier (Risk-Return Tradeoff) - Log Return Based",
             xaxis_title="Expected Annual Volatility (Risk)",
             yaxis_title="Expected Annual Return (CAGR)",
             height=450, margin=dict(l=20, r=20, t=50, b=20),
@@ -364,7 +364,7 @@ class AuditEngine:
         pct_10 = np.percentile(final_values, 10)
         pct_90 = np.percentile(final_values, 90)
 
-        # 【修正 C】ヒストグラムの注釈表示の改善 (倍率表記と背景色の追加)
+        # 【修正】ヒストグラムの注釈表示の改善 (倍率表記と背景色の追加、重なり防止)
         bg_style = dict(bgcolor="rgba(255, 255, 255, 0.9)", bordercolor="gray", borderwidth=1, font_size=11)
 
         fig.add_vline(x=1.0, line_dash="dash", line_color="red", 
@@ -499,7 +499,6 @@ def main():
             # 実際の時価総額データを取得する処理
             # ==========================================
             try:
-                # ※ data_engine.py に DataFetcher.fetch_market_caps が実装されている必要があります。
                 market_caps = DataFetcher.fetch_market_caps(list(norm_weights.keys()), region=region)
             except AttributeError:
                 st.warning("⚠️ DataFetcherモジュールに fetch_market_caps が未実装です。一時的に各銘柄を均等の時価総額(1.0)として計算します。")
@@ -579,28 +578,23 @@ def main():
                 if bm_returns.empty:
                     st.info("💡 データ不足のため表示できません（ベンチマークデータの取得に失敗しました）。")
                 else:
-                    # 【修正 B】 累積リターン比較グラフの「独立化」と「100スタート同期」
-                    port_growth = synthetic_portfolio.copy()
-                    if not port_growth.empty and port_growth.iloc[0] != 0:
-                        port_growth = port_growth / port_growth.iloc[0] * 100
-                        
+                    # 【修正】超シンプル化: 過去の実績リターンから100スタートの推移を個別に作成
+                    port_growth = (1 + returns).cumprod() * 100
                     bm_growth = (1 + bm_returns).cumprod() * 100
-                    if not bm_growth.empty and bm_growth.iloc[0] != 0:
-                        bm_growth = bm_growth / bm_growth.iloc[0] * 100
-                        
-                    aligned_growth = pd.concat([port_growth.rename("Portfolio"), bm_growth.rename("Benchmark")], axis=1).dropna()
                     
-                    # dropnaで開始日がズレた場合、再度100スタートに厳密に揃える
+                    # 欠損値を前詰め(ffill)することで、期間ズレによるグラフの形が同一化するのを防ぐ
+                    aligned_growth = pd.concat([port_growth.rename("Portfolio"), bm_growth.rename("Benchmark")], axis=1).ffill().dropna()
+                    
                     if not aligned_growth.empty:
+                        # プロット直前にもう一度起点を100に厳密に合わせる
                         aligned_growth = aligned_growth.div(aligned_growth.iloc[0]) * 100
                         
-                    fig_rel = px.line(aligned_growth, labels={'value': 'Cumulative Return (Base=100)', 'index': 'Date'}, title="Portfolio vs Benchmark Growth")
-                    
-                    # 成長率の錯覚を防ぐため、比較グラフを「対数スケール」に設定
-                    fig_rel.update_yaxes(type="log")
-                    
-                    fig_rel.update_layout(height=400, margin=dict(l=20, r=20, t=50, b=20))
-                    st.plotly_chart(fig_rel, use_container_width=True)
+                        fig_rel = px.line(aligned_growth, labels={'value': 'Cumulative Return (Base=100)', 'index': 'Date'}, title="Portfolio vs Benchmark Growth")
+                        fig_rel.update_yaxes(type="log") # 成長率の錯覚を防ぐため対数スケールに設定
+                        fig_rel.update_layout(height=400, margin=dict(l=20, r=20, t=50, b=20))
+                        st.plotly_chart(fig_rel, use_container_width=True)
+                    else:
+                        st.warning("⚠️ グラフを描画するための共通期間データがありません。")
 
             # ---------------------------------------------------------
             # --- Page 2: 要因分析 (Factor Attribution) ---
