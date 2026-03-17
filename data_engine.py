@@ -1,7 +1,7 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
-※ 修正版(v13): 銘柄名正規化の徹底、インナージョインによる期間同期の強制、時価総額取得エラーの明示化を追加。
+※ 修正版(v14): API制限を回避するバッチ処理の導入、および時価総額失敗時の「株価加重スマート・フォールバック」を実装。
 """
 
 import pandas as pd
@@ -91,67 +91,81 @@ class DataFetcher:
     def fetch_market_data(tickers, start_date="2000-01-01", max_retries=3):
         """
         指定されたティッカーのヒストリカルデータを取得し、クレンジングする。
-        Rate Limit対策として、指数バックオフを伴うリトライロジックを追加。
+        💡 修正内容: yfinanceのRate Limit対策として、銘柄をバッチ分割(50銘柄ずつ)して取得。
         """
         if not tickers: return pd.DataFrame()
         if isinstance(tickers, str): tickers = [tickers]
         
-        for attempt in range(max_retries):
-            try:
-                # threads=False でマルチスレッドを無効化しAPI制限(Rate Limit)を回避
-                data = yf.download(tickers, start=start_date, progress=False, auto_adjust=True, threads=False)
-                
-                # 取得データが空の場合は一時的なブロックの可能性があるのでリトライへ
-                if data.empty:
-                    time.sleep(2 ** attempt)
-                    continue
-                
-                # データ構造の確実なクレンジング（不要な階層の削ぎ落とし）
-                if isinstance(data.columns, pd.MultiIndex):
-                    if 'Close' in data.columns.get_level_values(0):
-                        data = data['Close']
-                    elif 'Adj Close' in data.columns.get_level_values(0):
-                        data = data['Adj Close']
-                else:
-                    # 古い形式の場合の対応
-                    if 'Close' in data.columns:
-                        data = data[['Close']]
-                    elif 'Adj Close' in data.columns:
-                        data = data[['Adj Close']]
-                
-                # 1銘柄・複数銘柄の取得パターンの統一
-                if isinstance(data, pd.Series):
-                    data = data.to_frame()
+        batch_size = 50
+        all_data = []
+        
+        for i in range(0, len(tickers), batch_size):
+            batch_tickers = tickers[i:i+batch_size]
+            batch_data = pd.DataFrame()
+            
+            for attempt in range(max_retries):
+                try:
+                    # threads=False でマルチスレッドを無効化しAPI制限(Rate Limit)を回避
+                    data = yf.download(batch_tickers, start=start_date, progress=False, auto_adjust=True, threads=False)
                     
-                # 列名が 'Close' 等の一般名詞になってしまっている場合は、ティッカー名に強制上書き
-                if len(data.columns) == 1 and len(tickers) == 1:
-                    data.columns = [tickers[0]]
+                    # 取得データが空の場合は一時的なブロックの可能性があるのでリトライへ
+                    if data.empty:
+                        time.sleep(2 ** attempt)
+                        continue
                     
-                # 列名を確実に文字列化
-                data.columns = [str(c).strip().upper() for c in data.columns]
-                
-                # 💡【重要】タイムゾーンの完全剥奪と日付の正規化
-                if data.index.tz is not None: 
-                    data.index = data.index.tz_localize(None)
-                data.index = pd.to_datetime(data.index).normalize()
+                    # データ構造の確実なクレンジング（不要な階層の削ぎ落とし）
+                    if isinstance(data.columns, pd.MultiIndex):
+                        if 'Close' in data.columns.get_level_values(0):
+                            data = data['Close']
+                        elif 'Adj Close' in data.columns.get_level_values(0):
+                            data = data['Adj Close']
+                    else:
+                        if 'Close' in data.columns:
+                            data = data[['Close']]
+                        elif 'Adj Close' in data.columns:
+                            data = data[['Adj Close']]
+                    
+                    if isinstance(data, pd.Series):
+                        data = data.to_frame()
+                        
+                    if len(data.columns) == 1 and len(batch_tickers) == 1:
+                        data.columns = [batch_tickers[0]]
+                        
+                    data.columns = [str(c).strip().upper() for c in data.columns]
+                    
+                    if data.index.tz is not None: 
+                        data.index = data.index.tz_localize(None)
+                    data.index = pd.to_datetime(data.index).normalize()
 
-                # ffillに制限(limit=5)を設け、上場廃止・取引停止銘柄が「永遠に同じ価格で生き残る」ことを防ぐ
-                return data.ffill(limit=5).dropna(how='all')
+                    batch_data = data.ffill(limit=5).dropna(how='all')
+                    break  # 成功したらリトライループを抜ける
+                    
+                except Exception as e:
+                    print(f"Fetch Error for batch {i} on attempt {attempt+1}: {e}")
+                    time.sleep(2 ** attempt)
+                    
+            if not batch_data.empty:
+                all_data.append(batch_data)
+            
+            # バッチ間に少し待機時間を設け、APIからの完全ブロックを防ぐ
+            if i + batch_size < len(tickers):
+                time.sleep(0.5)
                 
-            except Exception as e:
-                # エラー発生時は待機して再試行 (例: 1秒 -> 2秒 -> 4秒)
-                print(f"Fetch Error for {tickers} on attempt {attempt+1}: {e}")
-                time.sleep(2 ** attempt)
-                
-        # 全リトライ失敗時は空のDataFrameを返す
-        return pd.DataFrame()
+        if not all_data:
+            return pd.DataFrame()
+            
+        # 全バッチを列方向に結合して一つにする
+        final_data = pd.concat(all_data, axis=1)
+        # 重複してしまった列名があれば除外
+        final_data = final_data.loc[:, ~final_data.columns.duplicated()]
+        return final_data
 
     @staticmethod
     @st.cache_data(ttl=86400)  # 時価総額は日次キャッシュ(24時間)で十分
     def fetch_market_caps(tickers, region="US", **kwargs):
         """
         指定されたティッカーの時価総額(Market Cap)を取得する。
-        DBキャッシュ -> yfinance -> FMP API の多層フォールバックで堅牢に取得。
+        💡 修正内容: 取得失敗時に「株価」を利用したスマート・フォールバックを実行。
         """
         if not tickers: return {}
         if isinstance(tickers, str): tickers = [tickers]
@@ -159,10 +173,46 @@ class DataFetcher:
         init_db()
         fetched_caps = {}
         
+        # --- 💡 1. 準備: 株価(Price)を直近のヒストリカルデータから取得しておく ---
+        latest_prices = {}
+        try:
+            # 過去15日分くらい取得して最新行を使う（休場日対策）
+            recent_start = (pd.Timestamp.today() - pd.Timedelta(days=15)).strftime("%Y-%m-%d")
+            # キャッシュされた関数を呼ぶため負荷は低い
+            recent_data = DataFetcher.fetch_market_data(tickers, start_date=recent_start)
+            if not recent_data.empty:
+                latest_series = recent_data.ffill().iloc[-1]
+                for t in tickers:
+                    if t in latest_series and pd.notna(latest_series[t]) and latest_series[t] > 0:
+                        latest_prices[t] = float(latest_series[t])
+        except Exception as e:
+            print(f"Error fetching recent prices for fallback: {e}")
+
+        # --- 💡 2. FMP APIで一括(バルク)取得を試みる (最も高速・確実) ---
+        if FMP_API_KEY:
+            batch_size = 20
+            for i in range(0, len(tickers), batch_size):
+                batch_tickers = tickers[i:i+batch_size]
+                ticker_str = ",".join(batch_tickers)  # AAPL,MSFT,GOOGL のように繋げる
+                try:
+                    url = f"https://financialmodelingprep.com/api/v3/market-capitalization/{ticker_str}?apikey={FMP_API_KEY}"
+                    response = requests.get(url, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        for item in data:
+                            if 'symbol' in item and 'marketCap' in item and item['marketCap'] > 0:
+                                fetched_caps[item['symbol'].upper()] = item['marketCap']
+                except Exception as e:
+                    print(f"FMP API Batch Error: {e}")
+                time.sleep(0.2)  # リクエスト間の冷却時間
+        
+        # --- 💡 3. 残りの銘柄をDBキャッシュとyfinanceで穴埋め ---
         for ticker in tickers:
+            if ticker in fetched_caps:
+                continue
+                
             mcap = None
-            
-            # 1. まずローカルDBキャッシュを確認（API呼び出しの節約と安定化）
+            # DBの確認
             try:
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
@@ -171,67 +221,73 @@ class DataFetcher:
                 conn.close()
                 if row and row[0] is not None and row[0] > 0:
                     fetched_caps[ticker] = row[0]
-                    continue # DBにあれば次へ
-            except Exception as e:
-                print(f"DB Read Error for {ticker}: {e}")
+                    continue
+            except Exception:
+                pass
 
-            # 2. キャッシュがなければ yfinance を試す（基本ルート）
+            # yfinanceへの個別リクエスト
             try:
                 tick = yf.Ticker(ticker)
                 mcap = tick.info.get('marketCap')
                 if mcap is None or not isinstance(mcap, (int, float)) or mcap <= 0:
                     mcap = None
-            except Exception as e:
-                print(f"yfinance Market Cap Error for {ticker}: {e}")
-                mcap = None
+            except Exception:
+                pass
 
-            # 3. yfinance がダメなら FMP API でフォールバック
-            if mcap is None and FMP_API_KEY:
-                try:
-                    url = f"https://financialmodelingprep.com/api/v3/market-capitalization/{ticker}?apikey={FMP_API_KEY}"
-                    response = requests.get(url, timeout=5)
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data and len(data) > 0 and 'marketCap' in data[0]:
-                            mcap = data[0]['marketCap']
-                except Exception as e:
-                    print(f"FMP API Error for {ticker}: {e}")
-
-            # 4. 取得できた場合は結果を辞書に格納し、次回のためにDBへ保存
-            if mcap is not None and isinstance(mcap, (int, float)) and mcap > 0:
+            if mcap is not None:
                 fetched_caps[ticker] = mcap
-                try:
-                    conn = sqlite3.connect(DB_PATH)
-                    c = conn.cursor()
-                    # 既に存在する場合は上書き更新 (INSERT OR REPLACE)
-                    c.execute("INSERT OR REPLACE INTO market_caps (ticker, market_cap, last_updated) VALUES (?, ?, CURRENT_TIMESTAMP)", (ticker, float(mcap)))
-                    conn.commit()
-                    conn.close()
-                except Exception as e:
-                    print(f"DB Write Error for {ticker}: {e}")
-            else:
-                print(f"Warning: Market Cap data missing or invalid for {ticker} across all sources.")
                 
-        # --- 取得結果の検証とエラー明示化 ---
-        valid_caps = [float(v) for v in fetched_caps.values() if v > 0]
-        
-        if not valid_caps:
-            # 全滅した場合は明確なエラーメッセージを画面に出す
-            st.error("🚨 【エラー】全銘柄の時価総額データの取得に失敗しました。経済（時価総額加重）ポートフォリオは正確に計算されません。")
-            fallback_cap = 1.0  # 計算クラッシュを防ぐため最低限の均等配分値を入れる
-        else:
-            fallback_cap = float(np.median(valid_caps))
-            # 一部だけ取得できなかった場合は警告を出す
-            if len(valid_caps) < len(tickers):
-                st.warning(f"⚠️ 一部銘柄の時価総額が取得できなかったため、中央値による補完を行いました。")
-        
-        # 最終的に全ての要求ティッカーに対して確実な float 値を返す
+        # 取得できた分をDBへ保存
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            for t, mc in fetched_caps.items():
+                c.execute("INSERT OR REPLACE INTO market_caps (ticker, market_cap, last_updated) VALUES (?, ?, CURRENT_TIMESTAMP)", (t, float(mc)))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+        # --- 💡 4. 株価を用いた「スマート・フォールバック」による補完 ---
         final_market_caps = {}
+        implied_shares = []
+        
+        # 時価総額と株価の両方が取れている銘柄から「推定発行済株式数」を逆算
+        for t in tickers:
+            if t in fetched_caps and t in latest_prices:
+                implied_shares.append(fetched_caps[t] / latest_prices[t])
+                
+        if implied_shares:
+            # 取得できた銘柄の発行済株式数の中央値を算出
+            median_shares = float(np.median(implied_shares))
+            fallback_mode = "implied"
+        else:
+            # 全滅の場合は株価をそのまま使用（純粋な株価加重）
+            median_shares = 1.0
+            fallback_mode = "pure_price"
+            
+        missing_count = 0
         for ticker in tickers:
             if ticker in fetched_caps and fetched_caps[ticker] > 0:
                 final_market_caps[ticker] = float(fetched_caps[ticker])
             else:
-                final_market_caps[ticker] = fallback_cap
+                missing_count += 1
+                if ticker in latest_prices:
+                    # 株価 × 推定株式数（または1.0）で時価総額を擬似的に算出
+                    final_market_caps[ticker] = latest_prices[ticker] * median_shares
+                else:
+                    # 株価すら取れない場合は、他銘柄の時価総額中央値（最終手段）
+                    if fetched_caps:
+                        final_market_caps[ticker] = float(np.median(list(fetched_caps.values())))
+                    else:
+                        final_market_caps[ticker] = 1.0
+
+        # UIへの通知
+        if missing_count > 0:
+            if fallback_mode == "pure_price":
+                st.error("🚨 【API制限】全銘柄の時価総額の取得に失敗しました。経済ポートフォリオは**株価加重**で代用して計算しています。")
+            else:
+                st.warning(f"⚠️ {missing_count} 銘柄の時価総額が取得できなかったため、株価比率ベースで推定補完を行いました。")
                 
         return final_market_caps
 
@@ -401,8 +457,6 @@ class DataFetcher:
                 print(f"Warning: Dataset {dataset_name} does not contain all required 5 factors and RF.")
             
             # スケール統一の厳格化
-            # Ken Frenchのデータは原則パーセント（1.0 = 1%）。
-            # 最大値が0.5を超える場合、パーセント表記とみなして100で割り小数(0.01 = 1%)に統一する
             if ff_data.max().max() > 0.5:
                 ff_data = ff_data / 100.0
             
