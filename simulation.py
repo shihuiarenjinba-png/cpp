@@ -1,9 +1,9 @@
 """
 simulation.py
-GARCHモデル、t分布を用いたモンテカルロ・シミュレーション、および過去の危機のタイムマシンテストを行うモジュール
-【アップデート】過去危機のSurvivor Weighting（動的再配分）、GARCH最尤法（MLE）、ローリング回帰（動的エクスポージャー）、
+ヒストリカル・ブートストラップ法を用いたシミュレーション、および過去の危機のタイムマシンテストを行うモジュール
+【アップデート】過去危機のSurvivor Weighting（動的再配分）、ローリング回帰（動的エクスポージャー）、
 および トラッキングエラー（TE）を反映した確率的シナリオ生成を実装。
-※ 修正版(v15): 期待リターンにシュリンケージ(長期平均への回帰)と上限キャップを導入し、異常な上振れを抑制。
+※ 修正版(v16): モンテカルロ予測を廃止し、過去の生データをそのままサンプリングする「30日窓ブロック・ブートストラップ法」へ完全移行。
 """
 
 import numpy as np
@@ -16,13 +16,6 @@ import warnings
 # データ取得エンジン等のインポート
 from data_engine import DataFetcher
 from config import TRADING_DAYS_PER_YEAR, MarketConfig
-
-# 📌 GARCHモデルによる動的ボラティリティ予測用
-try:
-    from arch import arch_model
-    HAS_ARCH = True
-except ImportError:
-    HAS_ARCH = False
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -224,86 +217,58 @@ class HistoryTimeMachine:
 
 
 # =========================================================
-# 🎲 確率的シナリオ生成クラス
+# 🎲 確率的シナリオ生成クラス (ブートストラップ版)
 # =========================================================
 class StochasticScenarioGenerator:
     @staticmethod
     def generate_paths(returns, n_scenarios=10000, n_days=252, tracking_error_annual=0.0):
         """
-        GARCH(1,1)とt分布を組み合わせたモンテカルロ・シミュレーション。
-        ポートフォリオ固有のトラッキングエラー（TE）を分散に加味する。
-        【修正】期待収益率にShrinkage（平均回帰）とキャップを導入し、異常な上振れを防ぐ。
+        過去の生データをそのままサンプリングする「30日窓ブロック・ブートストラップ法」。
+        架空の期待収益率や乱数分布に頼らず、市場のリアルな暴落と反発の「うねり」を再現する。
         """
         if returns is None or len(returns) < 30: return None
         
-        # --- 期待収益率の現実化（Shrinkage & Cap） ---
-        # 1. 過去の実績を年率化
-        historical_annual_mean = returns.mean() * TRADING_DAYS_PER_YEAR
+        # 実績リターンを対数リターンに変換して蓄積
+        log_returns = np.log1p(returns).to_numpy()
+        n_history = len(log_returns)
         
-        # 2. 長期的な市場の均衡リターン (例: 株式の歴史的平均である年率7%)
-        long_term_market_return = 0.07
+        # ブロック・ブートストラップの窓幅（市場の自己相関を保つための期間）
+        window_size = 30
         
-        # 3. シュリンケージ (Bayesian Shrinkage): 過去の実績と市場平均をブレンド
-        # 実績が極端に高い場合でも、長期平均に半分引き寄せることで過剰な上振れを防ぐ
-        shrunk_annual_mean = (historical_annual_mean * 0.5) + (long_term_market_return * 0.5)
+        if n_history < window_size:
+            window_size = 1
+            
+        n_blocks = int(np.ceil(n_days / window_size))
+        max_start_idx = max(0, n_history - window_size)
         
-        # 4. ハードキャップ (上限設定): どんなに過去成績が良くても、年率15%を将来予測の期待値の上限とする
-        # （これにより、10年間で天文学的な倍率になることを防ぐ）
-        MAX_EXPECTED_RETURN = 0.15
-        final_annual_mean = min(shrunk_annual_mean, MAX_EXPECTED_RETURN)
+        # 過去データからランダムに開始地点（ブロック）を抽出
+        np.random.seed(42)  # 実行ごとの再現性を担保
+        random_start_indices = np.random.randint(0, max_start_idx + 1, size=(n_blocks, n_scenarios))
         
-        # 日次ベースの期待リターンに再変換
-        daily_drift_base = final_annual_mean / TRADING_DAYS_PER_YEAR
+        simulated_log_returns = np.zeros((n_blocks * window_size, n_scenarios))
         
-        # デフォルトのパラメータ
-        current_vol = returns.std()
-        df = 5.0 # デフォルトの自由度
+        # 抽出したブロックをつなぎ合わせる
+        for i in range(n_blocks):
+            start_row = i * window_size
+            end_row = start_row + window_size
+            
+            indices = random_start_indices[i, :]
+            broadcast_indices = indices + np.arange(window_size)[:, None]
+            
+            simulated_log_returns[start_row:end_row, :] = log_returns[broadcast_indices]
         
-        # 1. 現在のボラティリティ・レジームと分布の厚みをGARCHモデルから取得
-        if HAS_ARCH and len(returns) > 252:
-            try:
-                # GARCHモデルの収束失敗（Iteration limit等）を防ぐため rescale=False 等の安全パラメータを追加
-                am = arch_model(returns * 100, vol='Garch', p=1, q=1, dist='t', rescale=False)
-                res = am.fit(disp='off', show_warning=False)
-                
-                # archのバージョンによる警告を防ぐため reindex=False を追加
-                forecasts = res.forecast(horizon=1, reindex=False)
-                
-                # 直近の予測ボラティリティ (ilocを使用して安全にアクセス)
-                current_vol = np.sqrt(forecasts.variance.iloc[-1, 0]) / 100.0
-                
-                # 最尤推定されたt分布の自由度(nu)を取得 (ファットテールの厚み)
-                if 'nu' in res.params:
-                    df = res.params['nu']
-            except Exception as e:
-                # 収束しなかった場合は通常の標準偏差へ静かにフォールバック
-                print(f"GARCH fallback triggered: {e}")
-                pass
+        # 指定された年数（日数）でカット
+        simulated_log_returns = simulated_log_returns[:n_days, :]
         
-        # トラッキングエラー（アクティブリスク）を分散に加算
-        # TE(年率)を日次化し、市場ボラティリティと合成 (σ_total^2 = σ_market^2 + σ_TE^2)
-        te_daily = tracking_error_annual / np.sqrt(TRADING_DAYS_PER_YEAR)
-        adjusted_vol = np.sqrt(current_vol**2 + te_daily**2)
-        
-        # 自由度が2以下になると分散が無限大になるため、安全装置を設ける
-        df = max(df, 2.1)
-        
-        # 2. t分布による乱数生成（ファットテールの考慮）
-        # t分布の分散は df/(df-2) になるため、合成された標準偏差(adjusted_vol)に合わせるようスケーリング
-        scale_factor = np.sqrt((df - 2) / df) * adjusted_vol
-        
-        # Z_t ~ t(df)
-        random_shocks = t.rvs(df, loc=0, scale=scale_factor, size=(n_days, n_scenarios))
-        
-        # 3. シナリオパスの生成 (ベクトル化演算で高速化)
-        # S_t = S_{t-1} * exp(drift + shock)
-        # 【修正】ドリフト項は「シュリンケージ済み平均 - 0.5 * 全ボラティリティの2乗（ボラティリティ・ドラッグ）」
-        drift = daily_drift_base - 0.5 * (adjusted_vol**2)
-        
-        daily_log_returns = drift + random_shocks
-        
+        # ポートフォリオ独自の運用ブレ（トラッキングエラー）をノイズとして追加
+        if tracking_error_annual > 0:
+            te_daily = tracking_error_annual / np.sqrt(TRADING_DAYS_PER_YEAR)
+            # TE分のノイズを付加（平均0の正規分布）
+            noise = np.random.normal(0, te_daily, size=(n_days, n_scenarios))
+            simulated_log_returns += noise
+            
         # 累積リターンを計算 (初期値 1.0 = 100%)
-        cumulative_returns = np.exp(np.cumsum(daily_log_returns, axis=0))
+        cumulative_returns = np.exp(np.cumsum(simulated_log_returns, axis=0))
         
         # 初期値を先頭に追加
         starting_point = np.ones((1, n_scenarios))
