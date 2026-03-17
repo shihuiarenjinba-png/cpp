@@ -2,6 +2,7 @@
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
 ※ 【UI最適化・ブートストラップ対応版】ファンチャート・ヒストグラムの損益率化、非推奨警告(use_container_width)の除去。
+※ 【ポートフォリオ vs ベンチマーク 分割版】Tab4のシミュレーション結果を上下に分割して比較可能に修正。
 """
 
 import os
@@ -514,10 +515,19 @@ def main():
                 res = HistoryTimeMachine.replay_crisis(norm_weights, crisis, region)
                 if res: crisis_results[crisis] = res
                 
+            # --- 💡 修正ポイント: ポートフォリオ用とベンチマーク用のシミュレーションを個別に実行 ---
             projection = ProjectionCore.run_projection(
                 returns=returns, bm_returns=bm_returns if not bm_returns.empty else None, 
                 n_scenarios=10000, n_years=10
             )
+
+            bm_projection = None
+            if not bm_returns.empty:
+                bm_projection = ProjectionCore.run_projection(
+                    returns=bm_returns, bm_returns=None,  # 自身のヒストリカルデータのみで実行
+                    n_scenarios=10000, n_years=10
+                )
+            # -----------------------------------------------------------------------------------
 
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "1️⃣ 総合診断", 
@@ -668,25 +678,24 @@ def main():
                     st.divider()
                     st.caption(f"⏳ ボラティリティ周期 (ウェルチ法): 約 {cycle_days} 日")
 
+            # --- 💡 修正ポイント: Tab4の表示を ポートフォリオ と ベンチマーク で上下に分割 ---
             with tab4:
                 st.header("4. Stress Test & Projection")
                 
-                st.subheader("🔮 Historical Bootstrap Projection (10 Years)")
+                # --- 上段: ご自身のポートフォリオの予測結果 ---
+                st.subheader("👤 Portfolio Projection (10 Years)")
+                st.markdown("あなたの現在のポートフォリオに基づいた1万回の将来10年間のシミュレーション結果です。")
                 if projection:
                     final_values = projection["paths"][-1, :]
                     worst_5th = projection['worst_5th']
                     cvar_raw = final_values[final_values <= worst_5th].mean()
                     
-                    # 💡 【修正点】倍率を「損益率（%）」に統一変換
                     median_pl = (projection['median'] - 1.0) * 100
                     worst_5th_pl = (worst_5th - 1.0) * 100
                     cvar_pl = (cvar_raw - 1.0) * 100
-                    
-                    # 💡 【追加点】中央値の年率換算（CAGR）を計算
                     cagr_median = ((projection['median']) ** (1 / 10) - 1.0) * 100
                     
                     p_col1, p_col2, p_col3, p_col4 = st.columns(4)
-                    # UI上でプラス・マイナスの符号付きで出力し、年率換算も併記
                     p_col1.metric("Median (中央値)", f"{median_pl:+.1f}%", f"年率換算: {cagr_median:+.1f}%", delta_color="normal")
                     p_col2.metric("Worst 5% (下位5%)", f"{worst_5th_pl:+.1f}%")
                     p_col3.metric("CVaR (下位5%平均)", f"{cvar_pl:+.1f}%", help="テールリスク（下位5%の最悪シナリオの平均損益率）")
@@ -694,8 +703,40 @@ def main():
                     
                     AuditEngine.plot_bootstrap_fanchart(projection["paths"])
                     AuditEngine.plot_bootstrap_histogram(final_values)
+                else:
+                    st.info("💡 シミュレーションに失敗しました。")
+
+                st.divider()
+                
+                # --- 下段: ベンチマークの予測結果 ---
+                st.subheader("🏢 Benchmark Projection (10 Years)")
+                st.markdown("市場平均（ベンチマーク単体）に基づいた将来10年間のシミュレーション結果です。ポートフォリオとの比較にご利用ください。")
+                if bm_projection:
+                    bm_final_values = bm_projection["paths"][-1, :]
+                    bm_worst_5th = bm_projection['worst_5th']
+                    bm_cvar_raw = bm_final_values[bm_final_values <= bm_worst_5th].mean()
+                    
+                    bm_median_pl = (bm_projection['median'] - 1.0) * 100
+                    bm_worst_5th_pl = (bm_worst_5th - 1.0) * 100
+                    bm_cvar_pl = (bm_cvar_raw - 1.0) * 100
+                    bm_cagr_median = ((bm_projection['median']) ** (1 / 10) - 1.0) * 100
+                    
+                    bp_col1, bp_col2, bp_col3, bp_col4 = st.columns(4)
+                    bp_col1.metric("Median (中央値)", f"{bm_median_pl:+.1f}%", f"年率換算: {bm_cagr_median:+.1f}%", delta_color="normal")
+                    bp_col2.metric("Worst 5% (下位5%)", f"{bm_worst_5th_pl:+.1f}%")
+                    bp_col3.metric("CVaR (下位5%平均)", f"{bm_cvar_pl:+.1f}%", help="テールリスク（下位5%の最悪シナリオの平均損益率）")
+                    bp_col4.metric("Prob of Loss (元本割れ確率)", f"{bm_projection['prob_loss']:.1f}%")
+                    
+                    AuditEngine.plot_bootstrap_fanchart(bm_projection["paths"])
+                    AuditEngine.plot_bootstrap_histogram(bm_final_values)
+                elif bm_returns.empty:
+                    st.warning("⚠️ ベンチマークデータが取得できなかったため、市場のシミュレーションは表示できません。")
+                else:
+                    st.info("💡 ベンチマークのシミュレーションに失敗しました。")
                 
                 st.divider()
+                
+                # --- ストレステスト ---
                 st.subheader("⚡ Stress Tests (Crash Replays)")
                 st.markdown("過去の主要な金融危機の際、現在のポートフォリオ構成がどの程度の下落を経験したかを追体験します。")
                 AuditEngine.plot_crisis_replays(crisis_results)
