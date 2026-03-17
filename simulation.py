@@ -3,11 +3,11 @@ simulation.py
 ヒストリカル・ブートストラップ法を用いたシミュレーション、および過去の危機のタイムマシンテストを行うモジュール
 【アップデート】過去危機のSurvivor Weighting（動的再配分）、ローリング回帰（動的エクスポージャー）、
 および トラッキングエラー（TE）を反映した確率的シナリオ生成を実装。
-※ 修正版(v18): 
+※ 修正版(v19): 
    - 30日窓ブロック・ブートストラップ法への移行
    - 【修正 STEP 2】 期待値のセンタリング補正（現実的な長期期待収益率へのスケーリング）
    - 【修正 STEP 3】 長期の重力・平均回帰の導入（異常な上振れパスの抑制）
-   - 【新規】 CAGRの厳密計算および20%超過時の保守的下方修正（アラート）機能の追加
+   - 【新規・修正】 CAGR上限(15%)の厳格化とNaN回避の安全装置、ベンチマークパスの独立生成
 """
 
 import numpy as np
@@ -228,39 +228,33 @@ class StochasticScenarioGenerator:
     def generate_paths(returns, n_scenarios=10000, n_days=252, tracking_error_annual=0.0, target_annual_return=0.06, mean_reversion_strength=0.1):
         """
         過去の生データをそのままサンプリングする「30日窓ブロック・ブートストラップ法」。
-        【修正 STEP 2】過去データのボラティリティを維持したまま、全体の傾きを現実的な期待収益率にセンタリング補正。
-        【修正 STEP 3】上振れしすぎたパスに対して、平均回帰のペナルティを課して重力を働かせる。
+        【修正】NaN回避のため、対数を取る前にリターンを -0.99 にクリッピングする安全装置を追加。
         """
         if returns is None or len(returns) < 30: return None
         
-        # 実績リターンを対数リターンに変換して蓄積
-        log_returns = np.log1p(returns).to_numpy()
+        # --- 【修正】 NaN対策（対数計算エラーの完全防止） ---
+        # -1.0（-100%）以下のリターンが発生すると対数が計算できずNaNになるため、下限を-99%でクリップ
+        safe_returns = np.clip(returns, -0.99, None)
+        log_returns = np.log1p(safe_returns).to_numpy()
         n_history = len(log_returns)
         
-        # --- 【修正 STEP 2】 期待値のセンタリング補正 ---
-        # 過去の生データが持つ「日々の揺れ幅（暴落と高騰）」の形状は保ちつつ、
-        # 全体の平均的な傾きだけを「現実的な長期市場平均（または計算されたCAGR）」にシフトする
+        # --- 期待値のセンタリング補正 ---
         target_daily_log_ret = np.log1p(target_annual_return) / TRADING_DAYS_PER_YEAR
         historical_mean_log_ret = np.mean(log_returns)
         adjusted_log_returns = log_returns - historical_mean_log_ret + target_daily_log_ret
 
-        # ブロック・ブートストラップの窓幅（市場の自己相関を保つための期間）
+        # ブロック・ブートストラップの窓幅
         window_size = 30
-        
         if n_history < window_size:
             window_size = 1
             
         n_blocks = int(np.ceil(n_days / window_size))
         max_start_idx = max(0, n_history - window_size)
         
-        # 過去データからランダムに開始地点（ブロック）を抽出
-        np.random.seed(42)  # 実行ごとの再現性を担保
+        np.random.seed(42)  # 再現性
         random_start_indices = np.random.randint(0, max_start_idx + 1, size=(n_blocks, n_scenarios))
         
         simulated_log_returns = np.zeros((n_blocks * window_size, n_scenarios))
-        
-        # --- 【修正 STEP 3】 長期の「重力（平均回帰）」の準備 ---
-        # パスごとの現在の累積対数リターンを追跡する配列
         current_cum_log_returns = np.zeros(n_scenarios)
         
         # 抽出したブロックをつなぎ合わせる
@@ -271,42 +265,27 @@ class StochasticScenarioGenerator:
             indices = random_start_indices[i, :]
             broadcast_indices = indices + np.arange(window_size)[:, None]
             
-            # ブロックごとの生データ（センタリング補正済み）を取得
             block_log_returns = adjusted_log_returns[broadcast_indices]
             
             # --- 平均回帰（Mean Reversion）の適用 ---
-            # このブロック開始時点での「理想的な（目標とする）累積リターン」
             ideal_cum_log_return = start_row * target_daily_log_ret
-            
-            # 目標パスからの乖離度（プラスなら目標より上振れ、マイナスなら下振れ）
             deviation = current_cum_log_returns - ideal_cum_log_return
             
-            # 上がりすぎた（deviation > 0）パスに対してのみ、上昇幅を削るペナルティを計算
-            # 乖離分の数％（mean_reversion_strength）を、このブロックの期間（window_size）で均等に削り落とす
             penalty_per_day = np.where(deviation > 0, deviation * mean_reversion_strength / window_size, 0)
-            
-            # ペナルティ（重力）を日次リターンに適用
             block_log_returns = block_log_returns - penalty_per_day
             
             simulated_log_returns[start_row:end_row, :] = block_log_returns
-            
-            # 累積リターンを更新（次のブロックの重力判定用）
             current_cum_log_returns += np.sum(block_log_returns, axis=0)
         
-        # 指定された年数（日数）でカット
         simulated_log_returns = simulated_log_returns[:n_days, :]
         
-        # ポートフォリオ独自の運用ブレ（トラッキングエラー）をノイズとして追加
+        # トラッキングエラー（運用ブレ）のノイズ追加
         if tracking_error_annual > 0:
             te_daily = tracking_error_annual / np.sqrt(TRADING_DAYS_PER_YEAR)
-            # TE分のノイズを付加（平均0の正規分布）
             noise = np.random.normal(0, te_daily, size=(n_days, n_scenarios))
             simulated_log_returns += noise
             
-        # 累積リターンを計算 (初期値 1.0 = 100%)
         cumulative_returns = np.exp(np.cumsum(simulated_log_returns, axis=0))
-        
-        # 初期値を先頭に追加
         starting_point = np.ones((1, n_scenarios))
         paths = np.vstack([starting_point, cumulative_returns])
         
@@ -321,70 +300,82 @@ class ProjectionCore:
     def run_projection(returns, bm_returns=None, n_scenarios=10000, n_years=1):
         """
         シナリオジェネレータを呼び出し、TEを加味した上で最終的なパーセンタイル値などを算出する。
-        【新規】CAGRの厳密計算と、20%超過時の保守的下方修正ロジックを統合。
+        【修正】CAGR上限(15%)の厳格化、ゼロ除算防止、およびベンチマーク用パスの独立生成。
         """
         n_days = int(n_years * TRADING_DAYS_PER_YEAR)
         tracking_error_annual = 0.0
 
         # TEの自動計算ロジック
         if bm_returns is not None:
-            # ポートフォリオとベンチマークの日付を同期して差分を計算
             aligned = pd.concat([returns.rename("Port"), bm_returns.rename("BM")], axis=1).dropna()
             if len(aligned) > 30:
                 active_ret = aligned["Port"] - aligned["BM"]
-                # 標準偏差を年率換算してTEとする
                 tracking_error_annual = active_ret.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
 
-        # --- 【新規】 CAGRの厳密化と保守的見積もり機能 ---
+        # --- 【修正】 CAGRの計算とゼロ除算防止 ---
         if len(returns) > 0:
             cum_ret = (1 + returns).prod()
             years = len(returns) / TRADING_DAYS_PER_YEAR
-            cagr = cum_ret ** (1 / years) - 1 if years > 0 else 0.0
+            # 年数が極端に短い場合のゼロ除算エラーを防ぐため years > 0.1 を条件とする
+            cagr = cum_ret ** (1 / years) - 1 if years > 0.1 else 0.0
         else:
             cagr = 0.0
             
         target_return = cagr
         alert_msg = None
         
-        # CAGRが20%を超えた場合、見かけ倒しの高成長を抑制する
-        if target_return > 0.20:
-            # 過去10年(2520営業日)のデータがあればそのCAGRを計算
-            past_10y_returns = returns.tail(2520) if len(returns) > 2520 else returns
-            cum_ret_10y = (1 + past_10y_returns).prod()
-            years_10y = len(past_10y_returns) / TRADING_DAYS_PER_YEAR
-            cagr_10y = cum_ret_10y ** (1 / years_10y) - 1 if years_10y > 0 else 0.0
-            
-            # 10年平均と比較し、さらに上限キャップ(最大15%)を設けて保守的にする
-            conservative_return = min(cagr_10y, 0.15) 
-            
-            alert_msg = f"【アラート】算出された直近CAGR（{target_return*100:.1f}%）が異常値（20%超）を示しています。見かけ倒しの高成長を防ぐため、保守的シナリオ（{conservative_return*100:.1f}%）に下方修正しました。"
+        # --- 【修正】 CAGRの厳格な保守的キャップ処理（上限15%） ---
+        MAX_CAGR_CAP = 0.15 
+        if target_return > MAX_CAGR_CAP:
+            conservative_return = MAX_CAGR_CAP
+            alert_msg = f"【アラート】過去の実績CAGR（{target_return*100:.1f}%）が非現実的なため、将来予測には保守的シナリオ（{MAX_CAGR_CAP*100:.1f}%上限）を適用しました。"
             print(alert_msg) # バックエンドのログ用
             target_return = conservative_return
-        # ---------------------------------------------------
 
-        # TEパラメータや補正パラメータをジェネレータに渡す
+        # ポートフォリオのパス生成
         paths = StochasticScenarioGenerator.generate_paths(
             returns, 
             n_scenarios=n_scenarios, 
             n_days=n_days,
             tracking_error_annual=tracking_error_annual,
-            target_annual_return=target_return,     # 【STEP 2】動的計算されたCAGR（補正済み）を設定
-            mean_reversion_strength=0.1             # 【STEP 3】上振れ乖離の10%を引き戻す重力を設定
+            target_annual_return=target_return,
+            mean_reversion_strength=0.1
         )
         
         if paths is None: return None
+
+        # --- 【追加】 ベンチマーク専用のシミュレーションパスを生成（グラフ分離用） ---
+        bm_paths = None
+        if bm_returns is not None and len(bm_returns) > 30:
+            bm_cum_ret = (1 + bm_returns).prod()
+            bm_years = len(bm_returns) / TRADING_DAYS_PER_YEAR
+            bm_cagr = bm_cum_ret ** (1 / bm_years) - 1 if bm_years > 0.1 else 0.0
+            
+            # ベンチマークも異常値が出ないよう同様にキャップをかける
+            bm_target_return = min(bm_cagr, MAX_CAGR_CAP)
+            
+            bm_paths = StochasticScenarioGenerator.generate_paths(
+                bm_returns, 
+                n_scenarios=n_scenarios, 
+                n_days=n_days,
+                tracking_error_annual=0.0, # ベンチマーク自身なのでTEは0
+                target_annual_return=bm_target_return,
+                mean_reversion_strength=0.1
+            )
+        # -------------------------------------------------------------
         
         final_values = paths[-1, :]
         
         # 中央値、ワースト5%、トップ5%などの抽出
         results = {
-            "paths": paths, # 描画用に全パスを返す
+            "paths": paths,       # ポートフォリオの描画用パス
+            "bm_paths": bm_paths, # 【追加】ベンチマークの描画用独立パス
             "median": np.percentile(final_values, 50),
             "worst_5th": np.percentile(final_values, 5),
             "worst_1st": np.percentile(final_values, 1),
             "best_5th": np.percentile(final_values, 95),
-            "prob_loss": (final_values < 1.0).mean() * 100, # 元本割れ確率
-            "applied_cagr": target_return, # UI側で利用するために実際に適用したCAGRを保持
-            "alert_message": alert_msg     # UI側でアラートを表示するためのメッセージ
+            "prob_loss": (final_values < 1.0).mean() * 100,
+            "applied_cagr": target_return,
+            "alert_message": alert_msg
         }
         return results
