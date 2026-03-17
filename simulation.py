@@ -3,7 +3,10 @@ simulation.py
 ヒストリカル・ブートストラップ法を用いたシミュレーション、および過去の危機のタイムマシンテストを行うモジュール
 【アップデート】過去危機のSurvivor Weighting（動的再配分）、ローリング回帰（動的エクスポージャー）、
 および トラッキングエラー（TE）を反映した確率的シナリオ生成を実装。
-※ 修正版(v16): モンテカルロ予測を廃止し、過去の生データをそのままサンプリングする「30日窓ブロック・ブートストラップ法」へ完全移行。
+※ 修正版(v17): 
+   - 30日窓ブロック・ブートストラップ法への移行
+   - 【修正 STEP 2】 期待値のセンタリング補正（現実的な長期期待収益率へのスケーリング）
+   - 【修正 STEP 3】 長期の重力・平均回帰の導入（異常な上振れパスの抑制）
 """
 
 import numpy as np
@@ -221,10 +224,11 @@ class HistoryTimeMachine:
 # =========================================================
 class StochasticScenarioGenerator:
     @staticmethod
-    def generate_paths(returns, n_scenarios=10000, n_days=252, tracking_error_annual=0.0):
+    def generate_paths(returns, n_scenarios=10000, n_days=252, tracking_error_annual=0.0, target_annual_return=0.06, mean_reversion_strength=0.1):
         """
         過去の生データをそのままサンプリングする「30日窓ブロック・ブートストラップ法」。
-        架空の期待収益率や乱数分布に頼らず、市場のリアルな暴落と反発の「うねり」を再現する。
+        【修正 STEP 2】過去データのボラティリティを維持したまま、全体の傾きを現実的な期待収益率にセンタリング補正。
+        【修正 STEP 3】上振れしすぎたパスに対して、平均回帰のペナルティを課して重力を働かせる。
         """
         if returns is None or len(returns) < 30: return None
         
@@ -232,6 +236,13 @@ class StochasticScenarioGenerator:
         log_returns = np.log1p(returns).to_numpy()
         n_history = len(log_returns)
         
+        # --- 【修正 STEP 2】 期待値のセンタリング補正 ---
+        # 過去の生データが持つ「日々の揺れ幅（暴落と高騰）」の形状は保ちつつ、
+        # 全体の平均的な傾きだけを「現実的な長期市場平均（例: 年率6%）」にシフトする
+        target_daily_log_ret = np.log1p(target_annual_return) / TRADING_DAYS_PER_YEAR
+        historical_mean_log_ret = np.mean(log_returns)
+        adjusted_log_returns = log_returns - historical_mean_log_ret + target_daily_log_ret
+
         # ブロック・ブートストラップの窓幅（市場の自己相関を保つための期間）
         window_size = 30
         
@@ -247,6 +258,10 @@ class StochasticScenarioGenerator:
         
         simulated_log_returns = np.zeros((n_blocks * window_size, n_scenarios))
         
+        # --- 【修正 STEP 3】 長期の「重力（平均回帰）」の準備 ---
+        # パスごとの現在の累積対数リターンを追跡する配列
+        current_cum_log_returns = np.zeros(n_scenarios)
+        
         # 抽出したブロックをつなぎ合わせる
         for i in range(n_blocks):
             start_row = i * window_size
@@ -255,7 +270,27 @@ class StochasticScenarioGenerator:
             indices = random_start_indices[i, :]
             broadcast_indices = indices + np.arange(window_size)[:, None]
             
-            simulated_log_returns[start_row:end_row, :] = log_returns[broadcast_indices]
+            # ブロックごとの生データ（センタリング補正済み）を取得
+            block_log_returns = adjusted_log_returns[broadcast_indices]
+            
+            # --- 平均回帰（Mean Reversion）の適用 ---
+            # このブロック開始時点での「理想的な（目標とする）累積リターン」
+            ideal_cum_log_return = start_row * target_daily_log_ret
+            
+            # 目標パスからの乖離度（プラスなら目標より上振れ、マイナスなら下振れ）
+            deviation = current_cum_log_returns - ideal_cum_log_return
+            
+            # 上がりすぎた（deviation > 0）パスに対してのみ、上昇幅を削るペナルティを計算
+            # 乖離分の数％（mean_reversion_strength）を、このブロックの期間（window_size）で均等に削り落とす
+            penalty_per_day = np.where(deviation > 0, deviation * mean_reversion_strength / window_size, 0)
+            
+            # ペナルティ（重力）を日次リターンに適用
+            block_log_returns = block_log_returns - penalty_per_day
+            
+            simulated_log_returns[start_row:end_row, :] = block_log_returns
+            
+            # 累積リターンを更新（次のブロックの重力判定用）
+            current_cum_log_returns += np.sum(block_log_returns, axis=0)
         
         # 指定された年数（日数）でカット
         simulated_log_returns = simulated_log_returns[:n_days, :]
@@ -298,12 +333,15 @@ class ProjectionCore:
                 # 標準偏差を年率換算してTEとする
                 tracking_error_annual = active_ret.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
 
-        # TEパラメータをジェネレータに渡す
+        # TEパラメータや補正パラメータをジェネレータに渡す
+        # ※ target_annual_return（期待収益率）や mean_reversion_strength（平均回帰の強さ）は必要に応じて外部から注入可能です。
         paths = StochasticScenarioGenerator.generate_paths(
             returns, 
             n_scenarios=n_scenarios, 
             n_days=n_days,
-            tracking_error_annual=tracking_error_annual
+            tracking_error_annual=tracking_error_annual,
+            target_annual_return=0.06,      # 【STEP 2】長期期待リターンを年率6%に設定
+            mean_reversion_strength=0.1     # 【STEP 3】上振れ乖離の10%を引き戻す重力を設定
         )
         
         if paths is None: return None
