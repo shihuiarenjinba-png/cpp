@@ -1,8 +1,8 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 【UI最適化・ブートストラップ対応版】ファンチャート・ヒストグラムの損益率化、非推奨警告(use_container_width)の除去。
-※ 【修正版】Tab1グラフ期間同期、Tab4白紙ベンチマーク撤去、Tab5データ不足エラー解消（株価加重への移行）。
+※ 【修正版(v20)】過去データの異常な跳ね上がりを防ぐ幾何平均(CAGR)の導入、
+   およびベンチマークとポートフォリオのグラフ波形混線問題を解決する完全分離描画を実装。
 """
 
 import os
@@ -65,6 +65,45 @@ class AuditEngine:
             title="Model Fit: Actual vs Predicted Cumulative Return (Base=100)",
             xaxis_title="Date", yaxis_title="Cumulative Return",
             height=350, margin=dict(l=20, r=20, t=50, b=20),
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+        )
+        st.plotly_chart(fig, width="stretch")
+
+    @staticmethod
+    def plot_portfolio_vs_benchmark(port_returns, bm_returns):
+        """
+        [1ページ目用・新規追加]: ポートフォリオとベンチマークの累積リターン（対数スケール）比較
+        💡 修正ポイント: 変数の混線を防ぐため、内部でDataFrameに格納し完全に独立した2つの波形を生成・描画します。
+        """
+        if port_returns.empty or bm_returns.empty:
+            st.info("💡 データ不足のため表示できません（ベンチマークデータの取得に失敗しました）。")
+            return
+            
+        # データを厳密に日付で結合し、欠損のある日を落とすことで期間を完全に同期
+        df = pd.DataFrame({
+            "Portfolio": port_returns,
+            "Benchmark": bm_returns
+        }).dropna()
+        
+        if df.empty:
+            st.info("💡 共通のデータ期間がありません。")
+            return
+            
+        # ここでそれぞれ独立して複利の累積計算を行う
+        port_growth = (1 + df["Portfolio"]).cumprod() * 100
+        bm_growth = (1 + df["Benchmark"]).cumprod() * 100
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=port_growth.index, y=port_growth.values, mode='lines', name='Portfolio', line=dict(color='#1f77b4', width=2)))
+        fig.add_trace(go.Scatter(x=bm_growth.index, y=bm_growth.values, mode='lines', name='Benchmark', line=dict(color='#ff7f0e', dash='dash', width=2)))
+        
+        fig.update_layout(
+            title="Portfolio vs Benchmark Growth (Base=100)",
+            xaxis_title="Date",
+            yaxis_title="Cumulative Return (Log Scale)",
+            yaxis_type="log",
+            height=400, 
+            margin=dict(l=20, r=20, t=50, b=20),
             legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
         )
         st.plotly_chart(fig, width="stretch")
@@ -217,7 +256,7 @@ class AuditEngine:
         curr_ret = np.sum(mean_returns * curr_weights)
         curr_std = np.sqrt(np.dot(curr_weights.T, np.dot(cov_matrix, curr_weights)))
 
-        # ③ 経済 (Economy) : 時価総額から「株価加重(Price-weighted)」へ修正
+        # ③ 経済 (Economy)
         if market_caps is not None and isinstance(market_caps, dict):
             clean_caps = {str(k).strip().upper(): v for k, v in market_caps.items()}
             valid_caps = [v for v in clean_caps.values() if isinstance(v, (int, float)) and v > 0]
@@ -288,7 +327,7 @@ class AuditEngine:
         fig.add_trace(go.Scatter(
             x=[econ_std], y=[econ_ret], mode='markers',
             marker=dict(color='blue', size=14, symbol='square', line=dict(color='black', width=1)),
-            name='Economy (Price-weighted)'
+            name='Economy'
         ))
         
         fig.update_layout(
@@ -310,13 +349,13 @@ class AuditEngine:
         st.markdown("#### ⚖️ Proposed Optimal Weights")
         comp_df = pd.DataFrame({
             "Ticker": available_tickers,
-            "🏢 経済 (株価加重)": econ_weights * 100,
+            "🏢 経済": econ_weights * 100,
             "👤 あなた (現在)": curr_weights * 100,
             "⚖️ 理論 (Max Sharpe)": opt_weights * 100
         })
         
         styled_df = comp_df.style.format({
-            "🏢 経済 (株価加重)": "{:.1f}%",
+            "🏢 経済": "{:.1f}%",
             "👤 あなた (現在)": "{:.1f}%",
             "⚖️ 理論 (Max Sharpe)": "{:.1f}%"
         }).background_gradient(subset=["👤 あなた (現在)"], cmap="Wistia") 
@@ -495,7 +534,6 @@ def main():
                 st.warning("⚠️ ベンチマークデータの取得に失敗しました（API制限等）。市場比較やTEの計算はスキップされます。")
                 bm_returns = pd.Series(dtype=float)
 
-            # 💡 修正ポイント: 時価総額APIの取得エラーを避けるため、最新の株価による加重平均(Price-weighted)に完全移行
             try:
                 if not raw_input_data.empty:
                     latest_prices = raw_input_data.ffill().iloc[-1].to_dict()
@@ -521,8 +559,6 @@ def main():
                 returns=returns, bm_returns=bm_returns if not bm_returns.empty else None, 
                 n_scenarios=10000, n_years=10
             )
-            
-            # 💡 修正ポイント: ベンチマーク側のシミュレーション計算（白紙エラーの原因）を完全に撤去
 
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "1️⃣ 総合診断", 
@@ -554,8 +590,16 @@ def main():
                 
                 r2_score = style.get('r_squared', 0.0) * 100
                 
+                # 💡【修正ポイント】: 過去の実測値を単純平均(算術)から、厳密な幾何平均(CAGR)の計算式へ変更
+                if len(returns) > 0:
+                    years = len(returns) / 252.0
+                    cum_ret = (1 + returns).prod()
+                    cagr = (cum_ret ** (1 / years) - 1) if years > 0 else 0.0
+                else:
+                    cagr = 0.0
+                
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Past Annual Return (過去の実測値)", f"{returns.mean() * 252 * 100:.2f}%")
+                col1.metric("Past Annual Return (幾何平均・CAGR)", f"{cagr * 100:.2f}%")
                 col2.metric("Portfolio Volatility", f"{metrics.get('volatility', 0) * 100:.2f}%")
                 col3.metric("Model Fit (Adjusted R²)", f"{r2_score:.1f}%", help="自身のファクター戦略でどれだけ動きを説明できているか")
                 
@@ -570,31 +614,8 @@ def main():
                 st.divider()
                 st.subheader("📊 Market Relative Performance (Actual vs Benchmark)")
                 
-                # 💡 修正ポイント: 期間を同期し、同じ100スタート地点から正しく比較できるよう修正
-                if bm_returns.empty:
-                    st.info("💡 データ不足のため表示できません（ベンチマークデータの取得に失敗しました）。")
-                else:
-                    aligned_returns = pd.concat([returns.rename("Portfolio"), bm_returns.rename("Benchmark")], axis=1).dropna()
-                    
-                    if not aligned_returns.empty:
-                        port_growth = (1 + aligned_returns["Portfolio"]).cumprod() * 100
-                        bm_growth = (1 + aligned_returns["Benchmark"]).cumprod() * 100
-                        
-                        fig_rel = go.Figure()
-                        
-                        fig_rel.add_trace(go.Scatter(x=port_growth.index, y=port_growth.values, mode='lines', name='Portfolio', line=dict(color='#1f77b4', width=2)))
-                        fig_rel.add_trace(go.Scatter(x=bm_growth.index, y=bm_growth.values, mode='lines', name='Benchmark', line=dict(color='#ff7f0e', dash='dash', width=2)))
-                        
-                        fig_rel.update_layout(
-                            title="Portfolio vs Benchmark Growth (Base=100)",
-                            xaxis_title="Date",
-                            yaxis_title="Cumulative Return (Log Scale)",
-                            yaxis_type="log",
-                            height=400, 
-                            margin=dict(l=20, r=20, t=50, b=20),
-                            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
-                        )
-                        st.plotly_chart(fig_rel, width="stretch")
+                # 💡【修正ポイント】: 新設した関数を呼び出し、ベンチマークとポートフォリオを分離して描画する
+                AuditEngine.plot_portfolio_vs_benchmark(returns, bm_returns)
 
             with tab2:
                 st.header("2. Factor Attribution")
@@ -681,7 +702,12 @@ def main():
                 # --- ご自身のポートフォリオの予測結果 ---
                 st.subheader("👤 Portfolio Projection (10 Years)")
                 st.markdown("あなたの現在のポートフォリオに基づいた1万回の将来10年間のシミュレーション結果です。")
+                
                 if projection:
+                    # 前回のsimulation.py修正で追加されたアラートがあれば表示する
+                    if projection.get("alert_message"):
+                        st.warning(projection["alert_message"])
+
                     final_values = projection["paths"][-1, :]
                     worst_5th = projection['worst_5th']
                     cvar_raw = final_values[final_values <= worst_5th].mean()
@@ -704,8 +730,6 @@ def main():
                 
                 st.divider()
                 
-                # 💡 修正ポイント: 邪魔な「白紙シミュレーター（ベンチマーク側）」UIブロックを完全撤去しました
-                
                 # --- ストレステスト ---
                 st.subheader("⚡ Stress Tests (Crash Replays)")
                 st.markdown("過去の主要な金融危機の際、現在のポートフォリオ構成がどの程度の下落を経験したかを追体験します。")
@@ -717,7 +741,6 @@ def main():
                 st.subheader("⚖️ Efficient Frontier & Weight Optimization")
                 st.markdown("現在のポートフォリオから、**シャープレシオ（リスク・リターン比）を最大化**する未来の最適ウェイトを提案します。")
                 
-                # 💡 修正ポイント: how='all' に変更して、一部銘柄の欠損で全データが吹き飛ぶのを防ぐ
                 asset_returns = raw_input_data.pct_change().dropna(how='all')
                 AuditEngine.optimize_and_plot_frontier(asset_returns, norm_weights, market_caps=market_caps)
 
