@@ -346,14 +346,19 @@ class AuditEngine:
 
     @staticmethod
     def plot_bootstrap_histogram(final_values):
-        """[4ページ目用]: 最終資産分布の正確なヒストグラム（ブートストラップ対応・損益率ベース版）"""
+        """[4ページ目用]: 最終資産分布の正確なヒストグラム（外れ値トリミング・損益率ベース版）"""
         
         profit_pct = (final_values - 1.0) * 100
         
+        # 外れ値をカットしたX軸の範囲設定 (上下1%をトリミングして視認性向上)
+        pct_01 = np.percentile(profit_pct, 1)
+        pct_99 = np.percentile(profit_pct, 99)
+        
         fig = px.histogram(
-            profit_pct, nbins=50, title="Final Value Distribution (Historical Bootstrap - 10 Years)", 
+            profit_pct, nbins=100, title="Final Value Distribution (Historical Bootstrap - 10 Years)", 
             labels={'value': 'Total Return (%)', 'count': 'Frequency'}, 
-            color_discrete_sequence=["rgba(70, 130, 180, 0.6)"]
+            color_discrete_sequence=["rgba(70, 130, 180, 0.6)"],
+            range_x=[pct_01, pct_99] # X軸の描画範囲を制限
         )
         
         median_val = np.median(profit_pct)
@@ -373,10 +378,10 @@ class AuditEngine:
         st.markdown("##### 📊 10年後の予想損益サマリー（投資元本 = 0%）")
         l_col1, l_col2, l_col3, l_col4, l_col5 = st.columns(5)
         l_col1.markdown(f"**🔴 元本割れライン**<br>0.0%", unsafe_allow_html=True)
-        l_col2.markdown(f"**🟠 下位10%**<br>{pct_10:.1f}%", unsafe_allow_html=True)
-        l_col3.markdown(f"**🟢 中央値**<br>{median_val:.1f}%", unsafe_allow_html=True)
-        l_col4.markdown(f"**⚫ 平均値**<br>{mean_val:.1f}%", unsafe_allow_html=True)
-        l_col5.markdown(f"**🟣 上位10%**<br>{pct_90:.1f}%", unsafe_allow_html=True)
+        l_col2.markdown(f"**🟠 下位10%**<br>{pct_10:+.1f}%", unsafe_allow_html=True)
+        l_col3.markdown(f"**🟢 中央値**<br>{median_val:+.1f}%", unsafe_allow_html=True)
+        l_col4.markdown(f"**⚫ 平均値**<br>{mean_val:+.1f}%", unsafe_allow_html=True)
+        l_col5.markdown(f"**🟣 上位10%**<br>{pct_90:+.1f}%", unsafe_allow_html=True)
 
         st.caption("💡 **プロの視点:** 平均値(Mean)が中央値(Median)より右に大きくズレている場合、一部の大当たりシナリオに引っ張られた「一発逆転狙い」のリスキーなポートフォリオ特性を示唆します。")
 
@@ -670,12 +675,21 @@ def main():
                 if projection:
                     final_values = projection["paths"][-1, :]
                     worst_5th = projection['worst_5th']
-                    cvar = final_values[final_values <= worst_5th].mean()
+                    cvar_raw = final_values[final_values <= worst_5th].mean()
+                    
+                    # 💡 【修正点】倍率を「損益率（%）」に統一変換
+                    median_pl = (projection['median'] - 1.0) * 100
+                    worst_5th_pl = (worst_5th - 1.0) * 100
+                    cvar_pl = (cvar_raw - 1.0) * 100
+                    
+                    # 💡 【追加点】中央値の年率換算（CAGR）を計算
+                    cagr_median = ((projection['median']) ** (1 / 10) - 1.0) * 100
                     
                     p_col1, p_col2, p_col3, p_col4 = st.columns(4)
-                    p_col1.metric("Median (中央値)", f"{projection['median'] * 100:.1f}%")
-                    p_col2.metric("Worst 5% (下位5%)", f"{worst_5th * 100:.1f}%")
-                    p_col3.metric("CVaR (下位5%の平均)", f"{cvar * 100:.1f}%", help="テールリスク")
+                    # UI上でプラス・マイナスの符号付きで出力し、年率換算も併記
+                    p_col1.metric("Median (中央値)", f"{median_pl:+.1f}%", f"年率換算: {cagr_median:+.1f}%", delta_color="normal")
+                    p_col2.metric("Worst 5% (下位5%)", f"{worst_5th_pl:+.1f}%")
+                    p_col3.metric("CVaR (下位5%平均)", f"{cvar_pl:+.1f}%", help="テールリスク（下位5%の最悪シナリオの平均損益率）")
                     p_col4.metric("Prob of Loss (元本割れ確率)", f"{projection['prob_loss']:.1f}%")
                     
                     AuditEngine.plot_bootstrap_fanchart(projection["paths"])
