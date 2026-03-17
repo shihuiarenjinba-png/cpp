@@ -1,7 +1,7 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 【UI同期・最適化修正版】ファンチャートの損益率化、ヒストグラムとの視覚的同期、および最適化タブの距離計算バイパスロジックを追加。
+※ 【UI最適化・ブートストラップ対応版】ファンチャート・ヒストグラムの損益率化、非推奨警告(use_container_width)の除去。
 """
 
 import os
@@ -12,7 +12,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import re
-import random # その他のランダム処理用
+import random
 
 # =========================================================
 # 🔑 APIキーと環境変数の集中管理
@@ -21,7 +21,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass # dotenvがインストールされていない環境(Streamlit Cloud等)では安全にスキップ
+    pass
 
 def setup_api_keys():
     """Streamlit Secrets または 環境変数 からAPIキーを安全に取得・設定する"""
@@ -39,10 +39,8 @@ def setup_api_keys():
     if fmp_key:
         os.environ["FMP_API_KEY"] = fmp_key
 
-# モジュール読み込みの前にAPIキーのセットアップを実行
 setup_api_keys()
 
-# これまでに作成したモジュールのインポート
 from config import MarketConfig, FACTOR_TRANSLATION
 from data_engine import DataFetcher
 from analytics import AdvancedStats, FactorAnalyzer, AIPromptBuilder
@@ -68,7 +66,7 @@ class AuditEngine:
             height=350, margin=dict(l=20, r=20, t=50, b=20),
             legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     @staticmethod
     def plot_residuals(residuals):
@@ -86,7 +84,7 @@ class AuditEngine:
             xaxis_title="Date", yaxis_title="Residuals (%)",
             height=250, margin=dict(l=20, r=20, t=50, b=20)
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     @staticmethod
     def plot_active_return(port_returns, bm_returns):
@@ -109,7 +107,7 @@ class AuditEngine:
         )
         fig.add_hline(y=0, line_dash="dash", line_color="red", annotation_text="Benchmark Level")
         fig.update_layout(height=350, margin=dict(l=20, r=20, t=50, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     @staticmethod
     def plot_factor_correlation(region="US"):
@@ -123,7 +121,7 @@ class AuditEngine:
             title=f"Factor Correlation ({region} Region)"
         )
         fig.update_layout(height=400, margin=dict(l=20, r=20, t=50, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     @staticmethod
     def plot_rolling_correlation(port_returns, bm_returns, window=60):
@@ -142,7 +140,7 @@ class AuditEngine:
         )
         fig.add_hline(y=0, line_dash="dash", line_color="red")
         fig.update_layout(height=350, margin=dict(l=20, r=20, t=50, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     @staticmethod
     def plot_crisis_replays(crisis_results):
@@ -183,7 +181,7 @@ class AuditEngine:
             fig.add_trace(go.Scatter(x=rolling_df.index, y=rolling_df["Adjusted_R2"], name="Adj R2", line=dict(color='purple')), row=row_idx, col=1)
         
         fig.update_layout(height=150 * n_rows, title_text="Dynamic Factor Exposure", margin=dict(l=20, r=20, t=50, b=20), showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     @staticmethod
     def optimize_and_plot_frontier(asset_returns, current_weights_dict, market_caps=None):
@@ -200,21 +198,16 @@ class AuditEngine:
             
         returns_df = asset_returns[available_tickers]
         
-        # データ不足(ゼロ除算)によるクラッシュを防ぐガード節
         if returns_df.empty or len(returns_df) < 10:
             st.warning("⚠️ 最適化に必要なデータが不足しています。")
             return
         
-        # 対数リターン(幾何平均)の算術計算に統一
         trading_days = 252
         log_returns = np.log(1 + returns_df)
         mean_returns = np.exp(log_returns.mean() * trading_days) - 1
         
         cov_matrix = returns_df.cov() * trading_days
         
-        # -----------------------------------------------------
-        # 1. 基準となるウェイト（あなた ＆ 経済）を先に算出
-        # -----------------------------------------------------
         # ② あなた (Self)
         curr_weights = np.array([clean_weights_dict.get(t, 0.0) for t in available_tickers], dtype=np.float64)
         if np.sum(curr_weights) > 0:
@@ -238,9 +231,6 @@ class AuditEngine:
         econ_ret = np.sum(mean_returns * econ_weights)
         econ_std = np.sqrt(np.dot(econ_weights.T, np.dot(cov_matrix, econ_weights)))
 
-        # -----------------------------------------------------
-        # 2. モンテカルロ近似による最適ポートフォリオ探索（ディリクレ分布＋強制エントリー）
-        # -----------------------------------------------------
         num_portfolios = 5000
         np.random.seed(42)
         
@@ -268,41 +258,32 @@ class AuditEngine:
         # ① 理論 (Finance) : Max Sharpe
         opt_weights = np.array(weights_list[max_sharpe_idx])
 
-        # -----------------------------------------------------
-        # 3. 2つの距離（Active Share）の算出とバイパスロジック
-        # -----------------------------------------------------
         distance_economy = 0.5 * np.sum(np.abs(curr_weights - econ_weights)) * 100
         distance_finance = 0.5 * np.sum(np.abs(curr_weights - opt_weights)) * 100
 
-        # 【修正項目 3】バイパスロジック: 銘柄が1つだけの場合や、浮動小数点レベルの極微小な差異(0.1%未満)は完全に0.0%とする
         if len(available_tickers) <= 1 or distance_economy < 0.1:
             distance_economy = 0.0
         if len(available_tickers) <= 1 or distance_finance < 0.1:
             distance_finance = 0.0
 
-        # --- 効率的フロンティアの描画 ---
         fig = go.Figure()
         
-        # 透明度 (opacity=0.3) を設定し、グラフがベタ塗りで潰れるのを解消
         fig.add_trace(go.Scatter(
             x=results[0], y=results[1], mode='markers',
             marker=dict(color=results[2], colorscale='Viridis', showscale=True, size=4, opacity=0.3, colorbar=dict(title="Sharpe Ratio")),
             name='Simulated Portfolios'
         ))
         
-        # Max Sharpe
         fig.add_trace(go.Scatter(
             x=[opt_std], y=[opt_ret], mode='markers',
             marker=dict(color='red', size=16, symbol='star', line=dict(color='black', width=1)),
             name='Max Sharpe Portfolio'
         ))
-        # Current
         fig.add_trace(go.Scatter(
             x=[curr_std], y=[curr_ret], mode='markers',
             marker=dict(color='orange', size=14, symbol='x', line=dict(color='black', width=1)),
             name='Current Portfolio'
         ))
-        # Economy (Market Cap)
         fig.add_trace(go.Scatter(
             x=[econ_std], y=[econ_ret], mode='markers',
             marker=dict(color='blue', size=14, symbol='square', line=dict(color='black', width=1)),
@@ -316,11 +297,8 @@ class AuditEngine:
             height=450, margin=dict(l=20, r=20, t=50, b=20),
             legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         
-        # -----------------------------------------------------
-        # 4. ポジショニング表示と新しい比較テーブル
-        # -----------------------------------------------------
         st.markdown("#### 📏 Positioning & Active Share")
         st.markdown("現在のあなたのポートフォリオが、「市場全体（経済）」と「最適解（理論）」からどの程度乖離しているか（アクティブ・シェア）を示します。")
         
@@ -342,13 +320,12 @@ class AuditEngine:
             "⚖️ 理論 (Max Sharpe)": "{:.1f}%"
         }).background_gradient(subset=["👤 あなた (現在)"], cmap="Wistia") 
         
-        st.dataframe(styled_df, use_container_width=True)
+        st.dataframe(styled_df, width="stretch")
 
     @staticmethod
-    def plot_monte_carlo_fanchart(paths):
-        """[4ページ目用]: 1万回のシミュレーション推移を扇状で可視化"""
+    def plot_bootstrap_fanchart(paths):
+        """[4ページ目用]: 1万回のシミュレーション推移を扇状で可視化（ブートストラップ対応）"""
         
-        # 【修正項目 1】パス全体を資産倍率(1.0基準)から、損益率(%基準)に変換
         profit_paths = (paths - 1.0) * 100
         
         percentiles = np.percentile(profit_paths, [5, 25, 50, 75, 95], axis=1)
@@ -362,21 +339,19 @@ class AuditEngine:
         fig.add_trace(go.Scatter(x=years, y=percentiles[1], fill='tonexty', fillcolor='rgba(70, 130, 180, 0.4)', line=dict(width=0), name='25th-75th Percentile'))
         fig.add_trace(go.Scatter(x=years, y=percentiles[2], mode='lines', line=dict(color='darkblue', width=2), name='Median (50th)'))
         
-        # 【修正項目 1】Y=0.0に赤色破線を設定し、ブレークイーブンを明示
         fig.add_hline(y=0.0, line_dash="dash", line_color="red", annotation_text="Break-even (0%)")
         
-        fig.update_layout(title="Monte Carlo Projection (10-Year Fan Chart)", xaxis_title="Years", yaxis_title="Total Return (%)", height=450)
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(title="Historical Bootstrap Projection (10-Year Fan Chart)", xaxis_title="Years", yaxis_title="Total Return (%)", height=450)
+        st.plotly_chart(fig, width="stretch")
 
     @staticmethod
-    def plot_monte_carlo_histogram(final_values):
-        """[4ページ目用]: 最終資産分布の正確なヒストグラム（視認性改善・損益率ベース版）"""
+    def plot_bootstrap_histogram(final_values):
+        """[4ページ目用]: 最終資産分布の正確なヒストグラム（ブートストラップ対応・損益率ベース版）"""
         
-        # 1.0を基準とする倍率から、0%をプラマイゼロとする損益率(%)に変換
         profit_pct = (final_values - 1.0) * 100
         
         fig = px.histogram(
-            profit_pct, nbins=50, title="Final Value Distribution (10 Years)", 
+            profit_pct, nbins=50, title="Final Value Distribution (Historical Bootstrap - 10 Years)", 
             labels={'value': 'Total Return (%)', 'count': 'Frequency'}, 
             color_discrete_sequence=["rgba(70, 130, 180, 0.6)"]
         )
@@ -386,7 +361,6 @@ class AuditEngine:
         pct_10 = np.percentile(profit_pct, 10)
         pct_90 = np.percentile(profit_pct, 90)
 
-        # 【修正項目 2】グラフ内は縦線のみを描画し、元本ライン(0%)は赤色破線で統一
         fig.add_vline(x=0.0, line_dash="dash", line_color="red")
         fig.add_vline(x=pct_10, line_dash="dash", line_color="orange")
         fig.add_vline(x=median_val, line_dash="solid", line_color="green")
@@ -394,9 +368,8 @@ class AuditEngine:
         fig.add_vline(x=pct_90, line_dash="dash", line_color="purple")
         
         fig.update_layout(height=350, margin=dict(l=20, r=20, t=50, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         
-        # グラフの下に、重ならない綺麗な凡例（サマリー）を配置
         st.markdown("##### 📊 10年後の予想損益サマリー（投資元本 = 0%）")
         l_col1, l_col2, l_col3, l_col4, l_col5 = st.columns(5)
         l_col1.markdown(f"**🔴 元本割れライン**<br>0.0%", unsafe_allow_html=True)
@@ -417,13 +390,11 @@ def main():
     st.markdown("インタラクティブなリスク評価とAI診断システム")
     st.divider()
 
-    # --- サイドバー (動的スプレッドシート機能 & API設定) ---
     st.sidebar.header("⚙️ 設定 & ポートフォリオ")
     
     st.sidebar.markdown("**🤖 AI診断用 API設定**")
     ai_api_key = st.sidebar.text_input("API Key (現在プレースホルダー)", type="password", help="ここにOpenAI等のAPIキーを入れると本物のAIが動くようになります")
     
-    # ⚠️ FMP_API_KEYが未設定の場合の警告を表示
     if not os.environ.get("FMP_API_KEY"):
         st.sidebar.warning("⚠️ FMP_API_KEY が設定されていません。時価総額データの取得に失敗する可能性があります。")
         
@@ -477,8 +448,7 @@ def main():
         if ticker and pd.notna(row["Weight"]):
             weights_dict[ticker] = float(row["Weight"])
 
-    # --- 実行ボタン ---
-    if st.sidebar.button("Run Advanced Analysis", type="primary", use_container_width=True):
+    if st.sidebar.button("Run Advanced Analysis", type="primary", width="stretch"):
         if not weights_dict:
             st.error("有効なティッカーとウェイトを入力してください。")
             return
@@ -519,9 +489,6 @@ def main():
                 st.warning("⚠️ ベンチマークデータの取得に失敗しました（API制限等）。市場比較やTEの計算はスキップされます。")
                 bm_returns = pd.Series(dtype=float)
 
-            # ==========================================
-            # 実際の時価総額データを取得する処理
-            # ==========================================
             try:
                 market_caps = DataFetcher.fetch_market_caps(list(norm_weights.keys()), region=region)
             except AttributeError:
@@ -531,7 +498,6 @@ def main():
                 st.warning(f"⚠️ 時価総額データの取得に失敗しました。一時的に各銘柄を均等として扱います。({e})")
                 market_caps = {ticker: 1.0 for ticker in norm_weights.keys()}
 
-            # 解析実行
             metrics = AdvancedStats.calculate_metrics(returns, benchmark_returns=bm_returns if not bm_returns.empty else None, weights_dict=norm_weights, region=region)
             style = FactorAnalyzer.analyze_style(synthetic_portfolio, region=region)
             cycle_days = RegimeAnalyzer.detect_cycle(returns)
@@ -548,9 +514,6 @@ def main():
                 n_scenarios=10000, n_years=10
             )
 
-            # ==========================================
-            # 🗂️ 描画レイヤー (5つのタブ構成へ完全分離)
-            # ==========================================
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "1️⃣ 総合診断", 
                 "2️⃣ 要因分析", 
@@ -559,9 +522,6 @@ def main():
                 "5️⃣ 最適化提案"
             ])
 
-            # ---------------------------------------------------------
-            # --- Page 1: 総合診断 (Current Diagnosis) ---
-            # ---------------------------------------------------------
             with tab1:
                 st.header(f"1. Current Diagnosis ({region} Market)")
                 st.subheader("🤖 クオンツマネージャーの辛口診断")
@@ -602,17 +562,14 @@ def main():
                 if bm_returns.empty:
                     st.info("💡 データ不足のため表示できません（ベンチマークデータの取得に失敗しました）。")
                 else:
-                    # 無理にDataFrameを結合せず、独立した系列として描画する
                     port_growth = (1 + returns).cumprod() * 100
                     bm_growth = (1 + bm_returns).cumprod() * 100
                     
                     fig_rel = go.Figure()
                     
-                    # ポートフォリオの線を追加
                     if not port_growth.empty:
                         fig_rel.add_trace(go.Scatter(x=port_growth.index, y=port_growth.values, mode='lines', name='Portfolio', line=dict(color='#1f77b4', width=2)))
                         
-                    # ベンチマークの線を追加
                     if not bm_growth.empty:
                         fig_rel.add_trace(go.Scatter(x=bm_growth.index, y=bm_growth.values, mode='lines', name='Benchmark', line=dict(color='#ff7f0e', dash='dash', width=2)))
                     
@@ -620,16 +577,13 @@ def main():
                         title="Portfolio vs Benchmark Growth (Base=100)",
                         xaxis_title="Date",
                         yaxis_title="Cumulative Return (Log Scale)",
-                        yaxis_type="log", # 成長率の錯覚を防ぐため対数スケールに設定
+                        yaxis_type="log",
                         height=400, 
                         margin=dict(l=20, r=20, t=50, b=20),
                         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
                     )
-                    st.plotly_chart(fig_rel, use_container_width=True)
+                    st.plotly_chart(fig_rel, width="stretch")
 
-            # ---------------------------------------------------------
-            # --- Page 2: 要因分析 (Factor Attribution) ---
-            # ---------------------------------------------------------
             with tab2:
                 st.header("2. Factor Attribution")
                 
@@ -680,9 +634,6 @@ def main():
                 else:
                     st.info("💡 ファクター分析を行うためのデータが不足しています（最低36ヶ月分のデータが推奨されます）。")
 
-            # ---------------------------------------------------------
-            # --- Page 3: リスク・相関分析 (Risk & Tracking) ---
-            # ---------------------------------------------------------
             with tab3:
                 st.header("3. Risk & Tracking Analysis")
                 if bm_returns.empty:
@@ -712,13 +663,10 @@ def main():
                     st.divider()
                     st.caption(f"⏳ ボラティリティ周期 (ウェルチ法): 約 {cycle_days} 日")
 
-            # ---------------------------------------------------------
-            # --- Page 4: 将来シミュレーション (Stress Test & Projection) ---
-            # ---------------------------------------------------------
             with tab4:
                 st.header("4. Stress Test & Projection")
                 
-                st.subheader("🔮 Stochastic Projection (Monte Carlo Simulation - 10 Years)")
+                st.subheader("🔮 Historical Bootstrap Projection (10 Years)")
                 if projection:
                     final_values = projection["paths"][-1, :]
                     worst_5th = projection['worst_5th']
@@ -730,17 +678,14 @@ def main():
                     p_col3.metric("CVaR (下位5%の平均)", f"{cvar * 100:.1f}%", help="テールリスク")
                     p_col4.metric("Prob of Loss (元本割れ確率)", f"{projection['prob_loss']:.1f}%")
                     
-                    AuditEngine.plot_monte_carlo_fanchart(projection["paths"])
-                    AuditEngine.plot_monte_carlo_histogram(final_values)
+                    AuditEngine.plot_bootstrap_fanchart(projection["paths"])
+                    AuditEngine.plot_bootstrap_histogram(final_values)
                 
                 st.divider()
                 st.subheader("⚡ Stress Tests (Crash Replays)")
                 st.markdown("過去の主要な金融危機の際、現在のポートフォリオ構成がどの程度の下落を経験したかを追体験します。")
                 AuditEngine.plot_crisis_replays(crisis_results)
 
-            # ---------------------------------------------------------
-            # --- Page 5: 最適化提案 (Portfolio Optimization) ---
-            # ---------------------------------------------------------
             with tab5:
                 st.header("5. Portfolio Optimization")
                 
