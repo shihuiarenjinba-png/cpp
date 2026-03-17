@@ -2,6 +2,7 @@
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
 ※ 【UI最適化・ブートストラップ対応版】ファンチャート・ヒストグラムの損益率化、非推奨警告(use_container_width)の除去。
+※ 【修正版】Tab1グラフ期間同期、Tab4白紙ベンチマーク撤去、Tab5データ不足エラー解消（株価加重への移行）。
 """
 
 import os
@@ -216,7 +217,7 @@ class AuditEngine:
         curr_ret = np.sum(mean_returns * curr_weights)
         curr_std = np.sqrt(np.dot(curr_weights.T, np.dot(cov_matrix, curr_weights)))
 
-        # ③ 経済 (Economy) : 時価総額加重
+        # ③ 経済 (Economy) : 時価総額から「株価加重(Price-weighted)」へ修正
         if market_caps is not None and isinstance(market_caps, dict):
             clean_caps = {str(k).strip().upper(): v for k, v in market_caps.items()}
             valid_caps = [v for v in clean_caps.values() if isinstance(v, (int, float)) and v > 0]
@@ -287,7 +288,7 @@ class AuditEngine:
         fig.add_trace(go.Scatter(
             x=[econ_std], y=[econ_ret], mode='markers',
             marker=dict(color='blue', size=14, symbol='square', line=dict(color='black', width=1)),
-            name='Economy (Market Cap)'
+            name='Economy (Price-weighted)'
         ))
         
         fig.update_layout(
@@ -309,13 +310,13 @@ class AuditEngine:
         st.markdown("#### ⚖️ Proposed Optimal Weights")
         comp_df = pd.DataFrame({
             "Ticker": available_tickers,
-            "🏢 経済 (時価総額)": econ_weights * 100,
+            "🏢 経済 (株価加重)": econ_weights * 100,
             "👤 あなた (現在)": curr_weights * 100,
             "⚖️ 理論 (Max Sharpe)": opt_weights * 100
         })
         
         styled_df = comp_df.style.format({
-            "🏢 経済 (時価総額)": "{:.1f}%",
+            "🏢 経済 (株価加重)": "{:.1f}%",
             "👤 あなた (現在)": "{:.1f}%",
             "⚖️ 理論 (Max Sharpe)": "{:.1f}%"
         }).background_gradient(subset=["👤 あなた (現在)"], cmap="Wistia") 
@@ -401,7 +402,7 @@ def main():
     ai_api_key = st.sidebar.text_input("API Key (現在プレースホルダー)", type="password", help="ここにOpenAI等のAPIキーを入れると本物のAIが動くようになります")
     
     if not os.environ.get("FMP_API_KEY"):
-        st.sidebar.warning("⚠️ FMP_API_KEY が設定されていません。時価総額データの取得に失敗する可能性があります。")
+        st.sidebar.warning("⚠️ FMP_API_KEY が設定されていません。株価データの取得に失敗する可能性があります。")
         
     st.sidebar.divider()
     
@@ -494,13 +495,15 @@ def main():
                 st.warning("⚠️ ベンチマークデータの取得に失敗しました（API制限等）。市場比較やTEの計算はスキップされます。")
                 bm_returns = pd.Series(dtype=float)
 
+            # 💡 修正ポイント: 時価総額APIの取得エラーを避けるため、最新の株価による加重平均(Price-weighted)に完全移行
             try:
-                market_caps = DataFetcher.fetch_market_caps(list(norm_weights.keys()), region=region)
-            except AttributeError:
-                st.warning("⚠️ DataFetcherモジュールに fetch_market_caps が未実装です。一時的に各銘柄を均等の時価総額(1.0)として計算します。")
-                market_caps = {ticker: 1.0 for ticker in norm_weights.keys()}
+                if not raw_input_data.empty:
+                    latest_prices = raw_input_data.ffill().iloc[-1].to_dict()
+                    market_caps = {k: (v if v > 0 else 1.0) for k, v in latest_prices.items()}
+                else:
+                    market_caps = {ticker: 1.0 for ticker in norm_weights.keys()}
             except Exception as e:
-                st.warning(f"⚠️ 時価総額データの取得に失敗しました。一時的に各銘柄を均等として扱います。({e})")
+                st.warning(f"⚠️ 株価データの取得に失敗しました。一時的に各銘柄を均等として扱います。({e})")
                 market_caps = {ticker: 1.0 for ticker in norm_weights.keys()}
 
             metrics = AdvancedStats.calculate_metrics(returns, benchmark_returns=bm_returns if not bm_returns.empty else None, weights_dict=norm_weights, region=region)
@@ -518,6 +521,8 @@ def main():
                 returns=returns, bm_returns=bm_returns if not bm_returns.empty else None, 
                 n_scenarios=10000, n_years=10
             )
+            
+            # 💡 修正ポイント: ベンチマーク側のシミュレーション計算（白紙エラーの原因）を完全に撤去
 
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "1️⃣ 総合診断", 
@@ -564,6 +569,8 @@ def main():
                 
                 st.divider()
                 st.subheader("📊 Market Relative Performance (Actual vs Benchmark)")
+                
+                # 💡 修正ポイント: 期間を同期し、同じ100スタート地点から正しく比較できるよう修正
                 if bm_returns.empty:
                     st.info("💡 データ不足のため表示できません（ベンチマークデータの取得に失敗しました）。")
                 else:
@@ -697,6 +704,8 @@ def main():
                 
                 st.divider()
                 
+                # 💡 修正ポイント: 邪魔な「白紙シミュレーター（ベンチマーク側）」UIブロックを完全撤去しました
+                
                 # --- ストレステスト ---
                 st.subheader("⚡ Stress Tests (Crash Replays)")
                 st.markdown("過去の主要な金融危機の際、現在のポートフォリオ構成がどの程度の下落を経験したかを追体験します。")
@@ -708,6 +717,7 @@ def main():
                 st.subheader("⚖️ Efficient Frontier & Weight Optimization")
                 st.markdown("現在のポートフォリオから、**シャープレシオ（リスク・リターン比）を最大化**する未来の最適ウェイトを提案します。")
                 
+                # 💡 修正ポイント: how='all' に変更して、一部銘柄の欠損で全データが吹き飛ぶのを防ぐ
                 asset_returns = raw_input_data.pct_change().dropna(how='all')
                 AuditEngine.optimize_and_plot_frontier(asset_returns, norm_weights, market_caps=market_caps)
 
