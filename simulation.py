@@ -3,10 +3,11 @@ simulation.py
 ヒストリカル・ブートストラップ法を用いたシミュレーション、および過去の危機のタイムマシンテストを行うモジュール
 【アップデート】過去危機のSurvivor Weighting（動的再配分）、ローリング回帰（動的エクスポージャー）、
 および トラッキングエラー（TE）を反映した確率的シナリオ生成を実装。
-※ 修正版(v17): 
+※ 修正版(v18): 
    - 30日窓ブロック・ブートストラップ法への移行
    - 【修正 STEP 2】 期待値のセンタリング補正（現実的な長期期待収益率へのスケーリング）
    - 【修正 STEP 3】 長期の重力・平均回帰の導入（異常な上振れパスの抑制）
+   - 【新規】 CAGRの厳密計算および20%超過時の保守的下方修正（アラート）機能の追加
 """
 
 import numpy as np
@@ -238,7 +239,7 @@ class StochasticScenarioGenerator:
         
         # --- 【修正 STEP 2】 期待値のセンタリング補正 ---
         # 過去の生データが持つ「日々の揺れ幅（暴落と高騰）」の形状は保ちつつ、
-        # 全体の平均的な傾きだけを「現実的な長期市場平均（例: 年率6%）」にシフトする
+        # 全体の平均的な傾きだけを「現実的な長期市場平均（または計算されたCAGR）」にシフトする
         target_daily_log_ret = np.log1p(target_annual_return) / TRADING_DAYS_PER_YEAR
         historical_mean_log_ret = np.mean(log_returns)
         adjusted_log_returns = log_returns - historical_mean_log_ret + target_daily_log_ret
@@ -320,6 +321,7 @@ class ProjectionCore:
     def run_projection(returns, bm_returns=None, n_scenarios=10000, n_years=1):
         """
         シナリオジェネレータを呼び出し、TEを加味した上で最終的なパーセンタイル値などを算出する。
+        【新規】CAGRの厳密計算と、20%超過時の保守的下方修正ロジックを統合。
         """
         n_days = int(n_years * TRADING_DAYS_PER_YEAR)
         tracking_error_annual = 0.0
@@ -333,15 +335,41 @@ class ProjectionCore:
                 # 標準偏差を年率換算してTEとする
                 tracking_error_annual = active_ret.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
 
+        # --- 【新規】 CAGRの厳密化と保守的見積もり機能 ---
+        if len(returns) > 0:
+            cum_ret = (1 + returns).prod()
+            years = len(returns) / TRADING_DAYS_PER_YEAR
+            cagr = cum_ret ** (1 / years) - 1 if years > 0 else 0.0
+        else:
+            cagr = 0.0
+            
+        target_return = cagr
+        alert_msg = None
+        
+        # CAGRが20%を超えた場合、見かけ倒しの高成長を抑制する
+        if target_return > 0.20:
+            # 過去10年(2520営業日)のデータがあればそのCAGRを計算
+            past_10y_returns = returns.tail(2520) if len(returns) > 2520 else returns
+            cum_ret_10y = (1 + past_10y_returns).prod()
+            years_10y = len(past_10y_returns) / TRADING_DAYS_PER_YEAR
+            cagr_10y = cum_ret_10y ** (1 / years_10y) - 1 if years_10y > 0 else 0.0
+            
+            # 10年平均と比較し、さらに上限キャップ(最大15%)を設けて保守的にする
+            conservative_return = min(cagr_10y, 0.15) 
+            
+            alert_msg = f"【アラート】算出された直近CAGR（{target_return*100:.1f}%）が異常値（20%超）を示しています。見かけ倒しの高成長を防ぐため、保守的シナリオ（{conservative_return*100:.1f}%）に下方修正しました。"
+            print(alert_msg) # バックエンドのログ用
+            target_return = conservative_return
+        # ---------------------------------------------------
+
         # TEパラメータや補正パラメータをジェネレータに渡す
-        # ※ target_annual_return（期待収益率）や mean_reversion_strength（平均回帰の強さ）は必要に応じて外部から注入可能です。
         paths = StochasticScenarioGenerator.generate_paths(
             returns, 
             n_scenarios=n_scenarios, 
             n_days=n_days,
             tracking_error_annual=tracking_error_annual,
-            target_annual_return=0.06,      # 【STEP 2】長期期待リターンを年率6%に設定
-            mean_reversion_strength=0.1     # 【STEP 3】上振れ乖離の10%を引き戻す重力を設定
+            target_annual_return=target_return,     # 【STEP 2】動的計算されたCAGR（補正済み）を設定
+            mean_reversion_strength=0.1             # 【STEP 3】上振れ乖離の10%を引き戻す重力を設定
         )
         
         if paths is None: return None
@@ -355,6 +383,8 @@ class ProjectionCore:
             "worst_5th": np.percentile(final_values, 5),
             "worst_1st": np.percentile(final_values, 1),
             "best_5th": np.percentile(final_values, 95),
-            "prob_loss": (final_values < 1.0).mean() * 100 # 元本割れ確率
+            "prob_loss": (final_values < 1.0).mean() * 100, # 元本割れ確率
+            "applied_cagr": target_return, # UI側で利用するために実際に適用したCAGRを保持
+            "alert_message": alert_msg     # UI側でアラートを表示するためのメッセージ
         }
         return results
