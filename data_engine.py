@@ -1,7 +1,7 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
-※ 修正版(v14): API制限を回避するバッチ処理の導入、および時価総額失敗時の「株価加重スマート・フォールバック」を実装。
+※ 修正版(v15): 複雑な補完計算を削除。「オール・オア・ナッシング」ロジックを導入し、時価総額が1つでも欠損した場合は即座に株価平均に切り替える堅牢な設計に変更。
 """
 
 import pandas as pd
@@ -10,7 +10,7 @@ import yfinance as yf
 import pandas_datareader.data as web
 import warnings
 import streamlit as st
-import time  # リトライ待機用に新規追加
+import time  # リトライ待機用
 import sqlite3 # DBキャッシュ用
 import requests # FMP API通信用
 import os
@@ -91,7 +91,6 @@ class DataFetcher:
     def fetch_market_data(tickers, start_date="2000-01-01", max_retries=3):
         """
         指定されたティッカーのヒストリカルデータを取得し、クレンジングする。
-        💡 修正内容: yfinanceのRate Limit対策として、銘柄をバッチ分割(50銘柄ずつ)して取得。
         """
         if not tickers: return pd.DataFrame()
         if isinstance(tickers, str): tickers = [tickers]
@@ -161,11 +160,12 @@ class DataFetcher:
         return final_data
 
     @staticmethod
-    @st.cache_data(ttl=86400)  # 時価総額は日次キャッシュ(24時間)で十分
+    @st.cache_data(ttl=86400)  # 日次キャッシュ(24時間)
     def fetch_market_caps(tickers, region="US", **kwargs):
         """
         指定されたティッカーの時価総額(Market Cap)を取得する。
-        💡 修正内容: 取得失敗時に「株価」を利用したスマート・フォールバックを実行。
+        💡 修正内容: オール・オア・ナッシング方式。
+        1つでも時価総額が欠落している場合、全体を「株価」ベースに切り替える。
         """
         if not tickers: return {}
         if isinstance(tickers, str): tickers = [tickers]
@@ -173,12 +173,10 @@ class DataFetcher:
         init_db()
         fetched_caps = {}
         
-        # --- 💡 1. 準備: 株価(Price)を直近のヒストリカルデータから取得しておく ---
+        # --- 💡 1. 準備: 万が一のフォールバック用に株価(Price)を取得しておく ---
         latest_prices = {}
         try:
-            # 過去15日分くらい取得して最新行を使う（休場日対策）
             recent_start = (pd.Timestamp.today() - pd.Timedelta(days=15)).strftime("%Y-%m-%d")
-            # キャッシュされた関数を呼ぶため負荷は低い
             recent_data = DataFetcher.fetch_market_data(tickers, start_date=recent_start)
             if not recent_data.empty:
                 latest_series = recent_data.ffill().iloc[-1]
@@ -188,12 +186,12 @@ class DataFetcher:
         except Exception as e:
             print(f"Error fetching recent prices for fallback: {e}")
 
-        # --- 💡 2. FMP APIで一括(バルク)取得を試みる (最も高速・確実) ---
+        # --- 💡 2. FMP APIで一括(バルク)取得を試みる ---
         if FMP_API_KEY:
             batch_size = 20
             for i in range(0, len(tickers), batch_size):
                 batch_tickers = tickers[i:i+batch_size]
-                ticker_str = ",".join(batch_tickers)  # AAPL,MSFT,GOOGL のように繋げる
+                ticker_str = ",".join(batch_tickers)
                 try:
                     url = f"https://financialmodelingprep.com/api/v3/market-capitalization/{ticker_str}?apikey={FMP_API_KEY}"
                     response = requests.get(url, timeout=10)
@@ -204,12 +202,11 @@ class DataFetcher:
                                 fetched_caps[item['symbol'].upper()] = item['marketCap']
                 except Exception as e:
                     print(f"FMP API Batch Error: {e}")
-                time.sleep(0.2)  # リクエスト間の冷却時間
+                time.sleep(0.2) 
         
         # --- 💡 3. 残りの銘柄をDBキャッシュとyfinanceで穴埋め ---
         for ticker in tickers:
-            if ticker in fetched_caps:
-                continue
+            if ticker in fetched_caps: continue
                 
             mcap = None
             # DBの確認
@@ -222,8 +219,7 @@ class DataFetcher:
                 if row and row[0] is not None and row[0] > 0:
                     fetched_caps[ticker] = row[0]
                     continue
-            except Exception:
-                pass
+            except Exception: pass
 
             # yfinanceへの個別リクエスト
             try:
@@ -231,8 +227,7 @@ class DataFetcher:
                 mcap = tick.info.get('marketCap')
                 if mcap is None or not isinstance(mcap, (int, float)) or mcap <= 0:
                     mcap = None
-            except Exception:
-                pass
+            except Exception: pass
 
             if mcap is not None:
                 fetched_caps[ticker] = mcap
@@ -245,51 +240,30 @@ class DataFetcher:
                 c.execute("INSERT OR REPLACE INTO market_caps (ticker, market_cap, last_updated) VALUES (?, ?, CURRENT_TIMESTAMP)", (t, float(mc)))
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception: pass
 
-        # --- 💡 4. 株価を用いた「スマート・フォールバック」による補完 ---
-        final_market_caps = {}
-        implied_shares = []
+        # --- 💡 4. 【新機能】オール・オア・ナッシングの切り替え判定 ---
+        missing_tickers = [t for t in tickers if t not in fetched_caps]
         
-        # 時価総額と株価の両方が取れている銘柄から「推定発行済株式数」を逆算
-        for t in tickers:
-            if t in fetched_caps and t in latest_prices:
-                implied_shares.append(fetched_caps[t] / latest_prices[t])
-                
-        if implied_shares:
-            # 取得できた銘柄の発行済株式数の中央値を算出
-            median_shares = float(np.median(implied_shares))
-            fallback_mode = "implied"
+        if not missing_tickers:
+            # 全ての時価総額が揃った場合 → 理想の【時価総額加重】
+            return fetched_caps
         else:
-            # 全滅の場合は株価をそのまま使用（純粋な株価加重）
-            median_shares = 1.0
-            fallback_mode = "pure_price"
+            # 1つでも欠落がある場合 → 強制的に【株価加重(株価平均)】へ切り替え（混ぜない）
+            missing_names = ", ".join(missing_tickers[:3])
+            if len(missing_tickers) > 3: missing_names += " 等"
+            st.warning(f"⚠️ 一部の銘柄（{missing_names}）の時価総額が取得できないため、ポートフォリオ全体を**【株価平均（Price-Weighted）】**に切り替えて計算します。")
             
-        missing_count = 0
-        for ticker in tickers:
-            if ticker in fetched_caps and fetched_caps[ticker] > 0:
-                final_market_caps[ticker] = float(fetched_caps[ticker])
-            else:
-                missing_count += 1
-                if ticker in latest_prices:
-                    # 株価 × 推定株式数（または1.0）で時価総額を擬似的に算出
-                    final_market_caps[ticker] = latest_prices[ticker] * median_shares
+            fallback_weights = {}
+            for t in tickers:
+                if t in latest_prices:
+                    fallback_weights[t] = latest_prices[t]
                 else:
-                    # 株価すら取れない場合は、他銘柄の時価総額中央値（最終手段）
-                    if fetched_caps:
-                        final_market_caps[ticker] = float(np.median(list(fetched_caps.values())))
-                    else:
-                        final_market_caps[ticker] = 1.0
-
-        # UIへの通知
-        if missing_count > 0:
-            if fallback_mode == "pure_price":
-                st.error("🚨 【API制限】全銘柄の時価総額の取得に失敗しました。経済ポートフォリオは**株価加重**で代用して計算しています。")
-            else:
-                st.warning(f"⚠️ {missing_count} 銘柄の時価総額が取得できなかったため、株価比率ベースで推定補完を行いました。")
-                
-        return final_market_caps
+                    # 株価すら取れない極端なエラー時の最終安全装置
+                    fallback_weights[t] = 1.0
+            
+            # 値として株価の配列を返すことで、呼び出し元で自動的に「株価加重」として処理される
+            return fallback_weights
 
     @staticmethod
     def validate_tickers(input_dict):
