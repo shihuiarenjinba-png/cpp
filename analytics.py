@@ -1,7 +1,7 @@
 """
 analytics.py
 ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
-※修正版(v13): 回帰分析を「対数リターン」に完全統一し累積誤差を最小化。期待収益率にボラティリティ・ドラッグ(幾何近似)を導入。
+※修正版(v14): AIや各種指標で使われる期待収益率(mu)を、算術平均からボラティリティ・ドラッグを考慮した幾何平均近似式(μ - σ²/2)へ完全に置き換え。
 """
 
 import pandas as pd
@@ -145,8 +145,9 @@ class AdvancedStats:
             
             sigma = lw_sigma * penalty 
             
-            # 💡 【修正】ボラティリティ・ドラッグの算入 (幾何平均近似)
-            # 単純な算術平均から、ボラティリティによる目減り分(0.5 * σ^2)を差し引いて期待収益率(mu)を現実化
+            # 💡 【重要修正】期待収益率(mu)の算出を幾何平均近似式 (μ - σ²/2) に変更
+            # 算術平均(arithmetic_mu)だけで計算すると、20%超えなどの非現実的な高リターンになってしまうため、
+            # ボラティリティによる減価分を差し引き、現実の複利成長率に近い値をAIの評価基準とする。
             arithmetic_mu = returns.dropna().mean() * TRADING_DAYS_PER_YEAR
             mu = arithmetic_mu - 0.5 * (sigma ** 2) 
             
@@ -236,7 +237,8 @@ class AdvancedStats:
                 "volatility": sigma, "raw_volatility": raw_sigma,
                 "systematic_risk": systematic_risk, "idiosyncratic_risk": idiosyncratic_risk,
                 "portfolio_beta": portfolio_beta,
-                "risk_contribution": risk_contribution
+                "risk_contribution": risk_contribution,
+                "expected_return": mu  # 💡 AIプロンプトなどで参照できるように追加
             }
         except Exception as e:
             print(f"AdvancedStats Critical Fallback: {e}")
@@ -403,6 +405,9 @@ class AIPromptBuilder:
         r_squared = factor_data.get("r_squared", 0) * 100 if factor_data else 0.0
         alpha = factor_data.get("alpha", 0) * 100 if factor_data else 0.0
         te = stats_data.get("tracking_error", 0) * 100
+        
+        # 💡 AIプロンプトにも現実的な期待収益率(CAGR)を渡す
+        expected_return = stats_data.get("expected_return", 0) * 100
 
         prompt = f"""
 あなたはウォール街で長年活躍する、非常に優秀だが少し辛口なクオンツ・ポートフォリオマネージャーです。
@@ -414,6 +419,7 @@ class AIPromptBuilder:
 - モデル適合度 (Adjusted R2): {r_squared:.1f}% (※この数値が高いほど、自身のファクター戦略通りに動いています)
 - 年率トラッキングエラー (TE): {te:.2f}% (※対ベンチマークのズレ。低いほど市場のコピー、高いほど独自路線です)
 - 年率アルファ (超過収益): {alpha:.2f}%
+- 現実的な期待収益率(CAGR): {expected_return:.1f}%
 - ボラティリティ: {stats_data.get("volatility", 0) * 100:.1f}%
 
 【指示】
