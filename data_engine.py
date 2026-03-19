@@ -1,7 +1,8 @@
 """
 data_engine.py
 市場データの取得、ティッカーの正規化、および合成ポートフォリオの生成を行うモジュール
-※ 修正版(v15): 複雑な補完計算を削除。「オール・オア・ナッシング」ロジックを導入し、時価総額が1つでも欠損した場合は即座に株価平均に切り替える堅牢な設計に変更。
+※ 修正版(v16): 未上場期間（データ欠損期間）に対して、ベンチマークリターンからペナルティを差し引いた
+   「重石（足を引っ張る）」リターンを補完するプロキシ・バックフィル機能を実装。
 """
 
 import pandas as pd
@@ -16,7 +17,7 @@ import requests # FMP API通信用
 import os
 
 # 先ほど作成したconfigからMarketConfigを読み込む
-from config import MarketConfig
+from config import MarketConfig, TRADING_DAYS_PER_YEAR
 
 # 📌 ログを埋め尽くすPandasの仕様変更警告をミュート
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -292,6 +293,7 @@ class DataFetcher:
         """
         各銘柄の生データを取得し、「生存銘柄のみ」による動的ウェイト再配分を行い、
         正確な合成ポートフォリオの累積リターンを算出する。
+        💡 修正(v16): 未上場期間のデータを、ベンチマークのリターンにペナルティを課した値で補完する。
         """
         ticker_weights = DataFetcher.normalize_weights(ticker_weights)
         tickers = list(ticker_weights.keys())
@@ -311,11 +313,11 @@ class DataFetcher:
         if isinstance(bm_prices, pd.Series):
             bm_prices = bm_prices.to_frame(name=bm_ticker)
 
-        # 欠損値(NaN)のまま pct_change を計算させ、存在しない日のリターンを誤って0にしない (fill_method=None)
+        # 欠損値(NaN)のまま pct_change を計算させる
         returns = raw_prices.pct_change(fill_method=None)
         bm_returns = bm_prices.pct_change(fill_method=None).iloc[:, 0].rename("Benchmark")
         
-        # 💡【重要】結合前に日付フォーマット(YYYY-MM-DD)とタイムゾーン(None)を強制的に揃える
+        # 日付フォーマット(YYYY-MM-DD)とタイムゾーン(None)を強制的に揃える
         if returns.index.tz is not None:
             returns.index = returns.index.tz_localize(None)
         returns.index = pd.to_datetime(returns.index).normalize()
@@ -324,21 +326,60 @@ class DataFetcher:
             bm_returns.index = bm_returns.index.tz_localize(None)
         bm_returns.index = pd.to_datetime(bm_returns.index).normalize()
         
-        # 💡【重要】日付同期の強制化: ベンチマークとポートフォリオの共通期間のみを抽出 (Inner Join)
-        aligned_df = pd.merge(returns, bm_returns, left_index=True, right_index=True, how='inner')
+        # 💡【第1段階】未上場期間のペナルティ・バックフィル処理
+        # ベンチマークと結合し、全期間のタイムラインを確保する
+        aligned_df = pd.merge(returns, bm_returns, left_index=True, right_index=True, how='left')
         
-        # 結合後にデータがごっそり消えていないか監査
         if len(aligned_df) < 20:
             st.error(f"⚠️ データ結合後の有効日数が {len(aligned_df)} 日しかありません。期間設定やティッカーの地域設定が合っているか確認してください。")
             return None
 
-        # 完全に日付が揃った状態でポートフォリオ側の列だけを抽出して計算に進む
+        # 各銘柄ごとに未上場期間をベンチマーク＋ペナルティで埋める
+        for ticker in tickers:
+            if ticker not in aligned_df.columns:
+                continue
+                
+            # 銘柄のデータ系列とベンチマーク系列
+            asset_ret = aligned_df[ticker]
+            bm_ret = aligned_df["Benchmark"]
+            
+            # NaNが存在する（未上場期間がある）場合のみ処理
+            if asset_ret.isna().any():
+                # 上場後（データが存在する期間）のデータを抽出
+                valid_data = asset_ret.dropna()
+                
+                # ペナルティの決定（デフォルトは年率-2%の足引っ張り）
+                penalty_annual = 0.02 
+                
+                if len(valid_data) > 60: # 最低約3ヶ月のデータがあれば実力を測る
+                    # 上場後の期間で、ベンチマークとの平均リターンの差分（アルファ）を見る
+                    common_period = bm_ret.loc[valid_data.index]
+                    asset_mean = valid_data.mean() * TRADING_DAYS_PER_YEAR
+                    bm_mean = common_period.mean() * TRADING_DAYS_PER_YEAR
+                    
+                    # 上場後も市場に負けている弱い銘柄なら、未上場時代はもっと悪かった（年率-5%）と仮定
+                    if asset_mean < bm_mean:
+                        penalty_annual = 0.05
+                    # 上場後に市場を圧倒している強い銘柄なら、ペナルティを軽減（年率-1%）
+                    elif asset_mean > bm_mean + 0.10:
+                        penalty_annual = 0.01
+
+                # ペナルティを日次リターンに換算
+                penalty_daily = penalty_annual / TRADING_DAYS_PER_YEAR
+                
+                # 未上場期間（NaNの場所）を、ベンチマークリターンからペナルティを引いた値で埋める
+                # ※これにより、未上場銘柄は確実に「市場の足を引っ張る重石」として機能する
+                proxy_returns = bm_ret - penalty_daily
+                aligned_df[ticker] = asset_ret.fillna(proxy_returns)
+
+        # 完全に日付とデータが揃った状態でポートフォリオ側の列だけを抽出して計算に進む
+        # ※バックフィルしたため、aligned_returns には理論上 NaN は無くなっている
         aligned_returns = aligned_df[tickers]
         
         # --- リバランス・ドリフト計算ロジック ---
         w_series = pd.Series(ticker_weights) / 100.0
+        # データは全て埋まった前提なので、全てTrueとなる
         is_alive = aligned_returns.notna()
-        # 💡 エラーハンドリング: 計算途中の欠損は0リターンとして扱い、グラフの不自然な切断を防ぐ
         clean_returns = aligned_returns.fillna(0)
 
         if rebalance_freq == "D":
