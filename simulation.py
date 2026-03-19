@@ -3,12 +3,10 @@ simulation.py
 ヒストリカル・ブートストラップ法を用いたシミュレーション、および過去の危機のタイムマシンテストを行うモジュール
 【アップデート】過去危機のSurvivor Weighting（動的再配分）、ローリング回帰（動的エクスポージャー）、
 および トラッキングエラー（TE）を反映した確率的シナリオ生成を実装。
-※ 修正版(v20): 
+※ 修正版(v23): 
    - 30日窓ブロック・ブートストラップ法への移行
-   - 【修正 STEP 2】 期待値のセンタリング補正（伊藤のレンマに基づくボラティリティ・ドラッグの控除による過大評価の抑制）
-   - 【修正 STEP 3】 長期の重力・平均回帰の導入（異常な上振れパスの抑制）
-   - 【新規・修正】 CAGR上限(15%)の厳格化とNaN回避の安全装置、ベンチマークパスの独立生成
-   - 【新規・修正】 インデックスのDatetime正規化とInner Joinによる厳格な日付紐付け（バグ修正）
+   - 【現実化】 異常な上振れやバグを生む近似式を廃止し、真の「幾何平均（CAGR）」ベースで将来パスを生成。
+   - 【現実化】 前段(data_engine)で作られた「未上場ペナルティ(重石)」を含んだデータでシミュレーションを実行。
 """
 
 import numpy as np
@@ -176,7 +174,6 @@ class HistoryTimeMachine:
         raw_data = DataFetcher.fetch_market_data(tickers, start_date=fetch_start)
         if raw_data is None or raw_data.empty: return None
 
-        # --- 【修正】 日付ズレ防止 ---
         # インデックスを確実にDatetime型に変換し、タイムゾーンを消去
         daily_returns = raw_data.pct_change().dropna(how='all')
         daily_returns.index = pd.to_datetime(daily_returns.index).tz_localize(None)
@@ -234,23 +231,21 @@ class StochasticScenarioGenerator:
     def generate_paths(returns, n_scenarios=10000, n_days=252, tracking_error_annual=0.0, target_annual_return=0.06, mean_reversion_strength=0.1):
         """
         過去の生データをそのままサンプリングする「30日窓ブロック・ブートストラップ法」。
-        【修正】NaN回避のため、対数を取る前にリターンを -0.99 にクリッピングする安全装置を追加。
+        💡修正: 余計な分散(σ²/2)の近似補正を廃止し、引数で渡された真のCAGRに基づいて直接センタリングする。
         """
         if returns is None or len(returns) < 30: return None
         
-        # --- 【修正】 NaN対策（対数計算エラーの完全防止） ---
-        # -1.0（-100%）以下のリターンが発生すると対数が計算できずNaNになるため、下限を-99%でクリップ
+        # NaN対策（対数計算エラーの完全防止）
         safe_returns = np.clip(returns, -0.99, None)
         log_returns = np.log1p(safe_returns).to_numpy()
         n_history = len(log_returns)
         
-        # --- 【修正】 期待値のセンタリング補正（過大評価の抑制） ---
-        # 伊藤の補題に基づくボラティリティ・ドラッグ（分散の半分）を引くことで、
-        # シミュレーションによる将来資産額が算術平均的に上振れ（現実離れして高く計算）するのを防ぐ
-        variance_annual = np.var(log_returns) * TRADING_DAYS_PER_YEAR
-        target_daily_log_ret = (np.log1p(target_annual_return) - 0.5 * variance_annual) / TRADING_DAYS_PER_YEAR
-        
+        # --- 期待値のセンタリング補正（幾何平均ベース） ---
+        # 伊藤の補題などの近似式は使わず、直接「日当たりの対数成長率」をターゲットとする
+        target_daily_log_ret = np.log1p(target_annual_return) / TRADING_DAYS_PER_YEAR
         historical_mean_log_ret = np.mean(log_returns)
+        
+        # 過去の平均値とターゲットとする幾何平均の差分を調整
         adjusted_log_returns = log_returns - historical_mean_log_ret + target_daily_log_ret
 
         # ブロック・ブートストラップの窓幅
@@ -310,31 +305,27 @@ class ProjectionCore:
     def run_projection(returns, bm_returns=None, n_scenarios=10000, n_years=1):
         """
         シナリオジェネレータを呼び出し、TEを加味した上で最終的なパーセンタイル値などを算出する。
-        【修正】CAGR上限(15%)の厳格化、ゼロ除算防止、およびベンチマーク用パスの独立生成。
+        【修正】CAGR（幾何平均）の正確な算出。
         """
         n_days = int(n_years * TRADING_DAYS_PER_YEAR)
         tracking_error_annual = 0.0
 
-        # --- 【修正】 インデックスのDatetime正規化 ---
-        # タイムゾーン等の違いによる結合時の日付ズレを防ぐ
+        # インデックスのDatetime正規化
         returns.index = pd.to_datetime(returns.index).tz_localize(None)
 
         # TEの自動計算ロジック
         if bm_returns is not None:
             bm_returns.index = pd.to_datetime(bm_returns.index).tz_localize(None)
-            # inner joinで確実に日付が一致するデータのみを比較する
             aligned = pd.concat([returns.rename("Port"), bm_returns.rename("BM")], axis=1, join='inner').dropna()
             if len(aligned) > 30:
                 active_ret = aligned["Port"] - aligned["BM"]
                 tracking_error_annual = active_ret.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
 
-        # --- 【修正】 CAGRの計算とゼロ除算防止 ---
+        # --- 💡【修正】真のCAGRの計算とゼロ除算防止 ---
         valid_returns = returns.dropna()
         if len(valid_returns) > 0:
             cum_ret = (1 + valid_returns).prod()
-            # len()ではなく非NaN数(count)を用いて正しい運用期間を算出する
             years = valid_returns.count() / TRADING_DAYS_PER_YEAR
-            # 年数が極端に短い場合のゼロ除算エラーを防ぐため years > 0.1 を条件とする
             cagr = cum_ret ** (1 / years) - 1 if years > 0.1 else 0.0
         else:
             cagr = 0.0
@@ -342,15 +333,15 @@ class ProjectionCore:
         target_return = cagr
         alert_msg = None
         
-        # --- 【修正】 CAGRの厳格な保守的キャップ処理（上限15%） ---
+        # CAGRの厳格な保守的キャップ処理（上限15%）
         MAX_CAGR_CAP = 0.15 
         if target_return > MAX_CAGR_CAP:
             conservative_return = MAX_CAGR_CAP
             alert_msg = f"【アラート】過去の実績CAGR（{target_return*100:.1f}%）が非現実的なため、将来予測には保守的シナリオ（{MAX_CAGR_CAP*100:.1f}%上限）を適用しました。"
-            print(alert_msg) # バックエンドのログ用
+            print(alert_msg)
             target_return = conservative_return
 
-        # ポートフォリオのパス生成
+        # ポートフォリオのパス生成（ペナルティ補完済みのreturnsがそのまま使われる）
         paths = StochasticScenarioGenerator.generate_paths(
             returns, 
             n_scenarios=n_scenarios, 
@@ -362,7 +353,7 @@ class ProjectionCore:
         
         if paths is None: return None
 
-        # --- 【追加】 ベンチマーク専用のシミュレーションパスを生成（グラフ分離用） ---
+        # --- ベンチマーク専用のシミュレーションパスを生成（グラフ分離用） ---
         bm_paths = None
         if bm_returns is not None:
             valid_bm_returns = bm_returns.dropna()
@@ -371,25 +362,22 @@ class ProjectionCore:
                 bm_years = valid_bm_returns.count() / TRADING_DAYS_PER_YEAR
                 bm_cagr = bm_cum_ret ** (1 / bm_years) - 1 if bm_years > 0.1 else 0.0
                 
-                # ベンチマークも異常値が出ないよう同様にキャップをかける
                 bm_target_return = min(bm_cagr, MAX_CAGR_CAP)
                 
                 bm_paths = StochasticScenarioGenerator.generate_paths(
                     valid_bm_returns, 
                     n_scenarios=n_scenarios, 
                     n_days=n_days,
-                    tracking_error_annual=0.0, # ベンチマーク自身なのでTEは0
+                    tracking_error_annual=0.0,
                     target_annual_return=bm_target_return,
                     mean_reversion_strength=0.1
                 )
-        # -------------------------------------------------------------
         
         final_values = paths[-1, :]
         
-        # 中央値、ワースト5%、トップ5%などの抽出
         results = {
-            "paths": paths,       # ポートフォリオの描画用パス
-            "bm_paths": bm_paths, # 【追加】ベンチマークの描画用独立パス
+            "paths": paths,       
+            "bm_paths": bm_paths, 
             "median": np.percentile(final_values, 50),
             "worst_5th": np.percentile(final_values, 5),
             "worst_1st": np.percentile(final_values, 1),
