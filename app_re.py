@@ -1,10 +1,11 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 【修正版(v22)】
+※ 【修正版(v23)】
    - 過去データの異常な跳ね上がりを防ぐ真の幾何平均(CAGR)の計算を導入。
    - ベンチマークとポートフォリオのグラフ波形混線問題（点対称バグ）を、対数スケールの廃止と厳格な同期で解決。
    - 最適化散布図（フロンティア）のドット消滅バグを解消し、元の安定した計算式へ復元。
+   - 【第5段階】UIから算術平均を完全排除し、CAGR/複利表記への統一と現実的なサマリー提示を実装。
 """
 
 import os
@@ -340,7 +341,8 @@ class AuditEngine:
         fig.update_layout(
             title="Efficient Frontier (Risk-Return Tradeoff)",
             xaxis_title="Expected Annual Volatility (Risk)",
-            yaxis_title="Expected Annual Return (CAGR)",
+            # 💡【修正】 Y軸ラベルをCAGR/複利に統一
+            yaxis_title="Expected Annual Return (CAGR / 複利)",
             height=450, margin=dict(l=20, r=20, t=50, b=20),
             legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
         )
@@ -409,28 +411,27 @@ class AuditEngine:
         )
         
         median_val = np.median(profit_pct)
-        mean_val = np.mean(profit_pct)
+        # 💡【第5段階】算術平均 (mean_val) の計算と描画を完全排除
         pct_10 = np.percentile(profit_pct, 10)
         pct_90 = np.percentile(profit_pct, 90)
 
         fig.add_vline(x=0.0, line_dash="dash", line_color="red")
         fig.add_vline(x=pct_10, line_dash="dash", line_color="orange")
         fig.add_vline(x=median_val, line_dash="solid", line_color="green")
-        fig.add_vline(x=mean_val, line_dash="dot", line_color="black")
         fig.add_vline(x=pct_90, line_dash="dash", line_color="purple")
         
         fig.update_layout(height=350, margin=dict(l=20, r=20, t=50, b=20))
         st.plotly_chart(fig, width="stretch")
         
         st.markdown("##### 📊 10年後の予想損益サマリー（投資元本 = 0%）")
-        l_col1, l_col2, l_col3, l_col4, l_col5 = st.columns(5)
+        # 💡【第5段階】平均値カラムを排除し、4カラムの現実的サマリーに変更
+        l_col1, l_col2, l_col3, l_col4 = st.columns(4)
         l_col1.markdown(f"**🔴 元本割れライン**<br>0.0%", unsafe_allow_html=True)
-        l_col2.markdown(f"**🟠 下位10%**<br>{pct_10:+.1f}%", unsafe_allow_html=True)
-        l_col3.markdown(f"**🟢 中央値**<br>{median_val:+.1f}%", unsafe_allow_html=True)
-        l_col4.markdown(f"**⚫ 平均値**<br>{mean_val:+.1f}%", unsafe_allow_html=True)
-        l_col5.markdown(f"**🟣 上位10%**<br>{pct_90:+.1f}%", unsafe_allow_html=True)
+        l_col2.markdown(f"**🟠 下位10% (悲観)**<br>{pct_10:+.1f}%", unsafe_allow_html=True)
+        l_col3.markdown(f"**🟢 中央値 (標準)**<br>{median_val:+.1f}%", unsafe_allow_html=True)
+        l_col4.markdown(f"**🟣 上位10% (楽観)**<br>{pct_90:+.1f}%", unsafe_allow_html=True)
 
-        st.caption("💡 **プロの視点:** 平均値(Mean)が中央値(Median)より右に大きくズレている場合、一部の大当たりシナリオに引っ張られた「一発逆転狙い」のリスキーなポートフォリオ特性を示唆します。")
+        st.caption("💡 **プロの視点:** 投資の将来予測において「平均値」は一部の大当たりシナリオに引っ張られて高く出るため危険です。保守的な計画を立てる際は、必ず「中央値（Median）」や「下位10%（悲観シナリオ）」を基準に判断してください。")
 
 # =========================================================
 # 🚀 Streamlit メインロジック
@@ -605,7 +606,8 @@ def main():
                     cagr = 0.0
                 
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Past Annual Return (真のCAGR・複利)", f"{cagr * 100:.2f}%")
+                # 💡【第5段階】 UI表記の統一
+                col1.metric("Past Annual Return (CAGR / 複利)", f"{cagr * 100:.2f}%")
                 col2.metric("Portfolio Volatility", f"{metrics.get('volatility', 0) * 100:.2f}%")
                 col3.metric("Model Fit (Adjusted R²)", f"{r2_score:.1f}%", help="自身のファクター戦略でどれだけ動きを説明できているか")
                 
@@ -717,10 +719,12 @@ def main():
                     median_pl = (projection['median'] - 1.0) * 100
                     worst_5th_pl = (worst_5th - 1.0) * 100
                     cvar_pl = (cvar_raw - 1.0) * 100
+                    
+                    # 💡【第5段階】UI表記の統一
                     cagr_median = ((projection['median']) ** (1 / 10) - 1.0) * 100
                     
                     p_col1, p_col2, p_col3, p_col4 = st.columns(4)
-                    p_col1.metric("Median (中央値)", f"{median_pl:+.1f}%", f"年率換算: {cagr_median:+.1f}%", delta_color="normal")
+                    p_col1.metric("Median (中央値)", f"{median_pl:+.1f}%", f"年率(CAGR): {cagr_median:+.1f}%", delta_color="normal")
                     p_col2.metric("Worst 5% (下位5%)", f"{worst_5th_pl:+.1f}%")
                     p_col3.metric("CVaR (下位5%平均)", f"{cvar_pl:+.1f}%", help="テールリスク（下位5%の最悪シナリオの平均損益率）")
                     p_col4.metric("Prob of Loss (元本割れ確率)", f"{projection['prob_loss']:.1f}%")
