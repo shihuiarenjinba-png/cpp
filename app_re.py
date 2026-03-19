@@ -1,8 +1,10 @@
 """
 app_re.py
 Streamlitを用いたUI構築と、最終結果の可視化・監査を行うメインアプリケーションモジュール。
-※ 【修正版(v21)】過去データの異常な跳ね上がりを防ぐ幾何平均近似式(μ - σ²/2)の導入、
-   およびベンチマークとポートフォリオのグラフ波形混線問題を解決する完全分離描画を実装。
+※ 【修正版(v22)】
+   - 過去データの異常な跳ね上がりを防ぐ真の幾何平均(CAGR)の計算を導入。
+   - ベンチマークとポートフォリオのグラフ波形混線問題（点対称バグ）を、対数スケールの廃止と厳格な同期で解決。
+   - 最適化散布図（フロンティア）のドット消滅バグを解消し、元の安定した計算式へ復元。
 """
 
 import os
@@ -72,27 +74,29 @@ class AuditEngine:
     @staticmethod
     def plot_portfolio_vs_benchmark(port_returns, bm_returns):
         """
-        [1ページ目用・修正版]: ポートフォリオとベンチマークの累積リターン（対数スケール）比較
-        💡 修正: 変数の混線を防ぐため、明示的に別々のSeriesとして独立させ、厳格に結合します。
+        [1ページ目用・修正版]: ポートフォリオとベンチマークの累積リターン比較
+        💡 修正: 期間を厳格に同期し、対数スケール(Log Scale)を廃止することで
+        「鏡合わせ(点対称)」に見える錯覚バグを解消。独立した複利計算を強制。
         """
         if port_returns.empty or bm_returns.empty:
             st.info("💡 データ不足のため表示できません（ベンチマークデータの取得に失敗しました）。")
             return
             
-        # 安全装置: 物理的に独立したSeriesに変換
-        s_port = pd.Series(port_returns.squeeze(), index=port_returns.index)
-        s_bm = pd.Series(bm_returns.squeeze(), index=bm_returns.index)
+        # 厳密に名前をつけて結合し、共通期間だけを残す
+        aligned = pd.concat([port_returns.rename("Portfolio"), bm_returns.rename("Benchmark")], axis=1).dropna()
         
-        df = pd.concat([s_port, s_bm], axis=1).dropna()
-        df.columns = ["Portfolio", "Benchmark"] # 列名を強制的に上書きして混線を防止
-            
-        if df.empty:
+        if aligned.empty:
             st.info("💡 共通のデータ期間がありません。")
             return
             
         # 独立して複利の累積計算を行う
-        port_growth = (1 + df["Portfolio"]).cumprod() * 100
-        bm_growth = (1 + df["Benchmark"]).cumprod() * 100
+        port_growth = (1 + aligned["Portfolio"]).cumprod() * 100
+        bm_growth = (1 + aligned["Benchmark"]).cumprod() * 100
+        
+        # グラフの起点を美しく揃えるために、前日を「100」として追加
+        base_date = aligned.index[0] - pd.Timedelta(days=1)
+        port_growth = pd.concat([pd.Series([100.0], index=[base_date]), port_growth])
+        bm_growth = pd.concat([pd.Series([100.0], index=[base_date]), bm_growth])
         
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=port_growth.index, y=port_growth.values, mode='lines', name='Portfolio', line=dict(color='#1f77b4', width=2)))
@@ -101,8 +105,7 @@ class AuditEngine:
         fig.update_layout(
             title="Portfolio vs Benchmark Growth (Base=100)",
             xaxis_title="Date",
-            yaxis_title="Cumulative Return (Log Scale)",
-            yaxis_type="log",
+            yaxis_title="Cumulative Return", # 対数スケールを廃止して標準スケールへ
             height=400, 
             margin=dict(l=20, r=20, t=50, b=20),
             legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
@@ -134,13 +137,7 @@ class AuditEngine:
             st.info("💡 データ不足のため表示できません（ベンチマークデータがありません）。")
             return
             
-        # 安全装置: 物理的に独立したSeriesに変換
-        s_port = pd.Series(port_returns.squeeze(), index=port_returns.index)
-        s_bm = pd.Series(bm_returns.squeeze(), index=bm_returns.index)
-        
-        aligned = pd.concat([s_port, s_bm], axis=1).dropna()
-        aligned.columns = ["Portfolio", "Benchmark"]
-
+        aligned = pd.concat([port_returns.rename("Portfolio"), bm_returns.rename("Benchmark")], axis=1).dropna()
         if len(aligned) < 2: return
             
         active_returns = aligned["Portfolio"] - aligned["Benchmark"]
@@ -175,11 +172,7 @@ class AuditEngine:
         """[3ページ目用]: 市場との連動性（ローリング相関）の推移を可視化"""
         if port_returns.empty or bm_returns.empty: return
             
-        s_port = pd.Series(port_returns.squeeze(), index=port_returns.index)
-        s_bm = pd.Series(bm_returns.squeeze(), index=bm_returns.index)
-        aligned = pd.concat([s_port, s_bm], axis=1).dropna()
-        aligned.columns = ["Portfolio", "Benchmark"]
-
+        aligned = pd.concat([port_returns.rename("Portfolio"), bm_returns.rename("Benchmark")], axis=1).dropna()
         if len(aligned) < window: return
             
         rolling_corr = aligned["Portfolio"].rolling(window=window).corr(aligned["Benchmark"]).dropna()
@@ -255,10 +248,10 @@ class AuditEngine:
         
         trading_days = 252
         
-        # 💡【修正】算術平均から分散の半分を差し引く幾何平均近似式 (μ - σ^2 / 2) を使用
-        arithmetic_mean = returns_df.mean() * trading_days
-        variance = returns_df.var() * trading_days
-        mean_returns = arithmetic_mean - (variance / 2.0)
+        # 💡【修正・復元】エラーの温床だった近似式を廃止し、ドットが正常に描画されていた安全な対数ベースに復元
+        safe_returns = np.clip(returns_df.fillna(0), -0.99, None) # NaNや極端なマイナスを防ぐ安全装置
+        log_returns = np.log1p(safe_returns)
+        mean_returns = np.exp(log_returns.mean() * trading_days) - 1
         
         cov_matrix = returns_df.cov() * trading_days
         
@@ -345,7 +338,7 @@ class AuditEngine:
         ))
         
         fig.update_layout(
-            title="Efficient Frontier (Risk-Return Tradeoff) - Volatility Drag Adjusted",
+            title="Efficient Frontier (Risk-Return Tradeoff)",
             xaxis_title="Expected Annual Volatility (Risk)",
             yaxis_title="Expected Annual Return (CAGR)",
             height=450, margin=dict(l=20, r=20, t=50, b=20),
@@ -603,16 +596,16 @@ def main():
                 
                 r2_score = style.get('r_squared', 0.0) * 100
                 
-                # 💡【修正】: 幾何平均近似式 (μ - σ^2 / 2) を用いて現実的なCAGRを計算
+                # 💡【修正】: 近似式を廃止し、実際の累積リターンから逆算する真の幾何平均(CAGR)を採用
                 if len(returns) > 0:
-                    arithmetic_mean = returns.mean() * 252.0
-                    variance = returns.var() * 252.0
-                    cagr = arithmetic_mean - (variance / 2.0)
+                    years = len(returns) / 252.0
+                    cum_ret = (1 + returns).prod()
+                    cagr = (cum_ret ** (1 / years) - 1) if years > 0 else 0.0
                 else:
                     cagr = 0.0
                 
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Past Annual Return (幾何平均近似・CAGR)", f"{cagr * 100:.2f}%")
+                col1.metric("Past Annual Return (真のCAGR・複利)", f"{cagr * 100:.2f}%")
                 col2.metric("Portfolio Volatility", f"{metrics.get('volatility', 0) * 100:.2f}%")
                 col3.metric("Model Fit (Adjusted R²)", f"{r2_score:.1f}%", help="自身のファクター戦略でどれだけ動きを説明できているか")
                 
