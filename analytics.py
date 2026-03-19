@@ -1,7 +1,8 @@
 """
 analytics.py
 ポートフォリオのリスク、リターン、ファクターエクスポージャー、およびリスク寄与度を計算するコア分析エンジン。
-※修正版(v14): AIや各種指標で使われる期待収益率(mu)を、算術平均からボラティリティ・ドラッグを考慮した幾何平均近似式(μ - σ²/2)へ完全に置き換え。
+※修正版(v17): 期待収益率(mu)の計算を、算術平均や近似式から「完全な幾何平均（CAGR）」へ移行。
+  ボラティリティ・ドラッグが実際に反映された、現実的で堅牢な複利計算に統一。
 """
 
 import pandas as pd
@@ -145,11 +146,17 @@ class AdvancedStats:
             
             sigma = lw_sigma * penalty 
             
-            # 💡 【重要修正】期待収益率(mu)の算出を幾何平均近似式 (μ - σ²/2) に変更
-            # 算術平均(arithmetic_mu)だけで計算すると、20%超えなどの非現実的な高リターンになってしまうため、
-            # ボラティリティによる減価分を差し引き、現実の複利成長率に近い値をAIの評価基準とする。
-            arithmetic_mu = returns.dropna().mean() * TRADING_DAYS_PER_YEAR
-            mu = arithmetic_mu - 0.5 * (sigma ** 2) 
+            # 💡 【重要修正】期待収益率(mu)を「完全な幾何平均（CAGR）」に移行
+            # 近似式(μ - σ²/2)を廃止し、実際の累積リターンから年率を逆算する堅牢な方式へ変更。
+            # これにより、ボラティリティ・ドラッグが実際に結果に反映された真の複利成長率を取得する。
+            clean_ret = returns.dropna()
+            if len(clean_ret) > 0:
+                cumulative_return = (1 + clean_ret).prod()
+                years = len(clean_ret) / TRADING_DAYS_PER_YEAR
+                # 年数が極端に短い場合のゼロ除算エラーを防ぐ
+                mu = (cumulative_return ** (1 / years) - 1) if years > 0.1 else 0.0
+            else:
+                mu = 0.0
             
             # 最大ドローダウン計算 (内部のリスク指標計算用であり、外部へ時系列データとしては出力しない)
             cumulative = (1 + returns).cumprod()
@@ -181,7 +188,7 @@ class AdvancedStats:
             # --- トラッキングエラー(TE)算出ロジック ---
             info_ratio = 0.0
             tracking_error = 0.0
-            systematic_risk, idiosyncratic_risk, portfolio_beta = 0.0, 0.0, 1.0
+            systematic_risk, idiosyncratic_risk, portfolio_beta = 1.0, 0.0, 1.0 # 修正: sys_riskの初期値を1.0にしておく
             
             try:
                 # ベンチマークが渡されていない場合は取得を試みる
@@ -267,7 +274,7 @@ class FactorAnalyzer:
         if target_series.empty: return fallback_result
         
         try:
-            # 💡 【修正】日次リターンを「対数リターン」に統一して回帰分析を行う
+            # 日次リターンを「対数リターン」に統一して回帰分析を行う
             # 対数リターンの二乗誤差最小化は、期間全体の「累積リターンのズレ最小化」と等価になる
             target_daily = np.log1p(target_series.pct_change().dropna())
             if len(target_daily) < 30: return fallback_result
@@ -278,7 +285,7 @@ class FactorAnalyzer:
             ff_data = DataFetcher.fetch_fama_french_factors(start_date, dataset_name=config["ff_dataset"])
             if ff_data.empty: return fallback_result
             
-            # 💡 【修正】FFファクターも対数リターン化してスケールを完全に一致させる
+            # FFファクターも対数リターン化してスケールを完全に一致させる
             ff_data = np.log1p(ff_data)
             
             # 日付のアライメント（タイムゾーンと時刻の除去）
@@ -325,7 +332,7 @@ class FactorAnalyzer:
             # 残差（対数リターンの差分）
             residuals = actual_returns - predicted_returns
 
-            # 💡 【修正】累積リターン推移の100スタート共通化
+            # 累積リターン推移の100スタート共通化
             # 対数リターンを np.exp() で指数関数的に戻し、算術の累積（価格）ベースに変換する
             actual_cum = np.exp(actual_returns.cumsum()) * 100
             pred_cum = np.exp(predicted_returns.cumsum()) * 100
